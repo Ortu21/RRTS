@@ -199,10 +199,12 @@ impl NavGrid {
         }
     }
 
-    /// Push a spawn point out of obstacle margins (plus unit clearance) and
-    /// back inside the map. Grid-fill layouts cannot dodge random rects, so
-    /// skirmish slots are repaired here instead of failing pathfinding.
-    /// Converges: obstacle lanes guarantee free space within a few passes.
+    /// Repair a spawn point into walkable, clear ground. Grid-fill layouts
+    /// cannot dodge random rects, so slots are fixed here instead of failing
+    /// pathfinding. Fast path returns untouched clear points; otherwise a
+    /// deterministic spiral over the precomputed walkability finds the
+    /// nearest walkable cell with clearance. Obstacle lanes guarantee one
+    /// exists within a few rings.
     pub fn clear_point(&self, point: Vec3) -> Vec3 {
         let mut point = point;
         point.x = point.x.clamp(
@@ -213,44 +215,42 @@ impl NavGrid {
             -self.half_size + UNIT_CLEARANCE,
             self.half_size - UNIT_CLEARANCE,
         );
-        for _ in 0..4 {
-            let mut moved = false;
-            for obstacle in &self.obstacles {
-                let delta = (point.xz() - obstacle.center).abs();
-                let push_x = obstacle.half_size.x + UNIT_CLEARANCE - delta.x;
-                let push_z = obstacle.half_size.y + UNIT_CLEARANCE - delta.y;
-                if push_x > 0.0 && push_z > 0.0 {
-                    if push_x < push_z {
-                        let sign = if point.x >= obstacle.center.x {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        point.x += push_x * sign;
-                    } else {
-                        let sign = if point.z >= obstacle.center.y {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        point.z += push_z * sign;
+        if self.is_walkable(point) && self.has_clearance(point) {
+            return point;
+        }
+        let (cx, cz) = (
+            ((point.x + self.half_size) / self.cell_size) as isize,
+            ((point.z + self.half_size) / self.cell_size) as isize,
+        );
+        for radius in 1..=12 {
+            for dx in -radius..=radius {
+                for dz in [-radius, radius] {
+                    if let Some(found) = self.clear_cell(cx + dx, cz + dz, point.y) {
+                        return found;
                     }
-                    moved = true;
                 }
             }
-            if !moved {
-                break;
+            for dz in -radius + 1..=radius - 1 {
+                for dx in [-radius, radius] {
+                    if let Some(found) = self.clear_cell(cx + dx, cz + dz, point.y) {
+                        return found;
+                    }
+                }
             }
-            point.x = point.x.clamp(
-                -self.half_size + UNIT_CLEARANCE,
-                self.half_size - UNIT_CLEARANCE,
-            );
-            point.z = point.z.clamp(
-                -self.half_size + UNIT_CLEARANCE,
-                self.half_size - UNIT_CLEARANCE,
-            );
         }
         point
+    }
+
+    fn clear_cell(&self, x: isize, z: isize, y: f32) -> Option<Vec3> {
+        if x < 0 || z < 0 || x >= self.width as isize || z >= self.width as isize {
+            return None;
+        }
+        let index = z as usize * self.width + x as usize;
+        if !self.walkable[index] {
+            return None;
+        }
+        let center = self.cell_center(index).with_y(y);
+        self.has_clearance(center).then_some(center)
     }
 
     fn cell(&self, point: Vec3) -> Option<usize> {
@@ -291,12 +291,14 @@ impl NavGrid {
         formation_slots(count, center, spacing)
             .into_iter()
             .map(|ideal| {
+                // Slots are cell centers, so clearance of the center is exact:
+                // every returned slot is walkable, unique and clear.
                 let cell = self
                     .cell(ideal)
-                    .filter(|index| self.walkable[*index] && !reserved.contains(index))
+                    .filter(|index| self.slot_free(*index, &reserved))
                     .or_else(|| {
                         (0..self.walkable.len())
-                            .filter(|index| self.walkable[*index] && !reserved.contains(index))
+                            .filter(|index| self.slot_free(*index, &reserved))
                             .min_by(|a, b| {
                                 self.cell_center(*a)
                                     .distance_squared(ideal)
@@ -308,6 +310,12 @@ impl NavGrid {
                 Some(self.cell_center(cell))
             })
             .collect()
+    }
+
+    fn slot_free(&self, index: usize, reserved: &HashSet<usize>) -> bool {
+        self.walkable[index]
+            && !reserved.contains(&index)
+            && self.has_clearance(self.cell_center(index))
     }
 
     pub fn find_path(&self, start: Vec3, goal: Vec3) -> Option<Vec<Vec3>> {
@@ -530,6 +538,25 @@ mod tests {
                 .find_path(Vec3::new(-6.0, 0.0, 0.0), Vec3::new(6.0, 0.0, 0.0))
                 .is_none()
         );
+    }
+    #[test]
+    fn benchmark_spawn_slots_repair_into_clearance() {
+        use crate::formation::formation_slots;
+        let grid = NavGrid::default();
+        // Mirror units::spawn_units for both benchmark armies.
+        for center in [Vec3::new(-110.0, 0.0, 0.0), Vec3::new(110.0, 0.0, 0.0)] {
+            let slots: Vec<_> = formation_slots(1000, center, 2.5)
+                .into_iter()
+                .map(|slot| grid.clear_point(slot))
+                .collect();
+            assert_eq!(slots.len(), 1000);
+            for slot in &slots {
+                assert!(
+                    grid.is_walkable(*slot) && grid.has_clearance(*slot),
+                    "spawn slot without clearance: {slot:?}"
+                );
+            }
+        }
     }
     #[test]
     fn formations_near_edges_and_obstacles_have_unique_free_slots() {

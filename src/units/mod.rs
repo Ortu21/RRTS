@@ -77,15 +77,16 @@ fn spawn_units(mut commands: Commands, scenario: Res<Scenario>, grid: Res<NavGri
     // movement-only so their numbers remain comparable.
     let combat_demo = matches!(*scenario, Scenario::Playground);
     for team in 0..scenario.teams() {
-        let slots = match *scenario {
-            // Grid fills cannot dodge random rects: repair slots into the
-            // clear instead of spawning inside obstacle margins.
-            Scenario::Skirmish { .. } => skirmish_slots(count, team, HALF_SIZE)
-                .into_iter()
-                .map(|slot| grid.clear_point(slot))
-                .collect(),
+        // Raw formation ideals are map-blind: repair every slot into the
+        // clear so no unit ever spawns inside an obstacle margin (which
+        // would fail pathfinding and idle correctness checks).
+        let slots: Vec<Vec3> = match *scenario {
+            Scenario::Skirmish { .. } => skirmish_slots(count, team, HALF_SIZE),
             _ => formation_slots(count, scenario.center(team), 2.5),
-        };
+        }
+        .into_iter()
+        .map(|slot| grid.clear_point(slot))
+        .collect();
         for (index, position) in slots.into_iter().enumerate() {
             let mut unit = commands.spawn((
                 Unit((team * count + index) as u32),

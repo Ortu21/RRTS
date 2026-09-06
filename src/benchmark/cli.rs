@@ -5,6 +5,8 @@ pub struct Config {
     pub benchmark: bool,
     pub suite: bool,
     pub headless: bool,
+    pub skirmish: bool,
+    pub profile_systems: bool,
     pub per_team: usize,
     pub ticks: usize,
     pub repeats: usize,
@@ -17,6 +19,8 @@ impl Default for Config {
             benchmark: false,
             suite: false,
             headless: false,
+            skirmish: false,
+            profile_systems: false,
             per_team: 1000,
             ticks: 1800,
             repeats: 3,
@@ -39,6 +43,8 @@ impl Config {
                     config.headless = true;
                 }
                 "--headless" => config.headless = true,
+                "--skirmish" => config.skirmish = true,
+                "--profile-systems" => config.profile_systems = true,
                 "--units-per-team" | "--ticks" | "--repeats" | "--seconds" | "--output" => {
                     let value = args
                         .next()
@@ -62,8 +68,8 @@ impl Config {
                 _ => return Err(format!("Unknown option: {arg}")),
             }
         }
-        if !(1..=1000).contains(&config.per_team) {
-            return Err("Units per team must be 1..1000".into());
+        if !(1..=10_000).contains(&config.per_team) {
+            return Err("Units per team must be 1..10000".into());
         }
         if !(60..=36000).contains(&config.ticks) {
             return Err("Ticks must be 60..36000".into());
@@ -80,15 +86,19 @@ impl Config {
         Ok(Some(config))
     }
 }
-pub const HELP: &str = "Rust RTS v0.0.2\n\
-  cargo run                                      Playground with obstacles\n\
+pub const HELP: &str = "Rust RTS v0.0.4\n\
+cargo run                                      Playground skirmish (attack-move demo)\n\
   cargo run -- --benchmark                        Graphical 1000 vs 1000 crossing\n\
-  cargo run -- --benchmark --headless             One CPU simulation benchmark\n\
-  cargo run -- --benchmark-suite                  100/500/1000 per team, idle/crossing, 3 repeats\n\
-Options: --units-per-team 1..1000, --ticks 1800 (headless), --seconds 30 (graphical),\n\
-         --repeats 3 (suite), --output <new-directory>\n\
+  cargo run -- --benchmark --skirmish               Graphical combat stress test\n\
+  cargo run -- --benchmark --headless               One CPU simulation benchmark\n\
+  cargo run -- --benchmark --headless --skirmish --units-per-team 10000   10k vs 10k combat stress\n\
+  cargo run -- --benchmark-suite                    100/500/1000 per team, idle/crossing, 3 repeats\n\
+  cargo run -- --benchmark-suite --skirmish         Suite plus the skirmish workload\n\
+Options: --units-per-team 1..10000, --ticks 1800 (headless), --seconds 30 (graphical),\n\
+         --repeats 3 (suite), --output <new-directory>, --profile-systems\n\
 Headless uses fixed 1/60 s simulation steps and excludes rendering.\n\
-Graphical runs include 3 s warmup and exit after saving results. No combat.";
+Graphical runs include 3 s warmup and exit after saving results. Plain crossing\n\
+benchmarks stay movement-only; --skirmish fields armed units with attack-move orders.";
 
 #[cfg(test)]
 mod tests {
@@ -108,5 +118,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(config.headless && config.suite && config.benchmark);
+        let skirmish = Config::parse([
+            "--benchmark".to_string(),
+            "--skirmish".to_string(),
+            "--headless".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(skirmish.skirmish);
+        assert!(Config::parse(["--benchmark --profile-systems".to_string()]).is_err());
+        let profiled = Config::parse(["--benchmark".to_string(), "--profile-systems".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(profiled.profile_systems);
+        assert!(Config::parse(["--units-per-team".into(), "10001".into()]).is_err());
     }
 }

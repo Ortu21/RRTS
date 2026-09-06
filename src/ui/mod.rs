@@ -4,10 +4,11 @@ use bevy::{
 };
 
 use crate::{
+    combat::{AttackTarget, Projectile},
     movement::MoveTarget,
     navigation::{NavigationStats, Route},
     selection::{Selected, SelectionSystems},
-    units::Unit,
+    units::{Team, Unit},
 };
 
 pub struct UiPlugin;
@@ -28,7 +29,7 @@ type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
-        Text::new("RTS Prototype v0.0.2\n\nFPS: ...\nUnits: 100\nSelected: 0"),
+        Text::new("RTS Prototype v0.0.4\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -44,15 +45,19 @@ fn setup_hud(mut commands: Commands) {
         BackgroundColor(Color::srgba(0.03, 0.05, 0.07, 0.85)),
     ));
     commands.spawn((
-        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add   Esc: clear   Right click: move"),
+        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add   Esc: clear   Right click: move   G: attack-move   H: hold   S: stop"),
         TextFont { font_size: FontSize::Px(15.0), ..default() },
         Node { position_type: PositionType::Absolute, bottom: px(16), left: px(16), ..default() },
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     units: Query<UnitStatus, With<Unit>>,
+    teams: Query<&Team, With<Unit>>,
+    engaging: Query<(), (With<Unit>, With<AttackTarget>)>,
+    projectiles: Query<(), With<Projectile>>,
     navigation: Res<NavigationStats>,
     benchmark: Option<Res<crate::benchmark::VisualRun>>,
     mut hud: Single<&mut Text, With<DebugHud>>,
@@ -70,6 +75,10 @@ fn update_hud(
         .unwrap_or(0.0);
     let count = units.iter().len();
     let selected = units.iter().filter(|(selected, _, _)| *selected).count();
+    let blue = teams.iter().filter(|team| team.0 == 0).count();
+    let red = teams.iter().filter(|team| team.0 != 0).count();
+    let engaging = engaging.iter().len();
+    let projectiles = projectiles.iter().len();
     let pending = units
         .iter()
         .filter(|(_, target, route)| *target && !*route)
@@ -77,6 +86,6 @@ fn update_hud(
     let failed = navigation.failed;
     let mode = benchmark.as_ref().map_or("PLAYGROUND", |run| run.label());
     hud.0 = format!(
-        "RTS Prototype v0.0.2\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
+        "RTS Prototype v0.0.4\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
     );
 }

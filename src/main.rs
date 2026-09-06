@@ -1,5 +1,6 @@
 mod benchmark;
 mod camera;
+mod combat;
 mod formation;
 mod movement;
 mod navigation;
@@ -7,6 +8,7 @@ mod orders;
 mod picking;
 mod scenario;
 mod selection;
+mod spatial;
 mod ui;
 mod units;
 mod world;
@@ -37,8 +39,14 @@ fn main() -> std::process::ExitCode {
         };
     }
     let scene = if config.benchmark {
-        Scenario::Benchmark {
-            per_team: config.per_team,
+        if config.skirmish {
+            Scenario::Skirmish {
+                per_team: config.per_team,
+            }
+        } else {
+            Scenario::Benchmark {
+                per_team: config.per_team,
+            }
         }
     } else {
         Scenario::Playground
@@ -58,25 +66,28 @@ fn main() -> std::process::ExitCode {
                     }
                 ),
                 resolution: (1280, 800).into(),
-                present_mode: if config.benchmark {
-                    bevy::window::PresentMode::AutoNoVsync
-                } else {
-                    default()
-                },
+                // VSync deliberately off everywhere: raw throughput, no
+                // display quantization in the FPS readout.
+                present_mode: bevy::window::PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
         }))
         .add_plugins((
             navigation::NavigationPlugin,
+            spatial::SpatialPlugin,
             world::WorldPlugin,
             camera::CameraPlugin,
             units::UnitPlugin { visuals: true },
             selection::SelectionPlugin,
             orders::OrderPlugin,
+            combat::CombatPlugin,
             movement::MovementPlugin,
             ui::UiPlugin,
         ));
+    if config.profile_systems {
+        app.add_plugins(benchmark::profile::ProfilePlugin);
+    }
     if config.benchmark
         && let Err(error) = benchmark::add_graphical(&mut app, config)
     {

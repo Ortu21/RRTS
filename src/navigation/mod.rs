@@ -258,6 +258,15 @@ fn plan_paths(
         if let Some(points) = grid.find_path(transform.translation.with_y(0.0), target.0) {
             commands.entity(entity).insert(Route { points, next: 0 });
             stats.planned += 1;
+        } else if grid.has_clearance(target.0)
+            && (!grid.has_clearance(transform.translation.with_y(0.0))
+                || !grid.is_walkable(transform.translation.with_y(0.0)))
+        {
+            // Transient start inside an obstacle margin or on an unwalkable
+            // cell edge (crowd shove) with a valid goal: keep the order
+            // pending and let the movement beeline fallback walk the unit
+            // out; a later planning frame succeeds. Every other failure
+            // stops the unit and counts, as before.
         } else {
             commands.entity(entity).remove::<MoveTarget>();
             stats.failed += 1;

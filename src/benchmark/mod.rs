@@ -1,14 +1,19 @@
 pub mod cli;
+pub mod profile;
 mod report;
 
 use crate::{
+    combat::{AttackTarget, CombatPlugin, Health, Projectile},
     movement::{MoveTarget, MovementPlugin},
     navigation::{NavGrid, NavigationPlugin, NavigationStats, PlanPaths, Route},
+    orders::UnitOrder,
     scenario::Scenario,
+    spatial::SpatialPlugin,
     units::{Team, Unit, UnitPlugin},
 };
 use bevy::{prelude::*, time::TimeUpdateStrategy};
 use cli::Config;
+use profile::{ProfilePlugin, SystemProfile};
 use report::{Report, Run, Sample, Stats};
 use std::{
     collections::HashMap,
@@ -26,7 +31,7 @@ fn positions(world: &mut World) -> Vec<(u32, Vec3, bool)> {
     units
 }
 
-fn crossing_order(world: &mut World) -> (Vec<Vec3>, f64) {
+fn crossing_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
     let start = Instant::now();
     let scenario = *world.resource::<Scenario>();
     let mut units: Vec<_> = world
@@ -36,20 +41,50 @@ fn crossing_order(world: &mut World) -> (Vec<Vec3>, f64) {
         .collect();
     units.sort_unstable_by_key(|(_, id, _)| *id);
     let grid = world.resource::<NavGrid>();
-    let destinations: [Vec<Vec3>; 2] = std::array::from_fn(|team| {
+    let destinations: [Option<Vec<Vec3>>; 2] = std::array::from_fn(|team| {
         grid.formation(scenario.per_team(), scenario.center(1 - team), 2.5)
-            .expect("benchmark formations fit the map")
     });
     let mut expected = Vec::with_capacity(units.len());
     for (entity, id, team) in units {
-        let goal = destinations[team as usize][id as usize % scenario.per_team()];
+        let goals = destinations[team as usize]
+            .as_ref()
+            .ok_or_else(|| format!("benchmark formations do not fit the map for {team}"))?;
+        let goal = goals[id as usize % scenario.per_team()];
         world
             .entity_mut(entity)
             .insert(MoveTarget(goal))
             .remove::<Route>();
         expected.push(goal.with_y(0.8));
     }
-    (expected, start.elapsed().as_secs_f64() * 1000.0)
+    Ok((expected, start.elapsed().as_secs_f64() * 1000.0))
+}
+
+/// Combat stress orders: every unit attack-moves at the enemy home side.
+/// Returns initial positions (kill baseline) plus generation cost.
+fn skirmish_order(world: &mut World) -> (Vec<Vec3>, f64) {
+    let start = Instant::now();
+    let scenario = *world.resource::<Scenario>();
+    let mut units: Vec<_> = world
+        .query::<(Entity, &Unit, &Team, &Transform)>()
+        .iter(world)
+        .map(|(entity, unit, team, transform)| {
+            (entity, unit.0, team.0, transform.translation.with_y(0.8))
+        })
+        .collect();
+    units.sort_unstable_by_key(|(_, id, _, _)| *id);
+    let mut initial = Vec::with_capacity(units.len());
+    for (entity, _, team, position) in units {
+        let destination = scenario.attack_target(team as usize);
+        world
+            .entity_mut(entity)
+            .insert((
+                UnitOrder::AttackMove { destination },
+                MoveTarget(destination),
+            ))
+            .remove::<(AttackTarget, Route)>();
+        initial.push(position);
+    }
+    (initial, start.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn sample(world: &mut World, tick: usize, update_ms: f64, frame_ms: f64) -> Sample {
@@ -65,6 +100,14 @@ fn sample(world: &mut World, tick: usize, update_ms: f64, frame_ms: f64) -> Samp
             pending += 1;
         }
     }
+    let engaging = world
+        .query_filtered::<Entity, (With<Unit>, With<AttackTarget>)>()
+        .iter(world)
+        .count();
+    let projectiles = world
+        .query_filtered::<Entity, With<Projectile>>()
+        .iter(world)
+        .count();
     Sample {
         tick,
         update_ms,
@@ -72,6 +115,8 @@ fn sample(world: &mut World, tick: usize, update_ms: f64, frame_ms: f64) -> Samp
         planning_ms: world.resource::<NavigationStats>().last_ms,
         moving,
         pending,
+        engaging,
+        projectiles,
     }
 }
 
@@ -79,12 +124,18 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
     let positions = positions(world);
     let grid = world.resource::<NavGrid>();
     let mut checksum = 0xcbf29ce484222325_u64;
-    let mut valid = positions.len() == expected.len();
+    let skirmish = run.workload == "skirmish";
+    let mut valid = skirmish || positions.len() == expected.len();
     for ((id, position, moving), goal) in positions.iter().zip(expected) {
-        if !moving && position.distance(*goal) < 0.001 {
+        if !skirmish && !moving && position.distance(*goal) < 0.001 {
             run.arrived += 1;
         }
-        valid &= grid.is_walkable(*position) && grid.has_clearance(*position);
+        // Combat steering ignores obstacles, so clearance only applies
+        // to movement-only workloads.
+        valid &= position.is_finite()
+            && position.x.abs() <= 100.0
+            && position.z.abs() <= 100.0
+            && (skirmish || (grid.is_walkable(*position) && grid.has_clearance(*position)));
         for value in [
             *id,
             position.x.to_bits(),
@@ -94,11 +145,32 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
             checksum = (checksum ^ value as u64).wrapping_mul(0x100000001b3);
         }
     }
+    // Fold health into the checksum so combat outcomes must be deterministic
+    // across repeats, not just positions.
+    let mut health: Vec<_> = world
+        .query::<(&Unit, &Health)>()
+        .iter(world)
+        .map(|(unit, health)| (unit.0, health.current.to_bits()))
+        .collect();
+    health.sort_unstable();
+    for (id, bits) in health {
+        for value in [id as u64, bits as u64] {
+            checksum = (checksum ^ value).wrapping_mul(0x100000001b3);
+        }
+    }
     let stats = world.resource::<NavigationStats>();
     run.planned = stats.planned;
     run.failed = stats.failed;
     run.checksum = checksum;
-    run.pass = valid && run.failed == 0 && run.arrived == expected.len();
+    if skirmish {
+        // `arrived` carries survivors for skirmish runs.
+        run.arrived = positions.len();
+        run.kills = expected.len().saturating_sub(positions.len());
+        run.pass =
+            valid && run.failed == 0 && run.kills > 0 && run.arrived + run.kills == expected.len();
+    } else {
+        run.pass = valid && run.failed == 0 && run.arrived == expected.len();
+    }
 }
 
 fn empty_run(per_team: usize, workload: &'static str, repeat: usize, mode: &'static str) -> Run {
@@ -112,6 +184,7 @@ fn empty_run(per_team: usize, workload: &'static str, repeat: usize, mode: &'sta
         planned: 0,
         failed: 0,
         arrived: 0,
+        kills: 0,
         pass: false,
         valid_timing: true,
         checksum: 0,
@@ -126,7 +199,13 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
         vec![config.per_team]
     };
     let workloads: Vec<&'static str> = if config.suite {
-        vec!["idle", "crossing"]
+        if config.skirmish {
+            vec!["idle", "crossing", "skirmish"]
+        } else {
+            vec!["idle", "crossing"]
+        }
+    } else if config.skirmish {
+        vec!["skirmish"]
     } else {
         vec!["crossing"]
     };
@@ -135,17 +214,33 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
     for per_team in sizes {
         for &workload in &workloads {
             for repeat in 1..=repeats {
+                let scenario = if workload == "skirmish" {
+                    Scenario::Skirmish { per_team }
+                } else {
+                    Scenario::Benchmark { per_team }
+                };
                 let mut app = App::new();
                 app.add_plugins(MinimalPlugins)
                     .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                         1.0 / 60.0,
                     )))
-                    .insert_resource(Scenario::Benchmark { per_team })
+                    .insert_resource(scenario)
                     .add_plugins((
                         NavigationPlugin,
                         UnitPlugin { visuals: false },
                         MovementPlugin,
                     ));
+                if workload == "skirmish" {
+                    // Combat systems stay out of movement-only runs so their
+                    // measurements remain comparable across versions.
+                    app.add_plugins((SpatialPlugin, CombatPlugin))
+                        .add_plugins(bevy::asset::AssetPlugin::default())
+                        .init_asset::<Mesh>()
+                        .init_asset::<StandardMaterial>();
+                }
+                if config.profile_systems {
+                    app.add_plugins(ProfilePlugin);
+                }
                 app.finish();
                 app.cleanup();
                 for _ in 0..120 {
@@ -154,9 +249,14 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
                 *app.world_mut().resource_mut::<NavigationStats>() = NavigationStats::default();
                 let mut run = empty_run(per_team, workload, repeat, "headless");
                 let expected = if workload == "crossing" {
-                    let (expected, ms) = crossing_order(app.world_mut());
+                    let (expected, ms) = crossing_order(app.world_mut())
+                        .map_err(|error| format!("{workload}: {error}"))?;
                     run.order_ms = ms;
                     expected
+                } else if workload == "skirmish" {
+                    let (initial, ms) = skirmish_order(app.world_mut());
+                    run.order_ms = ms;
+                    initial
                 } else {
                     positions(app.world_mut())
                         .into_iter()
@@ -172,19 +272,25 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
                         .push(sample(app.world_mut(), tick, update_ms, 0.0));
                 }
                 finish(app.world_mut(), &expected, &mut run);
+                if config.profile_systems {
+                    app.world()
+                        .resource::<SystemProfile>()
+                        .print(per_team, workload, repeat);
+                }
                 let previous = checksums
                     .entry((per_team, workload))
                     .or_insert(run.checksum);
                 run.pass &= *previous == run.checksum;
                 let stats = Stats::new(run.samples.iter().map(|sample| sample.update_ms));
                 println!(
-                    "{per_team} vs {per_team} {workload:8} repeat={repeat} mean={:.3}ms p95={:.3}ms p99={:.3}ms arrived={}/{} failed={} {}",
+                    "{per_team} vs {per_team} {workload:8} repeat={repeat} mean={:.3}ms p95={:.3}ms p99={:.3}ms arrived={}/{} failed={} kills={} {}",
                     stats.mean,
                     stats.p95,
                     stats.p99,
                     run.arrived,
                     per_team * 2,
                     run.failed,
+                    run.kills,
                     if run.pass { "PASS" } else { "FAIL" }
                 );
                 report.runs.push(run);
@@ -254,7 +360,19 @@ fn start_graphical(world: &mut World) {
     if now < 3.0 || world.resource::<VisualRun>().started.is_some() {
         return;
     }
-    let (expected, ms) = crossing_order(world);
+    let scenario = *world.resource::<Scenario>();
+    let (expected, ms) = if matches!(scenario, Scenario::Skirmish { .. }) {
+        skirmish_order(world)
+    } else {
+        match crossing_order(world) {
+            Ok(orders) => orders,
+            Err(error) => {
+                eprintln!("Cannot start benchmark: {error}");
+                world.write_message(AppExit::error());
+                return;
+            }
+        }
+    };
     *world.resource_mut::<NavigationStats>() = NavigationStats::default();
     let mut state = world.resource_mut::<VisualRun>();
     state.expected = expected;
@@ -317,13 +435,19 @@ fn record_graphical(world: &mut World) {
             finish(world, &state.expected, &mut run);
             let passed = run.pass;
             println!(
-                "Graphical benchmark: arrived={}/{} failed={} correctness={} timing_valid={}",
+                "Graphical benchmark: arrived={}/{} failed={} kills={} correctness={} timing_valid={}",
                 run.arrived,
                 run.per_team * 2,
                 run.failed,
+                run.kills,
                 run.pass,
                 run.valid_timing
             );
+            if state.config.profile_systems {
+                world
+                    .resource::<SystemProfile>()
+                    .print(run.per_team, run.workload, run.repeat);
+            }
             state.report.runs.push(run);
             match state.report.write() {
                 Ok(()) => {

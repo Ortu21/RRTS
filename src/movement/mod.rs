@@ -1,12 +1,20 @@
-use crate::navigation::{PlanPaths, Route};
+use crate::{
+    combat::AttackTarget,
+    navigation::{PlanPaths, Route},
+    orders::UnitOrder,
+};
 use bevy::prelude::*;
 
 pub struct MovementPlugin;
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, move_units.after(PlanPaths));
+        app.add_systems(Update, move_units.in_set(MovementSystems).after(PlanPaths));
     }
 }
+
+/// Ordering anchor so avoidance and combat chase run after route movement.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MovementSystems;
 #[derive(Component)]
 pub struct Movement {
     pub speed: f32,
@@ -14,32 +22,66 @@ pub struct Movement {
 #[derive(Component)]
 pub struct MoveTarget(pub Vec3);
 
+/// A plain move order: go to the destination and ignore enemies.
+/// Replaces any attack-move intent and drops temporary combat targets.
 pub fn queue_move(entity: &mut EntityCommands, destination: Vec3) {
-    entity.insert(MoveTarget(destination)).remove::<Route>();
+    entity
+        .insert((UnitOrder::Move { destination }, MoveTarget(destination)))
+        .remove::<(Route, crate::combat::AttackTarget)>();
 }
 
+#[allow(clippy::type_complexity)]
 fn move_units(
     mut commands: Commands,
     time: Res<Time>,
-    mut units: Query<(Entity, &mut Transform, &Movement, &mut Route), With<MoveTarget>>,
+    mut units: Query<
+        (
+            Entity,
+            &mut Transform,
+            &Movement,
+            &MoveTarget,
+            Option<&mut Route>,
+        ),
+        Without<AttackTarget>,
+    >,
 ) {
-    for (entity, mut transform, movement, mut route) in &mut units {
-        let mut remaining = movement.speed * time.delta_secs();
-        while route.next < route.points.len() {
-            let destination = route.points[route.next].with_y(transform.translation.y);
-            let offset = destination - transform.translation;
-            let distance = offset.length();
-            if distance <= remaining {
-                transform.translation = destination;
-                remaining -= distance;
-                route.next += 1;
-            } else {
-                transform.translation += offset.normalize_or_zero() * remaining;
-                break;
+    for (entity, mut transform, movement, target, route) in &mut units {
+        match route {
+            Some(mut route) => {
+                let mut remaining = movement.speed * time.delta_secs();
+                while route.next < route.points.len() {
+                    let destination = route.points[route.next].with_y(transform.translation.y);
+                    let offset = destination - transform.translation;
+                    let distance = offset.length();
+                    if distance <= remaining {
+                        transform.translation = destination;
+                        remaining -= distance;
+                        route.next += 1;
+                    } else {
+                        transform.translation += offset.normalize_or_zero() * remaining;
+                        break;
+                    }
+                }
+                if route.next == route.points.len() {
+                    commands.entity(entity).remove::<(MoveTarget, Route)>();
+                }
             }
-        }
-        if route.next == route.points.len() {
-            commands.entity(entity).remove::<(MoveTarget, Route)>();
+            None => {
+                // No planned route yet (planner backlog) or a transiently
+                // unplannable start: steer directly so units keep closing in
+                // instead of stranding. The planner upgrades them to a real
+                // route when budget allows; arrival snaps exactly.
+                let step = movement.speed * time.delta_secs();
+                let goal = target.0.with_y(transform.translation.y);
+                let offset = goal - transform.translation;
+                let distance = offset.length();
+                if distance <= step {
+                    transform.translation = goal;
+                    commands.entity(entity).remove::<MoveTarget>();
+                } else if distance > f32::EPSILON {
+                    transform.translation += offset / distance * step;
+                }
+            }
         }
     }
 }

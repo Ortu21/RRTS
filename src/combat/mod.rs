@@ -4,7 +4,7 @@ use crate::{
     movement::{ARRIVE_RADIUS, MoveTarget, Movement, MovementSystems, face_toward},
     navigation::Route,
     orders::{UnitOrder, allows_auto_targeting, allows_chase, queue_stop},
-    spatial::{MAP_BOUND, SpatialGrid},
+    spatial::SpatialGrid,
     units::{Team, Unit, UnitKind},
 };
 
@@ -30,9 +30,7 @@ impl Plugin for CombatPlugin {
                 Update,
                 (
                     validate_targets.in_set(ValidateTargets),
-                    (acquire_targets, retarget_stale_locks)
-                        .chain()
-                        .in_set(AcquireTargets),
+                    acquire_targets.in_set(AcquireTargets),
                     resolve_behaviour.in_set(ResolveBehaviour),
                     chase_targets.in_set(ChaseTargets),
                     (traverse_turrets, tick_cooldowns, fire_weapons)
@@ -239,19 +237,35 @@ fn validate_targets(
     }
 }
 
+/// Targeting service: automatic acquisition for targetless units plus
+/// periodic lock re-evaluation for engaged ones, in a single pass. One
+/// query iteration instead of two; each unit scans at most once per
+/// stagger tick either way, so the scan budget is unchanged.
+///
+/// Without re-evaluation a unit chases its first lock forever, running
+/// past nearer enemies: packed battles decay into tail-chasing with almost
+/// no time spent inside weapon range.
 #[allow(clippy::type_complexity)]
 fn acquire_targets(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
     mut clock: ResMut<CombatClock>,
+    weapons: Query<&Weapon>,
     units: Query<
-        (Entity, &Transform, &Team, &UnitOrder, &AcquisitionRange),
-        (With<Unit>, With<Weapon>, Without<AttackTarget>),
+        (
+            Entity,
+            &Transform,
+            &Team,
+            &UnitOrder,
+            &AcquisitionRange,
+            Option<&AttackTarget>,
+        ),
+        (With<Unit>, With<Weapon>),
     >,
     candidates: Query<(&Team, &Health), With<Unit>>,
 ) {
     clock.tick += 1;
-    for (entity, transform, team, order, range) in &units {
+    for (entity, transform, team, order, range, target) in &units {
         if let UnitOrder::Attack { target } = order {
             // Explicit order, not automatic acquisition.
             let valid = candidates
@@ -270,16 +284,59 @@ fn acquire_targets(
         if !(clock.tick + entity.to_bits()).is_multiple_of(ACQUIRE_STRIDE) {
             continue;
         }
-        if let Some((target, _)) = nearest_enemy(
-            &grid,
-            &candidates,
-            team,
-            transform.translation,
-            range.0,
-            entity,
-            None,
-        ) {
-            commands.entity(entity).insert(AttackTarget(target));
+        match target {
+            None => {
+                if let Some((target, _)) = nearest_enemy(
+                    &grid,
+                    &candidates,
+                    team,
+                    transform.translation,
+                    range.0,
+                    entity,
+                    None,
+                ) {
+                    commands.entity(entity).insert(AttackTarget(target));
+                }
+            }
+            Some(target) => {
+                // Retarget every auto-acquiring order except transient Idle:
+                // marchers walking past enemies need fresh locks as much as
+                // chasers. Explicit `Attack` never reaches here (handled
+                // above); invalid locks remain owned by validation.
+                if !matches!(
+                    order,
+                    UnitOrder::AttackMove { .. } | UnitOrder::Move { .. } | UnitOrder::HoldPosition
+                ) {
+                    continue;
+                }
+                let Some(current_position) = target_position(&grid, target.0) else {
+                    continue;
+                };
+                let current_sq = transform.translation.distance_squared(current_position);
+                let weapon_range_sq = weapons
+                    .get(entity)
+                    .map(|weapon| weapon.range.powi(2))
+                    .unwrap_or(f32::MAX);
+                // Only strictly nearer candidates can win (see
+                // `should_retarget`), so shrink the scan to the current lock
+                // distance: wide scans happen only for stale far locks,
+                // settled melee costs almost nothing.
+                let radius = range.0.min(current_sq.sqrt() + 0.01);
+                if let Some((candidate, _)) = nearest_enemy(
+                    &grid,
+                    &candidates,
+                    team,
+                    transform.translation,
+                    radius,
+                    entity,
+                    Some(target.0),
+                )
+                .filter(|(_, candidate_sq)| {
+                    should_retarget(current_sq, *candidate_sq, weapon_range_sq)
+                }) {
+                    commands.entity(entity).insert(AttackTarget(candidate));
+                }
+            }
         }
     }
 }
@@ -324,69 +381,6 @@ fn nearest_enemy(
         }
     });
     best
-}
-
-/// Periodic lock re-evaluation for attack-moving units: on a unit's stagger
-/// tick, replace a stale lock with a clearly closer enemy (see
-/// `should_retarget`). Explicit `Attack` orders keep their ordered target;
-/// invalid locks remain owned by validation.
-#[allow(clippy::type_complexity)]
-fn retarget_stale_locks(
-    mut commands: Commands,
-    grid: Res<SpatialGrid>,
-    clock: Res<CombatClock>,
-    weapons: Query<&Weapon>,
-    units: Query<
-        (
-            Entity,
-            &Transform,
-            &Team,
-            &UnitOrder,
-            &AttackTarget,
-            &AcquisitionRange,
-        ),
-        (With<Unit>, With<Weapon>),
-    >,
-    candidates: Query<(&Team, &Health), With<Unit>>,
-) {
-    for (entity, transform, team, order, target, range) in &units {
-        // Retarget every auto-acquiring order except transient Idle:
-        // marchers walking past enemies need fresh locks as much as chasers.
-        if !matches!(
-            order,
-            UnitOrder::AttackMove { .. } | UnitOrder::Move { .. } | UnitOrder::HoldPosition
-        ) {
-            continue;
-        }
-        if !(clock.tick + entity.to_bits()).is_multiple_of(ACQUIRE_STRIDE) {
-            continue;
-        }
-        let Some(current_position) = target_position(&grid, target.0) else {
-            continue; // owned by validation
-        };
-        let current_sq = transform.translation.distance_squared(current_position);
-        let weapon_range_sq = weapons
-            .get(entity)
-            .map(|weapon| weapon.range.powi(2))
-            .unwrap_or(f32::MAX);
-        // Only strictly nearer candidates can win (see `should_retarget`),
-        // so shrink the scan to the current lock distance: wide scans happen
-        // only for stale far locks, settled melee costs almost nothing.
-        let radius = range.0.min(current_sq.sqrt() + 0.01);
-        if let Some((candidate, _)) = nearest_enemy(
-            &grid,
-            &candidates,
-            team,
-            transform.translation,
-            radius,
-            entity,
-            Some(target.0),
-        )
-        .filter(|(_, candidate_sq)| should_retarget(current_sq, *candidate_sq, weapon_range_sq))
-        {
-            commands.entity(entity).insert(AttackTarget(candidate));
-        }
-    }
 }
 
 /// Resolves order intent into locomotion arbitration markers plus movement
@@ -520,14 +514,18 @@ fn chase_targets(
         if in_weapon_range(transform.translation, target_position, weapon.range) {
             continue;
         }
-        let step = movement.speed * dt;
         let distance = offset.length();
         if distance > f32::EPSILON {
+            // Smooth pursuit: turn the hull at its rate and scale speed by
+            // alignment, so chasers arc into the target instead of spinning
+            // in place or snapping. Full speed when aligned, crawl when the
+            // target is directly behind.
             let turn_rate = crate::units::archetype(*kind).hull_turn;
             face_toward(&mut transform, offset, turn_rate, dt);
-            transform.translation += offset / distance * step.min(distance);
-            transform.translation.x = transform.translation.x.clamp(-MAP_BOUND, MAP_BOUND);
-            transform.translation.z = transform.translation.z.clamp(-MAP_BOUND, MAP_BOUND);
+            let forward = transform.rotation * Vec3::NEG_Z;
+            let alignment = forward.xz().dot(offset.xz().normalize_or_zero()).max(0.0);
+            let step = movement.speed * (0.35 + 0.65 * alignment) * dt;
+            crate::movement::steer(&mut transform, offset, step.min(distance));
         }
     }
 }

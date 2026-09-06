@@ -1,5 +1,7 @@
 use bevy::{prelude::*, window::PrimaryWindow};
 
+pub mod lines;
+
 use crate::{
     camera::RtsCamera,
     combat::{AttackTarget, Chasing, HoldFire},
@@ -16,6 +18,7 @@ pub struct OrderPlugin;
 impl Plugin for OrderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(FormationSettings { spacing: 2.5 })
+            .add_plugins(lines::LinesPlugin)
             .add_systems(
                 PostUpdate,
                 (
@@ -66,6 +69,17 @@ pub fn allows_chase(order: &UnitOrder) -> bool {
         order,
         UnitOrder::Attack { .. } | UnitOrder::AttackMove { .. }
     )
+}
+
+/// Display colour per order: Move green, Attack red, Hold blue, Idle dim
+/// yellow. Shared by order lines, destination markers and route flashes.
+pub fn order_color(order: &UnitOrder) -> Color {
+    match order {
+        UnitOrder::Move { .. } => Color::srgb(0.3, 1.0, 0.4),
+        UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. } => Color::srgb(1.0, 0.35, 0.15),
+        UnitOrder::HoldPosition => Color::srgb(0.35, 0.6, 1.0),
+        UnitOrder::Idle => Color::srgb(0.7, 0.7, 0.25),
+    }
 }
 
 fn issue_move_order(

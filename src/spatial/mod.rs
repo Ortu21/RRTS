@@ -84,6 +84,13 @@ impl SpatialGrid {
         self.positions.get(&entity).copied()
     }
 
+    /// Number of indexed entities sharing the caller's cell: live crowd
+    /// density for congestion-aware planning. Single hash lookup, no scan.
+    pub fn bucket_count(&self, position: Vec2) -> usize {
+        let cell = Self::cell_of(Vec3::new(position.x, 0.0, position.y), self.cell_size);
+        self.cells.get(&cell).map_or(0, Vec::len)
+    }
+
     /// Calls `visit` for every indexed entity within `radius` of `position`.
     /// Cell visit order is deterministic; the caller decides the selection.
     pub fn for_each_nearby(

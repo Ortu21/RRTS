@@ -1,6 +1,6 @@
 use crate::{
     combat::{AttackTarget, Chasing, HoldFire},
-    navigation::{PlanPaths, Route},
+    navigation::{HALF_SIZE, PlanPaths, Route, UNIT_CLEARANCE},
     orders::UnitOrder,
     units::UnitKind,
 };
@@ -74,7 +74,7 @@ fn move_units(
                         remaining -= distance;
                         route.next += 1;
                     } else {
-                        transform.translation += offset.normalize_or_zero() * remaining;
+                        steer(&mut transform, offset, remaining);
                         break;
                     }
                 }
@@ -96,7 +96,7 @@ fn move_units(
                     commands.entity(entity).remove::<MoveTarget>();
                 } else if distance > f32::EPSILON {
                     face_toward(&mut transform, offset, turn_rate, dt);
-                    transform.translation += offset / distance * step;
+                    steer(&mut transform, offset, step);
                 }
             }
         }
@@ -136,6 +136,23 @@ pub fn face_toward(transform: &mut Transform, offset: Vec3, turn_rate: f32, dt: 
     let current = transform.rotation.to_euler(EulerRot::YXZ).0;
     transform.rotation =
         Quat::from_rotation_y(rotate_toward(current, yaw_toward(offset), turn_rate * dt));
+}
+
+/// Single locomotion primitive shared by route following, beeline fallback
+/// and chase: advance along `wish_dir` (XZ) by up to `max_step`, clamped to
+/// the map. Facing is handled by the caller (`face_toward`); arrival snaps
+/// stay explicit at call sites so benchmarks keep exact destinations.
+/// Returns nothing; deterministic bit-for-bit with the inline code it
+/// replaces (clamping an in-bounds position is an exact no-op).
+pub fn steer(transform: &mut Transform, wish_dir: Vec3, max_step: f32) {
+    let flat = Vec3::new(wish_dir.x, 0.0, wish_dir.z);
+    if flat.length_squared() <= f32::EPSILON || max_step <= 0.0 {
+        return;
+    }
+    transform.translation += flat.normalize_or_zero() * max_step.min(flat.length());
+    let bound = HALF_SIZE - UNIT_CLEARANCE;
+    transform.translation.x = transform.translation.x.clamp(-bound, bound);
+    transform.translation.z = transform.translation.z.clamp(-bound, bound);
 }
 
 #[cfg(test)]

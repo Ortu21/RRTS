@@ -1,7 +1,7 @@
 use crate::{formation::formation_slots, movement::MoveTarget};
 use bevy::prelude::*;
 use std::{
-    cmp::Reverse,
+    cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashSet},
     time::Instant,
 };
@@ -10,6 +10,10 @@ pub const HALF_SIZE: f32 = 200.0;
 pub const CELL_SIZE: f32 = 2.5;
 pub const UNIT_CLEARANCE: f32 = 0.8;
 pub const PATHS_PER_FRAME: usize = 32;
+/// Extra route cost per crowded body in the destination cell: routes spread
+/// around live crowds instead of piling through them. Tunable; validated by
+/// keeping zero path failures on the stress workloads.
+pub const CONGESTION_WEIGHT: f32 = 0.5;
 
 /// Fixed map seed: obstacle layout is identical every run, on every
 /// platform, so benchmark checksums stay comparable.
@@ -319,6 +323,29 @@ impl NavGrid {
     }
 
     pub fn find_path(&self, start: Vec3, goal: Vec3) -> Option<Vec<Vec3>> {
+        self.find_path_inner(None, start, goal)
+    }
+
+    /// Theta* with live congestion costs: entering a crowded cell costs
+    /// extra, so fresh routes flow around battles instead of through them.
+    /// Only new plans see congestion (no mid-route replanning, no churn);
+    /// density comes from the pre-movement spatial index, so results stay
+    /// deterministic across repeats.
+    pub fn find_path_congested(
+        &self,
+        spatial: &crate::spatial::SpatialGrid,
+        start: Vec3,
+        goal: Vec3,
+    ) -> Option<Vec<Vec3>> {
+        self.find_path_inner(Some(spatial), start, goal)
+    }
+
+    fn find_path_inner(
+        &self,
+        spatial: Option<&crate::spatial::SpatialGrid>,
+        start: Vec3,
+        goal: Vec3,
+    ) -> Option<Vec<Vec3>> {
         if !self.has_clearance(start) || !self.has_clearance(goal) {
             return None;
         }
@@ -327,18 +354,26 @@ impl NavGrid {
         if !self.walkable[start_cell] || !self.walkable[goal_cell] {
             return None;
         }
-        let mut cost = vec![u32::MAX; self.walkable.len()];
+        // Theta*: any-angle search over the same grid. From each expansion
+        // the path shortcuts through the parent cell whenever line of
+        // sight holds, so open-field routes come out straight instead of
+        // staircased. Costs are exact world distances; the heap orders by
+        // total order so repeated runs agree bit-for-bit.
+        let mut cost = vec![f32::INFINITY; self.walkable.len()];
         let mut parent = vec![usize::MAX; self.walkable.len()];
         let mut open = BinaryHeap::new();
-        let heuristic = |index: usize| {
-            let dx = (index % self.width).abs_diff(goal_cell % self.width) as u32;
-            let dz = (index / self.width).abs_diff(goal_cell / self.width) as u32;
-            10 * dx.max(dz) + 4 * dx.min(dz)
-        };
-        cost[start_cell] = 0;
-        open.push(Reverse((heuristic(start_cell), 0, start_cell)));
-        while let Some(Reverse((_, queued_cost, current))) = open.pop() {
-            if queued_cost != cost[current] {
+        let center = |index: usize| self.cell_center(index).xz();
+        let segment = |a: usize, b: usize| center(a).distance(center(b));
+        let heuristic = |index: usize| center(index).distance(center(goal_cell));
+        cost[start_cell] = 0.0;
+        parent[start_cell] = start_cell;
+        open.push(Reverse((
+            FOrd(heuristic(start_cell)),
+            FOrd(0.0),
+            start_cell,
+        )));
+        while let Some(Reverse((_, queued, current))) = open.pop() {
+            if queued.0 != cost[current] {
                 continue;
             }
             if current == goal_cell {
@@ -396,15 +431,112 @@ impl NavGrid {
                 {
                     continue;
                 }
-                let next_cost = cost[current] + if diagonal { 14 } else { 10 };
+                let via = parent[current];
+                let (next_parent, next_cost) = if self.has_line_of_sight(center(via), center(next))
+                {
+                    (via, cost[via] + segment(via, next))
+                } else {
+                    (current, cost[current] + segment(current, next))
+                };
+                let next_cost = next_cost
+                    + spatial.map_or(0.0, |grid| {
+                        CONGESTION_WEIGHT * grid.bucket_count(center(next)) as f32
+                    });
                 if next_cost < cost[next] {
                     cost[next] = next_cost;
-                    parent[next] = current;
-                    open.push(Reverse((next_cost + heuristic(next), next_cost, next)));
+                    parent[next] = next_parent;
+                    open.push(Reverse((
+                        FOrd(next_cost + heuristic(next)),
+                        FOrd(next_cost),
+                        next,
+                    )));
                 }
             }
         }
         None
+    }
+
+    /// Line of sight between two ground points as an exact grid traversal
+    /// (Amanatides & Woo) over walkability: O(cells crossed) with O(1)
+    /// lookups, instead of rect scans per sample. Conservative by one design
+    /// choice: margin-band cells count as blocked even where point clearance
+    /// alone would pass, so shortcuts keep extra distance and stay valid.
+    pub fn has_line_of_sight(&self, from: Vec2, to: Vec2) -> bool {
+        let width = self.width as isize;
+        let mut x = ((from.x + self.half_size) / self.cell_size).floor() as isize;
+        let mut z = ((from.y + self.half_size) / self.cell_size).floor() as isize;
+        let end_x = ((to.x + self.half_size) / self.cell_size).floor() as isize;
+        let end_z = ((to.y + self.half_size) / self.cell_size).floor() as isize;
+        let step_x = (to.x > from.x) as isize - (to.x < from.x) as isize;
+        let step_z = (to.y > from.y) as isize - (to.y < from.y) as isize;
+        let mut t_max_x = if step_x == 0 {
+            f32::INFINITY
+        } else {
+            let edge = if step_x > 0 {
+                (x + 1) as f32 * self.cell_size - self.half_size
+            } else {
+                x as f32 * self.cell_size - self.half_size
+            };
+            (edge - from.x) / (to.x - from.x)
+        };
+        let mut t_max_z = if step_z == 0 {
+            f32::INFINITY
+        } else {
+            let edge = if step_z > 0 {
+                (z + 1) as f32 * self.cell_size - self.half_size
+            } else {
+                z as f32 * self.cell_size - self.half_size
+            };
+            (edge - from.y) / (to.y - from.y)
+        };
+        let t_delta_x = if step_x == 0 {
+            f32::INFINITY
+        } else {
+            self.cell_size / (to.x - from.x).abs()
+        };
+        let t_delta_z = if step_z == 0 {
+            f32::INFINITY
+        } else {
+            self.cell_size / (to.y - from.y).abs()
+        };
+        loop {
+            if x < 0 || z < 0 || x >= width || z >= width {
+                return false;
+            }
+            if !self.walkable[z as usize * self.width + x as usize] {
+                return false;
+            }
+            if x == end_x && z == end_z {
+                return true;
+            }
+            if t_max_x < t_max_z {
+                x += step_x;
+                t_max_x += t_delta_x;
+            } else {
+                z += step_z;
+                t_max_z += t_delta_z;
+            }
+        }
+    }
+}
+
+/// Total order over finite path costs for the Theta* heap. Costs never go
+/// NaN (sums of finite distances), so `total_cmp` is a valid ordering and
+/// repeated runs agree exactly.
+#[derive(Clone, Copy, PartialEq)]
+struct FOrd(f32);
+
+impl Eq for FOrd {}
+
+impl PartialOrd for FOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FOrd {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -437,6 +569,7 @@ impl Plugin for NavigationPlugin {
 fn plan_paths(
     mut commands: Commands,
     grid: Res<NavGrid>,
+    spatial: Option<Res<crate::spatial::SpatialGrid>>,
     mut stats: ResMut<NavigationStats>,
     pending: Query<(Entity, &Transform, &MoveTarget), Without<Route>>,
 ) {
@@ -444,7 +577,16 @@ fn plan_paths(
     stats.last_planned = 0;
     for (entity, transform, target) in pending.iter().take(PATHS_PER_FRAME) {
         stats.last_planned += 1;
-        if let Some(points) = grid.find_path(transform.translation.with_y(0.0), target.0) {
+        // Congested planning where the spatial index exists (combat
+        // scenes); plain movement benchmarks never load it and keep the
+        // exact legacy behaviour through the same code path.
+        let points = match spatial.as_deref() {
+            Some(index) => {
+                grid.find_path_congested(index, transform.translation.with_y(0.0), target.0)
+            }
+            None => grid.find_path(transform.translation.with_y(0.0), target.0),
+        };
+        if let Some(points) = points {
             commands.entity(entity).insert(Route { points, next: 0 });
             stats.planned += 1;
         } else if grid.has_clearance(target.0)
@@ -511,6 +653,74 @@ mod tests {
                     .is_some()
             );
         }
+    }
+    #[test]
+    fn open_field_routes_come_out_straight() {
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new());
+        let start = Vec3::new(-50.0, 0.0, -20.0);
+        let goal = Vec3::new(50.0, 0.0, 30.0);
+        let path = grid.find_path(start, goal).unwrap();
+        // Any-angle search: start cell, maybe one turning cell, goal.
+        assert!(path.len() <= 3, "staircased path: {path:?}");
+        // Within one half-cell diagonal per endpoint of the direct line:
+        // the only slack is cell-center quantization, never a detour.
+        let direct = start.distance(goal);
+        let full: Vec<Vec3> = std::iter::once(start)
+            .chain(path.iter().copied())
+            .chain(std::iter::once(goal))
+            .collect();
+        let walked: f32 = full.windows(2).map(|leg| leg[0].distance(leg[1])).sum();
+        assert!(walked <= direct + CELL_SIZE * std::f32::consts::SQRT_2 + 0.01);
+    }
+    #[test]
+    fn line_of_sight_respects_clearance_margins() {
+        let grid = NavGrid::new(
+            20.0,
+            CELL_SIZE,
+            vec![Obstacle {
+                center: Vec2::ZERO,
+                half_size: Vec2::new(2.0, 2.0),
+            }],
+        );
+        assert!(grid.has_line_of_sight(Vec2::new(-8.0, 8.0), Vec2::new(8.0, 8.0)));
+        assert!(!grid.has_line_of_sight(Vec2::new(-8.0, 0.0), Vec2::new(8.0, 0.0)));
+        // Grazing the margin counts as blocked: routes keep full clearance.
+        assert!(!grid.has_line_of_sight(Vec2::new(-8.0, 2.5), Vec2::new(8.0, 2.5)));
+    }
+
+    #[test]
+    fn congestion_keeps_routes_valid_and_deterministic() {
+        use crate::spatial::SpatialGrid;
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new());
+        let start = Vec3::new(-50.0, 0.0, 0.0);
+        let goal = Vec3::new(50.0, 0.0, 0.0);
+        // Empty index: congested planning degrades exactly to plain Theta*.
+        let empty = SpatialGrid::new(8.0);
+        assert_eq!(
+            grid.find_path(start, goal),
+            grid.find_path_congested(&empty, start, goal)
+        );
+        // A dense crowd block on the straight line pushes the route around
+        // it while staying valid and deterministic.
+        let mut crowded = SpatialGrid::new(8.0);
+        for index in 0..60 {
+            crowded.insert(
+                Entity::from_bits(index as u64 + 1),
+                Vec3::new(-5.0 + index as f32 * 0.2, 0.0, (index % 2) as f32),
+                0.55,
+            );
+        }
+        let bent = grid.find_path_congested(&crowded, start, goal).unwrap();
+        assert_eq!(
+            Some(bent.clone()),
+            grid.find_path_congested(&crowded, start, goal)
+        );
+        let mut previous = start;
+        for point in &bent {
+            assert!(grid.has_clearance(*point));
+            previous = *point;
+        }
+        assert_eq!(previous, goal);
     }
     #[test]
     fn invalid_and_unreachable_targets_are_rejected() {

@@ -12,14 +12,115 @@ use crate::{
     units::{Team, Unit, UnitPlugin},
 };
 use bevy::{prelude::*, time::TimeUpdateStrategy};
-use cli::Config;
-use profile::{ProfilePlugin, SystemProfile};
-use report::{Report, Run, Sample, Stats};
+use cli::{Config, SuitePreset, Workload};
+use report::{Report, Run, Sample, Stats, TELEMETRY_INTERVAL_TICKS};
 use std::{
     collections::HashMap,
     error::Error,
     time::{Duration, Instant},
 };
+
+const WARMUP_TICKS: usize = 120;
+
+#[derive(Clone, Copy)]
+struct Case {
+    workload: Workload,
+    per_team: usize,
+    ticks: usize,
+    repeats: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Telemetry {
+    moving: usize,
+    pending: usize,
+    engaging: usize,
+    projectiles: usize,
+}
+
+fn suite_cases(config: &Config) -> Vec<Case> {
+    let mut cases = match config.preset {
+        SuitePreset::Quick => vec![
+            Case {
+                workload: Workload::Idle,
+                per_team: 1000,
+                ticks: 600,
+                repeats: 3,
+            },
+            Case {
+                workload: Workload::Crossing,
+                per_team: 1000,
+                ticks: 1800,
+                repeats: 3,
+            },
+            Case {
+                workload: Workload::Crowd,
+                per_team: 1000,
+                ticks: 900,
+                repeats: 3,
+            },
+            Case {
+                workload: Workload::Skirmish,
+                per_team: 1000,
+                ticks: 600,
+                repeats: 3,
+            },
+        ],
+        SuitePreset::Full => {
+            let mut cases = Vec::new();
+            for per_team in [100, 1000] {
+                cases.push(Case {
+                    workload: Workload::Idle,
+                    per_team,
+                    ticks: 600,
+                    repeats: 5,
+                });
+            }
+            for per_team in [100, 500, 1000] {
+                cases.push(Case {
+                    workload: Workload::Crossing,
+                    per_team,
+                    ticks: 1800,
+                    repeats: 5,
+                });
+            }
+            for per_team in [500, 1000, 2500] {
+                cases.push(Case {
+                    workload: Workload::Crowd,
+                    per_team,
+                    ticks: 900,
+                    repeats: 5,
+                });
+            }
+            for per_team in [100, 500, 1000] {
+                cases.push(Case {
+                    workload: Workload::Skirmish,
+                    per_team,
+                    ticks: 1800,
+                    repeats: 5,
+                });
+            }
+            cases.push(Case {
+                workload: Workload::Skirmish,
+                per_team: 5000,
+                ticks: 600,
+                repeats: 3,
+            });
+            cases
+        }
+    };
+    if config.ticks_overridden {
+        for case in &mut cases {
+            case.ticks = config.ticks;
+        }
+    }
+    if config.repeats_overridden {
+        for case in &mut cases {
+            case.repeats = config.repeats;
+        }
+    }
+    cases
+}
 
 fn positions(world: &mut World) -> Vec<(u32, Vec3, bool)> {
     let mut units: Vec<_> = world
@@ -48,7 +149,7 @@ fn crossing_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
     for (entity, id, team) in units {
         let goals = destinations[team as usize]
             .as_ref()
-            .ok_or_else(|| format!("benchmark formations do not fit the map for {team}"))?;
+            .ok_or_else(|| format!("benchmark formations do not fit the map for team {team}"))?;
         let goal = goals[id as usize % scenario.per_team()];
         world
             .entity_mut(entity)
@@ -59,9 +160,7 @@ fn crossing_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
     Ok((expected, start.elapsed().as_secs_f64() * 1000.0))
 }
 
-/// Combat stress orders: every unit attack-moves at the enemy home side.
-/// Returns initial positions (kill baseline) plus generation cost.
-fn skirmish_order(world: &mut World) -> (Vec<Vec3>, f64) {
+fn strategic_order(world: &mut World, attack_move: bool) -> (Vec<Vec3>, f64) {
     let start = Instant::now();
     let scenario = *world.resource::<Scenario>();
     let mut units: Vec<_> = world
@@ -75,48 +174,59 @@ fn skirmish_order(world: &mut World) -> (Vec<Vec3>, f64) {
     let mut initial = Vec::with_capacity(units.len());
     for (entity, _, team, position) in units {
         let destination = scenario.attack_target(team as usize);
-        world
-            .entity_mut(entity)
-            .insert((
-                UnitOrder::AttackMove { destination },
-                MoveTarget(destination),
-            ))
+        let mut entity = world.entity_mut(entity);
+        if attack_move {
+            entity.insert(UnitOrder::AttackMove { destination });
+        } else {
+            entity.insert(UnitOrder::Move { destination });
+        }
+        entity
+            .insert(MoveTarget(destination))
             .remove::<(AttackTarget, Route)>();
         initial.push(position);
     }
     (initial, start.elapsed().as_secs_f64() * 1000.0)
 }
 
-fn sample(world: &mut World, tick: usize, update_ms: f64, frame_ms: f64) -> Sample {
-    let mut moving = 0;
-    let mut pending = 0;
+fn collect_telemetry(world: &mut World) -> Telemetry {
+    let mut telemetry = Telemetry::default();
     for route in world
         .query_filtered::<Has<Route>, With<MoveTarget>>()
         .iter(world)
     {
         if route {
-            moving += 1;
+            telemetry.moving += 1;
         } else {
-            pending += 1;
+            telemetry.pending += 1;
         }
     }
-    let engaging = world
+    telemetry.engaging = world
         .query_filtered::<Entity, (With<Unit>, With<AttackTarget>)>()
         .iter(world)
         .count();
-    let projectiles = world
+    telemetry.projectiles = world
         .query_filtered::<Entity, With<Projectile>>()
         .iter(world)
         .count();
+    telemetry
+}
+
+fn sample(
+    world: &World,
+    tick: usize,
+    update_ms: f64,
+    frame_ms: f64,
+    telemetry: Telemetry,
+) -> Sample {
     Sample {
         tick,
         update_ms,
         frame_ms,
         planning_ms: world.resource::<NavigationStats>().last_ms,
-        moving,
-        pending,
-        engaging,
-        projectiles,
+        moving: telemetry.moving,
+        pending: telemetry.pending,
+        engaging: telemetry.engaging,
+        projectiles: telemetry.projectiles,
     }
 }
 
@@ -124,18 +234,18 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
     let positions = positions(world);
     let grid = world.resource::<NavGrid>();
     let mut checksum = 0xcbf29ce484222325_u64;
-    let skirmish = run.workload == "skirmish";
-    let mut valid = skirmish || positions.len() == expected.len();
+    let allows_local_steering = matches!(run.workload, Workload::Crowd | Workload::Skirmish);
+    let requires_arrival = matches!(run.workload, Workload::Idle | Workload::Crossing);
+    let mut valid = positions.len() == expected.len() || run.workload == Workload::Skirmish;
     for ((id, position, moving), goal) in positions.iter().zip(expected) {
-        if !skirmish && !moving && position.distance(*goal) < 0.001 {
+        if requires_arrival && !moving && position.distance(*goal) < 0.001 {
             run.arrived += 1;
         }
-        // Combat steering ignores obstacles, so clearance only applies
-        // to movement-only workloads.
         valid &= position.is_finite()
             && position.x.abs() <= 100.0
             && position.z.abs() <= 100.0
-            && (skirmish || (grid.is_walkable(*position) && grid.has_clearance(*position)));
+            && (allows_local_steering
+                || (grid.is_walkable(*position) && grid.has_clearance(*position)));
         for value in [
             *id,
             position.x.to_bits(),
@@ -145,8 +255,6 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
             checksum = (checksum ^ value as u64).wrapping_mul(0x100000001b3);
         }
     }
-    // Fold health into the checksum so combat outcomes must be deterministic
-    // across repeats, not just positions.
     let mut health: Vec<_> = world
         .query::<(&Unit, &Health)>()
         .iter(world)
@@ -162,144 +270,194 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
     run.planned = stats.planned;
     run.failed = stats.failed;
     run.checksum = checksum;
-    if skirmish {
-        // `arrived` carries survivors for skirmish runs.
-        run.arrived = positions.len();
-        run.kills = expected.len().saturating_sub(positions.len());
-        run.pass =
-            valid && run.failed == 0 && run.kills > 0 && run.arrived + run.kills == expected.len();
-    } else {
-        run.pass = valid && run.failed == 0 && run.arrived == expected.len();
+    match run.workload {
+        Workload::Skirmish => {
+            run.arrived = positions.len();
+            run.kills = expected.len().saturating_sub(positions.len());
+            run.correctness_pass = valid
+                && run.failed == 0
+                && run.kills > 0
+                && run.arrived + run.kills == expected.len();
+        }
+        Workload::Crowd => {
+            run.arrived = positions.len();
+            run.correctness_pass = valid && run.failed == 0 && positions.len() == expected.len();
+        }
+        Workload::Idle | Workload::Crossing => {
+            run.correctness_pass = valid && run.failed == 0 && run.arrived == expected.len();
+        }
     }
 }
 
-fn empty_run(per_team: usize, workload: &'static str, repeat: usize, mode: &'static str) -> Run {
+fn empty_run(
+    per_team: usize,
+    workload: Workload,
+    repeat: usize,
+    mode: &'static str,
+    ticks: usize,
+) -> Run {
     Run {
         per_team,
         workload,
         repeat,
         mode,
+        ticks,
         samples: Vec::new(),
         order_ms: 0.0,
         planned: 0,
         failed: 0,
         arrived: 0,
         kills: 0,
-        pass: false,
-        valid_timing: true,
+        correctness_pass: false,
+        timing_valid: true,
         checksum: 0,
     }
 }
 
 pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
-    let mut report = Report::new(config.output.clone())?;
-    let sizes = if config.suite {
-        vec![100, 500, 1000]
+    #[cfg(not(feature = "profile-chrome"))]
+    if config.profile_capture {
+        return Err("profile capture requires Cargo feature profile-chrome".into());
+    }
+
+    let preset = if config.suite {
+        config.preset.as_str()
+    } else if config.profile_capture {
+        "profile"
     } else {
-        vec![config.per_team]
+        "custom"
     };
-    let workloads: Vec<&'static str> = if config.suite {
-        if config.skirmish {
-            vec!["idle", "crossing", "skirmish"]
-        } else {
-            vec!["idle", "crossing"]
-        }
-    } else if config.skirmish {
-        vec!["skirmish"]
+    let mut report = Report::new(config.output.clone(), preset)?;
+    let cases = if config.suite {
+        suite_cases(config)
     } else {
-        vec!["crossing"]
+        vec![Case {
+            workload: config.workload,
+            per_team: config.per_team,
+            ticks: config.ticks,
+            repeats: 1,
+        }]
     };
-    let repeats = if config.suite { config.repeats } else { 1 };
     let mut checksums = HashMap::new();
-    for per_team in sizes {
-        for &workload in &workloads {
-            for repeat in 1..=repeats {
-                let scenario = if workload == "skirmish" {
-                    Scenario::Skirmish { per_team }
-                } else {
-                    Scenario::Benchmark { per_team }
-                };
-                let mut app = App::new();
-                app.add_plugins(MinimalPlugins)
-                    .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                        1.0 / 60.0,
-                    )))
-                    .insert_resource(scenario)
-                    .add_plugins((
-                        NavigationPlugin,
-                        UnitPlugin { visuals: false },
-                        MovementPlugin,
-                    ));
-                if workload == "skirmish" {
-                    // Combat systems stay out of movement-only runs so their
-                    // measurements remain comparable across versions.
-                    app.add_plugins((SpatialPlugin, CombatPlugin))
-                        .add_plugins(bevy::asset::AssetPlugin::default())
-                        .init_asset::<Mesh>()
-                        .init_asset::<StandardMaterial>();
+    for case in cases {
+        for repeat in 1..=case.repeats {
+            let scenario = if matches!(case.workload, Workload::Crowd | Workload::Skirmish) {
+                Scenario::Skirmish {
+                    per_team: case.per_team,
                 }
-                if config.profile_systems {
-                    app.add_plugins(ProfilePlugin);
+            } else {
+                Scenario::Benchmark {
+                    per_team: case.per_team,
                 }
-                app.finish();
-                app.cleanup();
-                for _ in 0..120 {
-                    app.update();
-                }
-                *app.world_mut().resource_mut::<NavigationStats>() = NavigationStats::default();
-                let mut run = empty_run(per_team, workload, repeat, "headless");
-                let expected = if workload == "crossing" {
+            };
+            let mut app = App::new();
+            #[cfg(feature = "profile-chrome")]
+            if config.profile_capture {
+                app.add_plugins(bevy::log::LogPlugin::default());
+            }
+            app.add_plugins(MinimalPlugins)
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                    1.0 / 60.0,
+                )))
+                .insert_resource(scenario)
+                .add_plugins((
+                    NavigationPlugin,
+                    UnitPlugin { visuals: false },
+                    MovementPlugin,
+                ));
+            if case.workload == Workload::Crowd {
+                app.add_plugins(SpatialPlugin);
+            } else if case.workload == Workload::Skirmish {
+                app.add_plugins((SpatialPlugin, CombatPlugin))
+                    .add_plugins(bevy::asset::AssetPlugin::default())
+                    .init_asset::<Mesh>()
+                    .init_asset::<StandardMaterial>();
+            }
+            app.finish();
+            app.cleanup();
+            for _ in 0..WARMUP_TICKS {
+                app.update();
+            }
+            *app.world_mut().resource_mut::<NavigationStats>() = NavigationStats::default();
+            let mut run = empty_run(case.per_team, case.workload, repeat, "headless", case.ticks);
+            let expected = match case.workload {
+                Workload::Crossing => {
                     let (expected, ms) = crossing_order(app.world_mut())
-                        .map_err(|error| format!("{workload}: {error}"))?;
+                        .map_err(|error| format!("crossing: {error}"))?;
                     run.order_ms = ms;
                     expected
-                } else if workload == "skirmish" {
-                    let (initial, ms) = skirmish_order(app.world_mut());
+                }
+                Workload::Crowd => {
+                    let (initial, ms) = strategic_order(app.world_mut(), false);
                     run.order_ms = ms;
                     initial
-                } else {
-                    positions(app.world_mut())
-                        .into_iter()
-                        .map(|(_, position, _)| position)
-                        .collect()
-                };
-                run.samples = Vec::with_capacity(config.ticks);
-                for tick in 0..config.ticks {
-                    let start = Instant::now();
-                    app.update();
-                    let update_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    run.samples
-                        .push(sample(app.world_mut(), tick, update_ms, 0.0));
                 }
-                finish(app.world_mut(), &expected, &mut run);
-                if config.profile_systems {
-                    app.world()
-                        .resource::<SystemProfile>()
-                        .print(per_team, workload, repeat);
+                Workload::Skirmish => {
+                    let (initial, ms) = strategic_order(app.world_mut(), true);
+                    run.order_ms = ms;
+                    initial
                 }
-                let previous = checksums
-                    .entry((per_team, workload))
-                    .or_insert(run.checksum);
-                run.pass &= *previous == run.checksum;
-                let stats = Stats::new(run.samples.iter().map(|sample| sample.update_ms));
-                println!(
-                    "{per_team} vs {per_team} {workload:8} repeat={repeat} mean={:.3}ms p95={:.3}ms p99={:.3}ms arrived={}/{} failed={} kills={} {}",
-                    stats.mean,
-                    stats.p95,
-                    stats.p99,
-                    run.arrived,
-                    per_team * 2,
-                    run.failed,
-                    run.kills,
-                    if run.pass { "PASS" } else { "FAIL" }
-                );
-                report.runs.push(run);
+                Workload::Idle => positions(app.world_mut())
+                    .into_iter()
+                    .map(|(_, position, _)| position)
+                    .collect(),
+            };
+            run.samples = Vec::with_capacity(case.ticks);
+            let mut telemetry = collect_telemetry(app.world_mut());
+            #[cfg(feature = "profile-chrome")]
+            let _measurement_guard = config.profile_capture.then(|| {
+                bevy::log::info_span!(
+                    "benchmark_measurement",
+                    workload = case.workload.as_str(),
+                    per_team = case.per_team,
+                    ticks = case.ticks
+                )
+                .entered()
+            });
+            for tick in 0..case.ticks {
+                let start = Instant::now();
+                app.update();
+                let update_ms = start.elapsed().as_secs_f64() * 1000.0;
+                if tick > 0 && tick.is_multiple_of(TELEMETRY_INTERVAL_TICKS) {
+                    telemetry = collect_telemetry(app.world_mut());
+                }
+                run.samples
+                    .push(sample(app.world(), tick, update_ms, 0.0, telemetry));
             }
+            #[cfg(feature = "profile-chrome")]
+            drop(_measurement_guard);
+            finish(app.world_mut(), &expected, &mut run);
+            let previous = checksums
+                .entry((case.per_team, case.workload, case.ticks))
+                .or_insert(run.checksum);
+            run.correctness_pass &= *previous == run.checksum;
+            let stats = Stats::new(run.samples.iter().map(|sample| sample.update_ms));
+            println!(
+                "{} vs {} {:8} repeat={} ticks={} mean={:.3}ms p95={:.3}ms p99={:.3}ms arrived={}/{} failed={} kills={} {}",
+                case.per_team,
+                case.per_team,
+                case.workload.as_str(),
+                repeat,
+                case.ticks,
+                stats.mean,
+                stats.p95,
+                stats.p99,
+                run.arrived,
+                case.per_team * 2,
+                run.failed,
+                run.kills,
+                if run.correctness_pass { "PASS" } else { "FAIL" }
+            );
+            report.runs.push(run);
         }
     }
-    report.write()?;
+    let artifact = report.write()?;
+    if config.record_history {
+        let history = report.record_history(&artifact)?;
+        println!("Benchmark history: {}", history.display());
+    }
     println!("Results: {}", report.directory.canonicalize()?.display());
-    if report.runs.iter().any(|run| !run.pass) {
+    if report.runs.iter().any(|run| !run.correctness_pass) {
         return Err("Benchmark correctness checks failed; see report.md".into());
     }
     Ok(())
@@ -312,10 +470,12 @@ pub struct VisualRun {
     started: Option<f64>,
     tick_start: Instant,
     expected: Vec<Vec3>,
+    telemetry: Telemetry,
     run: Run,
     completed: bool,
     occluded: bool,
 }
+
 impl VisualRun {
     pub fn label(&self) -> &'static str {
         if self.started.is_none() {
@@ -327,21 +487,22 @@ impl VisualRun {
 }
 
 pub fn add_graphical(app: &mut App, config: Config) -> Result<(), Box<dyn Error>> {
-    let report = Report::new(config.output.clone())?;
+    let report = Report::new(config.output.clone(), "graphical")?;
     println!(
-        "Graphical benchmark: {} vs {}, 3 s warmup + {} s measurement. Keep the window visible; input invalidates timing. Output: {}",
+        "Graphical benchmark: {} vs {}, 3 s warmup + {} s measurement. Output: {}",
         config.per_team,
         config.per_team,
         config.seconds,
         report.directory.display()
     );
-    let run = empty_run(config.per_team, "crossing", 1, "graphical");
+    let run = empty_run(config.per_team, config.workload, 1, "graphical", 0);
     app.insert_resource(VisualRun {
         config,
         report,
         started: None,
         tick_start: Instant::now(),
         expected: Vec::new(),
+        telemetry: Telemetry::default(),
         run,
         completed: false,
         occluded: false,
@@ -360,23 +521,33 @@ fn start_graphical(world: &mut World) {
     if now < 3.0 || world.resource::<VisualRun>().started.is_some() {
         return;
     }
-    let scenario = *world.resource::<Scenario>();
-    let (expected, ms) = if matches!(scenario, Scenario::Skirmish { .. }) {
-        skirmish_order(world)
-    } else {
-        match crossing_order(world) {
-            Ok(orders) => orders,
-            Err(error) => {
-                eprintln!("Cannot start benchmark: {error}");
-                world.write_message(AppExit::error());
-                return;
-            }
+    let workload = world.resource::<VisualRun>().config.workload;
+    let result = match workload {
+        Workload::Skirmish => Ok(strategic_order(world, true)),
+        Workload::Crowd => Ok(strategic_order(world, false)),
+        Workload::Crossing => crossing_order(world),
+        Workload::Idle => Ok((
+            positions(world)
+                .into_iter()
+                .map(|(_, position, _)| position)
+                .collect(),
+            0.0,
+        )),
+    };
+    let (expected, ms) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("Cannot start benchmark: {error}");
+            world.write_message(AppExit::error());
+            return;
         }
     };
     *world.resource_mut::<NavigationStats>() = NavigationStats::default();
+    let telemetry = collect_telemetry(world);
     let mut state = world.resource_mut::<VisualRun>();
     state.expected = expected;
     state.run.order_ms = ms;
+    state.telemetry = telemetry;
     state.started = Some(now);
 }
 
@@ -387,7 +558,7 @@ fn track_occlusion(
     for event in events.read() {
         state.occluded = event.occluded;
         if event.occluded && state.started.is_some() {
-            state.run.valid_timing = false;
+            state.run.timing_valid = false;
         }
     }
 }
@@ -405,10 +576,18 @@ fn record_graphical(world: &mut World) {
         let frame_ms = time.delta_secs_f64() * 1000.0;
         let update_ms = state.tick_start.elapsed().as_secs_f64() * 1000.0;
         let tick = state.run.samples.len();
-        state
-            .run
-            .samples
-            .push(sample(world, tick, update_ms, frame_ms));
+        if tick > 0 && tick.is_multiple_of(TELEMETRY_INTERVAL_TICKS) {
+            state.telemetry = collect_telemetry(world);
+        }
+        let telemetry = state.telemetry;
+        state.run.samples.push(sample(
+            world,
+            tick,
+            update_ms,
+            frame_ms,
+            telemetry,
+        ));
+        state.run.ticks = state.run.samples.len();
         let focused = world
             .query::<&Window>()
             .iter(world)
@@ -426,31 +605,27 @@ fn record_graphical(world: &mut World) {
         let wheel = !world
             .resource::<Messages<bevy::input::mouse::MouseWheel>>()
             .is_empty();
-        let visible = !state.occluded;
-        state.run.valid_timing &= focused && visible && !keys && !mouse && !wheel;
+        state.run.timing_valid &= focused && !state.occluded && !keys && !mouse && !wheel;
         if now - started >= state.config.seconds {
             state.completed = true;
-            let mut run =
-                std::mem::replace(&mut state.run, empty_run(0, "crossing", 0, "graphical"));
+            let mut run = std::mem::replace(
+                &mut state.run,
+                empty_run(0, Workload::Crossing, 0, "graphical", 0),
+            );
             finish(world, &state.expected, &mut run);
-            let passed = run.pass;
+            let passed = run.correctness_pass;
             println!(
                 "Graphical benchmark: arrived={}/{} failed={} kills={} correctness={} timing_valid={}",
                 run.arrived,
                 run.per_team * 2,
                 run.failed,
                 run.kills,
-                run.pass,
-                run.valid_timing
+                run.correctness_pass,
+                run.timing_valid
             );
-            if state.config.profile_systems {
-                world
-                    .resource::<SystemProfile>()
-                    .print(run.per_team, run.workload, run.repeat);
-            }
             state.report.runs.push(run);
             match state.report.write() {
-                Ok(()) => {
+                Ok(_) => {
                     println!("Results: {}", state.report.directory.display());
                     world.write_message(if passed {
                         AppExit::Success
@@ -465,4 +640,10 @@ fn record_graphical(world: &mut World) {
             }
         }
     });
+}
+
+pub fn write_history_report(output: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
+    let directory = report::write_history_report(output)?;
+    println!("History report: {}", directory.canonicalize()?.display());
+    Ok(())
 }

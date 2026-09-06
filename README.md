@@ -27,53 +27,78 @@ The playground contains 100 blue vs 100 red units on a 200 × 200 field with thr
 
 Green rings show selected units. The HUD reports FPS, unit count per team, projectiles, engaging units, selection, queued paths and path failures.
 
-## Benchmark scene: 1,000 vs 1,000
+## Benchmark and profiler
+
+```sh
+./scripts/benchmark.sh quick
+./scripts/benchmark.sh full
+```
+
+The headless suite is the canonical performance baseline. It uses a fixed 1/60-second simulation step, 120 untimed warmup ticks and a dedicated optimized Cargo profile. `quick` covers one representative size for every workload with three repetitions; `full` expands sizes and uses five repetitions, plus a short 5,000-vs-5,000 combat stress case. Performance is always descriptive: only functional correctness can fail the command.
+
+The workloads isolate different costs:
+
+- `idle`: ECS scheduling and unchanged units.
+- `crossing`: obstacle-aware path planning and movement without combat or avoidance.
+- `crowd`: movement plus spatial-grid rebuild and local avoidance, without combat.
+- `skirmish`: spatial lookup, targeting, movement, avoidance, projectiles and deaths.
+
+```sh
+./scripts/benchmark.sh quick --repeats 2
+./scripts/benchmark.sh full --ticks 1200
+cargo run --profile benchmark -- --benchmark --headless --workload crowd --units-per-team 2500 --ticks 900
+```
+
+Telemetry requiring full-world queries is sampled every 60 ticks outside the timed region; raw `App::update` timing is still stored for every tick. Each repeated case records median, p95/p99, min/max, median-of-means and median absolute deviation (MAD), alongside correctness and a deterministic state checksum.
+
+### Passive history
+
+```sh
+./scripts/benchmark.sh record
+./scripts/benchmark.sh history
+```
+
+`record` runs the full suite and copies its compact canonical JSON into `benchmarks/history/benchmark/<machine>/`. Recording is intentionally explicit, requires a clean Git commit and refuses duplicate snapshots. Raw samples and traces stay ignored under `benchmark-results/`; only compact summaries belong in history.
+
+`history` creates `history.csv` and `history.md`, comparing each point only with the previous matching machine, Cargo profile, suite schema, preset and case. The deltas have no pass/fail threshold: they are evidence for human investigation, not an active regression gate.
+
+### System profiler
+
+```sh
+./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600
+```
+
+The profiler builds with Bevy's native tracing instrumentation and writes:
+
+- `trace.json`: the complete Chrome Trace event stream, openable in Perfetto or Chrome tracing tools.
+- `profile-summary.json`: compact machine-readable totals and distributions per ECS system.
+- `profile-report.md`: systems sorted by total measured time with calls, mean, p50, p95 and maximum.
+- `run/run.json`: the matching workload and environment metadata.
+
+Chrome Trace is used as the standard raw event format and timeline viewer; the project still owns workload orchestration, measurement boundaries, metadata, summaries and historical output. No marker systems are inserted into Bevy's ECS schedule. Profile numbers are instrumented diagnostics and must not be mixed with uninstrumented benchmark timings; parallel system totals can overlap.
+
+Pass `--record` to `scripts/profile.sh` to retain the compact profile summary in Git history after profiling a clean commit. Raw traces are deliberately never tracked.
+
+### Graphical benchmark
 
 ```sh
 cargo run -- --benchmark
+cargo run -- --benchmark --workload skirmish --units-per-team 1000 --seconds 30
 ```
 
-Blue and red formations exchange sides through the passages. This is a **movement benchmark, without combat or unit collision avoidance**. The wider camera shows both armies. After 3 seconds of idle warmup, the test measures 30 seconds, writes results and exits. Keep the window visible and avoid input during measurement; unfocused frames, reported window occlusion or input invalidate graphical timing. VSync is disabled in every scene, so the HUD reports raw throughput instead of display-quantized rates. Keep the window visible even on platforms that do not report occlusion.
-
-```sh
-cargo run -- --benchmark --units-per-team 500 --seconds 40
-cargo run -- --benchmark --headless --ticks 1800
-cargo run -- --benchmark-suite
-```
-
-## Skirmish stress test: attack-move combat
-
-```sh
-cargo run -- --benchmark --headless --skirmish --units-per-team 1000
-cargo run -- --benchmark --headless --skirmish --units-per-team 10000 --ticks 600
-cargo run -- --benchmark --skirmish
-cargo run -- --benchmark-suite --skirmish
-```
-
-`--skirmish` fields armed units on both map halves and orders every unit to attack-move at the enemy home side. The run measures full-combat simulation cost (spatial grid, avoidance, targeting, projectiles, deaths) plus kills, engaging units and projectiles per tick. Up to 10,000 units per team are supported; crossing formations above the free-cell count are rejected with an error instead of panicking. Skirmish correctness requires at least one kill, zero path failures, in-bounds finite positions, full survivor/kill accounting and matching checksums (health included) across repeats; obstacle clearance is waived because combat steering is local.
-
-```sh
-cargo run -- --benchmark --headless --skirmish --units-per-team 1000 --ticks 600 --profile-systems
-```
-
-`--profile-systems` prints a per-system-set cost table (grid rebuild, validate, acquire, resolve, plan, movement, chase, avoidance, weapon, projectile, death) without touching the CSV schema. Spans are approximate under parallel scheduling; read means, not single ticks.
-
-The suite runs **100/500/1,000 units per team × idle/crossing × 3 repeats**, using fixed 1/60-second simulation steps. Adding `--skirmish` appends the skirmish workload at the same sizes. Each run excludes 120 warmup ticks and measures 1,800 ticks (30 simulated seconds). Headless execution runs as fast as possible, with no window, render entities, camera, selection or UI. Its timings are **simulation CPU costs, not graphical FPS**.
-
-`--repeats`, `--ticks` and `--output <new-directory>` customize the suite. `--help` lists options. Output directories must be new to avoid overwriting earlier results. Short runs can fail arrival checks because movement has not finished.
-
-For representative release measurements, use `cargo run --release -- ...`. Development builds optimize game code at level 1 and dependencies at level 3; reports record the profile. Compare the same profile, machine and mode.
+The graphical mode remains useful for frame pacing and rendering observation. Keep its window visible and avoid input during measurement; focus, occlusion and input are tracked as timing-validity signals. VSync is disabled. Headless values are simulation CPU costs, while graphical frame intervals include rendering and presentation waits; neither measures GPU execution time directly.
 
 ### Results
 
-Each run writes a new directory under `benchmark-results/`:
+Each benchmark run writes a new directory under `benchmark-results/`:
 
-- `report.md`: readable tables, correctness and timing validity.
-- `summary.csv`: mean, p50/p95/p99/max CPU time, graphical frame intervals, order generation cost, planning cost, route failures, arrivals and final-position checksum.
-- `samples.csv`: individual ticks with timings, moving units and planning backlog.
-- `metadata.txt`: version, platform, CPU count, simulation step and workload parameters.
+- `run.json`: canonical schema-versioned artifact with metadata, runs and aggregates.
+- `report.md`: readable run and aggregate tables.
+- `summary.csv`: one row per repetition.
+- `samples.csv`: individual ticks and periodically sampled simulation state.
+- `metadata.txt`: environment and suite parameters.
 
-Headless CPU timing wraps `App::update`; sample collection and final validation are outside that timer. Graphical CPU timing covers the main schedule and excludes render-app work; graphical frame intervals include rendering and presentation waits. Neither measures GPU execution time directly. Order generation is measured separately. Checksums must match across repeated suite cases.
+Output directories must be new, preventing accidental overwrite. `--help` lists all CLI options; `--skirmish` remains an alias for `--workload skirmish`.
 
 ### Full test suite
 
@@ -95,4 +120,4 @@ Playground units apply soft local separation so they no longer stack, but there 
 
 Target platforms: macOS Apple Silicon, Windows x86_64 (MSVC tools), Linux x86_64 (C toolchain plus X11/Wayland and udev development libraries). Native validation is currently performed on macOS; Windows/Linux remain untested. `Cargo.lock` pins dependencies.
 
-Possible follow-ups: patrol/guard orders on the same intent pipeline, avoidance cost tuning guided by `--profile-systems`, wider benchmark size sweeps.
+Possible follow-ups: patrol/guard orders on the same intent pipeline, avoidance cost tuning guided by `scripts/profile.sh`, wider benchmark size sweeps.

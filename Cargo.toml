@@ -6,9 +6,24 @@ rust-version = "1.95"
 
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["3d", "ui"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.38"
+
+[features]
+profile-chrome = ["bevy/trace_chrome"]
 
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.benchmark]
+inherits = "release"
+codegen-units = 1
+lto = "thin"
+
+[profile.profiling]
+inherits = "release"
+debug = 1

@@ -1,219 +1,239 @@
-//! Opt-in per-system-set profiler for benchmark runs (`--profile-systems`).
+//! Chrome Trace post-processing for profiler runs.
 //!
-//! Marker systems bracket the simulation sets and accumulate wall-clock
-//! time in [`SystemProfile`]. Spans are measured independently, so an
-//! unconstrained system slipping between two markers is attributed to the
-//! enclosing span: numbers are approximate, good enough to rank bottlenecks
-//! (avoidance vs grid rebuild vs acquisition) but not for accounting.
-//! Profiling never touches simulation state, so determinism is unaffected,
-//! and the plugin is only added when the flag is set (zero overhead).
+//! Bevy emits the actual ECS-system spans. This module never registers marker
+//! systems and therefore cannot add ECS dependencies or reorder simulation.
 
-use bevy::prelude::*;
-use std::time::Instant;
-
-use crate::{
-    combat::{
-        AcquireTargets, ChaseTargets, DeathSystems, ProjectileSystems, ResolveBehaviour,
-        ValidateTargets, WeaponSystems,
-    },
-    movement::MovementSystems,
-    navigation::PlanPaths,
-    spatial::{SpatialSystems, apply_avoidance},
+use super::report::{
+    BenchmarkArtifact, Metadata, REPORT_SCHEMA_VERSION, Stats, record_json_artifact,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::{self, File},
+    io::{self, BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
 };
 
-pub struct ProfilePlugin;
-
-impl Plugin for ProfilePlugin {
-    fn build(&self, app: &mut App) {
-        // Each marker carries BOTH constraints (after previous, before next):
-        // single-sided markers float to the schedule edges under parallel
-        // execution and every span would read ~full frame. Sandwiching pins
-        // each span around its set. This also pins avoidance ahead of weapon
-        // fire, matching the design intent (separate right after movement).
-        app.init_resource::<SystemProfile>()
-            .add_systems(Update, start_rebuild.before(SpatialSystems))
-            .add_systems(
-                Update,
-                end_rebuild.after(SpatialSystems).before(ValidateTargets),
-            )
-            .add_systems(
-                Update,
-                start_validate.after(SpatialSystems).before(ValidateTargets),
-            )
-            .add_systems(
-                Update,
-                end_validate.after(ValidateTargets).before(AcquireTargets),
-            )
-            .add_systems(
-                Update,
-                start_acquire.after(ValidateTargets).before(AcquireTargets),
-            )
-            .add_systems(
-                Update,
-                end_acquire.after(AcquireTargets).before(ResolveBehaviour),
-            )
-            .add_systems(
-                Update,
-                start_resolve.after(AcquireTargets).before(ResolveBehaviour),
-            )
-            .add_systems(
-                Update,
-                end_resolve.after(ResolveBehaviour).before(PlanPaths),
-            )
-            .add_systems(Update, start_plan.after(ResolveBehaviour).before(PlanPaths))
-            .add_systems(Update, end_plan.after(PlanPaths).before(MovementSystems))
-            .add_systems(
-                Update,
-                start_movement.after(PlanPaths).before(MovementSystems),
-            )
-            .add_systems(
-                Update,
-                end_movement.after(MovementSystems).before(ChaseTargets),
-            )
-            .add_systems(
-                Update,
-                start_chase.after(MovementSystems).before(ChaseTargets),
-            )
-            .add_systems(
-                Update,
-                end_chase.after(ChaseTargets).before(apply_avoidance),
-            )
-            .add_systems(
-                Update,
-                start_avoidance.after(ChaseTargets).before(apply_avoidance),
-            )
-            .add_systems(
-                Update,
-                end_avoidance.after(apply_avoidance).before(WeaponSystems),
-            )
-            .add_systems(
-                Update,
-                start_weapon.after(apply_avoidance).before(WeaponSystems),
-            )
-            .add_systems(
-                Update,
-                end_weapon.after(WeaponSystems).before(ProjectileSystems),
-            )
-            .add_systems(
-                Update,
-                start_projectile
-                    .after(WeaponSystems)
-                    .before(ProjectileSystems),
-            )
-            .add_systems(
-                Update,
-                end_projectile.after(ProjectileSystems).before(DeathSystems),
-            )
-            .add_systems(
-                Update,
-                start_death.after(ProjectileSystems).before(DeathSystems),
-            )
-            .add_systems(Update, end_death.after(DeathSystems));
-    }
-}
-
-#[derive(Resource, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SystemProfile {
-    open: Vec<(&'static str, Instant)>,
-    totals: Vec<(&'static str, f64, u64)>,
+    pub system: String,
+    pub calls: usize,
+    pub total_ms: f64,
+    pub durations_ms: Stats,
 }
 
-impl SystemProfile {
-    fn open(&mut self, label: &'static str) {
-        self.open.push((label, Instant::now()));
-    }
-
-    fn close(&mut self, label: &'static str) {
-        if let Some(index) = self.open.iter().rposition(|(open, _)| *open == label) {
-            let (_, start) = self.open.remove(index);
-            let ms = start.elapsed().as_secs_f64() * 1000.0;
-            match self.totals.iter_mut().find(|(name, _, _)| *name == label) {
-                Some(entry) => {
-                    entry.1 += ms;
-                    entry.2 += 1;
-                }
-                None => self.totals.push((label, ms, 1)),
-            }
-        }
-    }
-
-    /// Mean milliseconds per measured tick, sorted as registered.
-    pub fn means(&self) -> Vec<(&'static str, f64)> {
-        self.totals
-            .iter()
-            .map(|(label, total, calls)| (*label, total / (*calls).max(1) as f64))
-            .collect()
-    }
-
-    pub fn print(&self, per_team: usize, workload: &str, repeat: usize) {
-        let means = self.means();
-        let total: f64 = means.iter().map(|(_, mean)| mean).sum();
-        println!(
-            "profile {per_team} vs {per_team} {workload} repeat={repeat} (mean ms/tick, spans may overlap):"
-        );
-        for (label, mean) in &means {
-            let share = if total > 0.0 {
-                mean / total * 100.0
-            } else {
-                0.0
-            };
-            println!("  {label:10} {mean:8.3}ms  ({share:5.1}%)");
-        }
-        println!("  total      {total:8.3}ms measured");
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProfileArtifact {
+    pub kind: String,
+    pub schema_version: u32,
+    pub metadata: Metadata,
+    pub case_id: String,
+    pub measurement_wall_ms: f64,
+    pub systems: Vec<SystemProfile>,
 }
 
-macro_rules! span {
-    ($start:ident, $end:ident, $label:literal) => {
-        fn $start(mut profile: ResMut<SystemProfile>) {
-            profile.open($label);
+#[derive(Clone)]
+struct Span {
+    name: String,
+    start_us: f64,
+    duration_us: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TraceRoot {
+    Events(Vec<TraceEvent>),
+    Wrapped {
+        #[serde(rename = "traceEvents")]
+        trace_events: Vec<TraceEvent>,
+    },
+}
+
+#[derive(Deserialize)]
+struct TraceEvent {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ph: String,
+    #[serde(default)]
+    ts: f64,
+    dur: Option<f64>,
+    #[serde(default)]
+    pid: i64,
+    #[serde(default)]
+    tid: i64,
+}
+
+pub fn write_profile_report(
+    trace: &Path,
+    benchmark_run: &Path,
+    output: Option<PathBuf>,
+    record_history: bool,
+) -> io::Result<PathBuf> {
+    let benchmark: BenchmarkArtifact =
+        serde_json::from_reader(BufReader::new(File::open(benchmark_run)?))?;
+    let parsed_trace: TraceRoot = serde_json::from_reader(BufReader::new(File::open(trace)?))?;
+    let spans = parse_spans(parsed_trace);
+    let measurement = spans
+        .iter()
+        .filter(|span| span.name.starts_with("benchmark_measurement"))
+        .max_by(|left, right| left.duration_us.total_cmp(&right.duration_us))
+        .ok_or_else(|| io::Error::other("trace has no benchmark_measurement span"))?;
+
+    let mut durations: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let measurement_end = measurement.start_us + measurement.duration_us;
+    for span in &spans {
+        let end = span.start_us + span.duration_us;
+        if span.start_us < measurement.start_us || end > measurement_end {
+            continue;
         }
-        fn $end(mut profile: ResMut<SystemProfile>) {
-            profile.close($label);
+        if let Some(system) = system_name(&span.name) {
+            durations
+                .entry(system)
+                .or_default()
+                .push(span.duration_us / 1000.0);
         }
+    }
+    if durations.is_empty() {
+        return Err(io::Error::other(
+            "measurement contains no Bevy system spans; ensure profile-chrome is enabled",
+        ));
+    }
+    let mut systems: Vec<_> = durations
+        .into_iter()
+        .map(|(system, values)| SystemProfile {
+            system,
+            calls: values.len(),
+            total_ms: values.iter().sum(),
+            durations_ms: Stats::new(values.into_iter()),
+        })
+        .collect();
+    systems.sort_by(|left, right| right.total_ms.total_cmp(&left.total_ms));
+
+    let run = benchmark
+        .runs
+        .first()
+        .ok_or_else(|| io::Error::other("benchmark run contains no case"))?;
+    let case_id = format!(
+        "{}/{}/{}x2/{}t",
+        run.mode,
+        run.workload.as_str(),
+        run.per_team,
+        run.ticks
+    );
+    let artifact = ProfileArtifact {
+        kind: "profile".into(),
+        schema_version: REPORT_SCHEMA_VERSION,
+        metadata: benchmark.metadata,
+        case_id: case_id.clone(),
+        measurement_wall_ms: measurement.duration_us / 1000.0,
+        systems,
     };
+
+    let directory = output.unwrap_or_else(|| {
+        trace
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    fs::create_dir_all(&directory)?;
+    serde_json::to_writer_pretty(
+        BufWriter::new(File::create(directory.join("profile-summary.json"))?),
+        &artifact,
+    )?;
+    write_markdown(&directory, &artifact)?;
+    if record_history {
+        let path = record_json_artifact("profile", &artifact.metadata, &case_id, &artifact)?;
+        println!("Profile history: {}", path.display());
+    }
+    Ok(directory)
 }
 
-span!(start_rebuild, end_rebuild, "rebuild");
-span!(start_validate, end_validate, "validate");
-span!(start_acquire, end_acquire, "acquire");
-span!(start_resolve, end_resolve, "resolve");
-span!(start_plan, end_plan, "plan");
-span!(start_movement, end_movement, "movement");
-span!(start_chase, end_chase, "chase");
-span!(start_avoidance, end_avoidance, "avoidance");
-span!(start_weapon, end_weapon, "weapon");
-span!(start_projectile, end_projectile, "projectile");
-span!(start_death, end_death, "death");
+fn write_markdown(directory: &Path, artifact: &ProfileArtifact) -> io::Result<()> {
+    let mut markdown = BufWriter::new(File::create(directory.join("profile-report.md"))?);
+    writeln!(
+        markdown,
+        "# RRTS system profile\n\nCase: `{}` · measurement wall time: {:.3} ms · machine: `{}`\n\nThese instrumented values describe where time was spent; they are not benchmark timings and never produce a regression verdict. Parallel system totals may overlap and must not be added to obtain frame wall time.\n\n| System | Calls | Total ms | Mean ms | p50 ms | p95 ms | Max ms |\n|---|---:|---:|---:|---:|---:|---:|",
+        artifact.case_id, artifact.measurement_wall_ms, artifact.metadata.machine_key,
+    )?;
+    for system in &artifact.systems {
+        writeln!(
+            markdown,
+            "| `{}` | {} | {:.3} | {:.4} | {:.4} | {:.4} | {:.4} |",
+            system.system,
+            system.calls,
+            system.total_ms,
+            system.durations_ms.mean,
+            system.durations_ms.p50,
+            system.durations_ms.p95,
+            system.durations_ms.max,
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_spans(trace: TraceRoot) -> Vec<Span> {
+    let events = match trace {
+        TraceRoot::Events(events)
+        | TraceRoot::Wrapped {
+            trace_events: events,
+        } => events,
+    };
+    let mut open: HashMap<(i64, i64), Vec<(String, f64)>> = HashMap::new();
+    let mut spans = Vec::new();
+    for event in events {
+        let key = (event.pid, event.tid);
+        match event.ph.as_str() {
+            "X" => {
+                if let Some(duration) = event.dur {
+                    spans.push(Span {
+                        name: event.name,
+                        start_us: event.ts,
+                        duration_us: duration,
+                    });
+                }
+            }
+            "B" => open.entry(key).or_default().push((event.name, event.ts)),
+            "E" => {
+                if let Some((name, start_us)) = open.get_mut(&key).and_then(Vec::pop) {
+                    spans.push(Span {
+                        name,
+                        start_us,
+                        duration_us: (event.ts - start_us).max(0.0),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+fn system_name(name: &str) -> Option<String> {
+    let value = name.strip_prefix("system:")?.trim();
+    let value = value.strip_prefix("name=").unwrap_or(value).trim();
+    Some(value.trim_matches('"').to_owned())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn spans_accumulate_means_and_ignore_stray_closes() {
-        let mut profile = SystemProfile::default();
-        profile.close("never-opened");
-        profile.open("a");
-        profile.close("a");
-        profile.open("a");
-        profile.close("a");
-        profile.open("b");
-        profile.close("b");
-        assert!(profile.means().iter().all(|(_, mean)| *mean >= 0.0));
-        let a = profile
-            .means()
-            .iter()
-            .find(|(label, _)| *label == "a")
-            .unwrap()
-            .1;
-        let b = profile
-            .means()
-            .iter()
-            .find(|(label, _)| *label == "b")
-            .unwrap()
-            .1;
-        assert!(a >= 0.0 && b >= 0.0);
-        assert_eq!(profile.totals.len(), 2);
+    fn parses_threaded_and_complete_spans() {
+        let trace: TraceRoot = serde_json::from_value(serde_json::json!([
+            {"name":"benchmark_measurement: workload=skirmish", "ph":"B", "ts":10.0, "pid":1, "tid":1},
+            {"name":"system: name=acquire_targets", "ph":"X", "ts":20.0, "dur":5.0, "pid":1, "tid":2},
+            {"name":"system: name=move_units", "ph":"B", "ts":30.0, "pid":1, "tid":3},
+            {"name":"system: name=move_units", "ph":"E", "ts":37.0, "pid":1, "tid":3},
+            {"name":"benchmark_measurement", "ph":"E", "ts":50.0, "pid":1, "tid":1}
+        ]))
+        .unwrap();
+        let spans = parse_spans(trace);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            system_name("system: name=move_units").as_deref(),
+            Some("move_units")
+        );
     }
 }

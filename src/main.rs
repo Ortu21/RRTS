@@ -13,7 +13,7 @@ mod ui;
 mod units;
 mod world;
 
-use benchmark::cli::{Config, HELP};
+use benchmark::cli::{Config, HELP, Workload};
 use bevy::prelude::*;
 use scenario::Scenario;
 
@@ -29,6 +29,32 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    if config.history_report {
+        return match benchmark::write_history_report(config.output.clone()) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if let (Some(trace), Some(run)) = (&config.profile_report, &config.profile_run) {
+        return match benchmark::profile::write_profile_report(
+            trace,
+            run,
+            config.output.clone(),
+            config.record_history,
+        ) {
+            Ok(directory) => {
+                println!("Profile report: {}", directory.display());
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     if config.headless {
         return match benchmark::run_headless(&config) {
             Ok(()) => std::process::ExitCode::SUCCESS,
@@ -39,7 +65,7 @@ fn main() -> std::process::ExitCode {
         };
     }
     let scene = if config.benchmark {
-        if config.skirmish {
+        if matches!(config.workload, Workload::Crowd | Workload::Skirmish) {
             Scenario::Skirmish {
                 per_team: config.per_team,
             }
@@ -85,9 +111,6 @@ fn main() -> std::process::ExitCode {
             movement::MovementPlugin,
             ui::UiPlugin,
         ));
-    if config.profile_systems {
-        app.add_plugins(benchmark::profile::ProfilePlugin);
-    }
     if config.benchmark
         && let Err(error) = benchmark::add_graphical(&mut app, config)
     {

@@ -45,11 +45,11 @@ impl Plugin for LinesPlugin {
 struct LineAssets {
     segment: Handle<Mesh>,
     marker: Handle<Mesh>,
-    order_material: [Handle<StandardMaterial>; 5],
-    flash_material: [Handle<StandardMaterial>; 5],
+    order_material: [Handle<StandardMaterial>; 6],
+    flash_material: [Handle<StandardMaterial>; 6],
 }
 
-/// Which order colour slot an entity uses: Move, Attack, Hold, Idle, Patrol.
+/// Which order colour slot an entity uses: Move, Attack, Hold, Idle, Patrol, Guard.
 pub fn order_slot(order: &UnitOrder) -> usize {
     match order {
         UnitOrder::Move { .. } => 0,
@@ -57,6 +57,7 @@ pub fn order_slot(order: &UnitOrder) -> usize {
         UnitOrder::HoldPosition => 2,
         UnitOrder::Idle => 3,
         UnitOrder::Patrol { .. } => 4,
+        UnitOrder::Guard { .. } => 5,
     }
 }
 
@@ -105,6 +106,9 @@ fn setup_line_assets(
         UnitOrder::Patrol {
             points: Vec::new(),
             next: 0,
+        },
+        UnitOrder::Guard {
+            target: Entity::from_bits(9),
         },
     ];
     for (slot, order) in orders.into_iter().enumerate() {
@@ -181,7 +185,7 @@ fn update_order_graphics(
     assets: Res<LineAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     grid: Res<SpatialGrid>,
-    units: Query<(Entity, &MoveTarget, &UnitOrder), With<Selected>>,
+    units: Query<(Entity, Option<&MoveTarget>, &UnitOrder), With<Selected>>,
     mut viz: Query<
         (
             Entity,
@@ -203,6 +207,15 @@ fn update_order_graphics(
         let Some(origin) = grid.position(entity) else {
             continue;
         };
+        // Guards holding near their ward carry no MoveTarget: draw the
+        // ward link instead so the order stays visible.
+        let goal = target.map(|target| target.0).or_else(|| match order {
+            UnitOrder::Guard { target } => grid.position(*target),
+            _ => None,
+        });
+        let Some(goal) = goal else {
+            continue;
+        };
         let slot = order_slot(order);
         live.insert((entity, 0u8));
         live.insert((entity, 1u8));
@@ -219,7 +232,7 @@ fn update_order_graphics(
                         *drawn = order.clone();
                         material.0 = assets.order_material[slot].clone();
                     }
-                    *viz_transform = segment_transform(origin, target.0, LINE_THICKNESS, LINE_Y);
+                    *viz_transform = segment_transform(origin, goal, LINE_THICKNESS, LINE_Y);
                 }
                 VizKind::Marker { order: drawn } => {
                     has_marker = true;
@@ -227,7 +240,7 @@ fn update_order_graphics(
                         *drawn = order.clone();
                         material.0 = assets.order_material[slot].clone();
                     }
-                    viz_transform.translation = target.0.with_y(MARKER_Y);
+                    viz_transform.translation = goal.with_y(MARKER_Y);
                 }
                 VizKind::Flash { .. } => {}
             }
@@ -242,7 +255,7 @@ fn update_order_graphics(
                 },
                 Mesh3d(assets.segment.clone()),
                 MeshMaterial3d(assets.order_material[slot].clone()),
-                segment_transform(origin, target.0, LINE_THICKNESS, LINE_Y),
+                segment_transform(origin, goal, LINE_THICKNESS, LINE_Y),
             ));
         }
         if !has_marker {
@@ -255,7 +268,7 @@ fn update_order_graphics(
                 },
                 Mesh3d(assets.marker.clone()),
                 MeshMaterial3d(assets.order_material[slot].clone()),
-                Transform::from_translation(target.0.with_y(MARKER_Y))
+                Transform::from_translation(goal.with_y(MARKER_Y))
                     .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
             ));
         }
@@ -326,6 +339,12 @@ mod tests {
                 next: 0
             }),
             4
+        );
+        assert_eq!(
+            order_slot(&UnitOrder::Guard {
+                target: Entity::from_bits(9)
+            }),
+            5
         );
     }
 }

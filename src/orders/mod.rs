@@ -21,7 +21,12 @@ impl Plugin for OrderPlugin {
             .add_plugins(lines::LinesPlugin)
             .add_systems(
                 PostUpdate,
-                (issue_pending_attack_move, issue_pending_patrol).before(SelectionSystems),
+                (
+                    issue_pending_attack_move,
+                    issue_pending_patrol,
+                    issue_pending_guard,
+                )
+                    .before(SelectionSystems),
             )
             .add_systems(
                 PostUpdate,
@@ -29,6 +34,7 @@ impl Plugin for OrderPlugin {
                     issue_move_order,
                     enter_attack_move_targeting,
                     enter_patrol_targeting,
+                    enter_guard_targeting,
                     issue_hold_stop_keys,
                 )
                     .after(SelectionSystems),
@@ -52,6 +58,7 @@ pub enum PendingOrder {
     None,
     AttackMove,
     Patrol,
+    Guard,
 }
 
 /// Cap waypoint count per patrol loop: bounds memory and keeps loops readable.
@@ -68,6 +75,7 @@ pub enum UnitOrder {
     AttackMove { destination: Vec3 },
     HoldPosition,
     Patrol { points: Vec<Vec3>, next: usize },
+    Guard { target: Entity },
 }
 
 /// Behaviour rule: which orders may acquire enemies on their own.
@@ -82,6 +90,7 @@ pub fn allows_auto_targeting(order: &UnitOrder) -> bool {
             | UnitOrder::HoldPosition
             | UnitOrder::Idle
             | UnitOrder::Patrol { .. }
+            | UnitOrder::Guard { .. }
     )
 }
 
@@ -90,13 +99,16 @@ pub fn allows_auto_targeting(order: &UnitOrder) -> bool {
 pub fn allows_chase(order: &UnitOrder) -> bool {
     matches!(
         order,
-        UnitOrder::Attack { .. } | UnitOrder::AttackMove { .. } | UnitOrder::Patrol { .. }
+        UnitOrder::Attack { .. }
+            | UnitOrder::AttackMove { .. }
+            | UnitOrder::Patrol { .. }
+            | UnitOrder::Guard { .. }
     )
 }
 
 /// Display colour per order: Move green, Attack red, Hold blue, Idle dim
-/// yellow, Patrol violet. Shared by order lines, destination markers and
-/// route flashes.
+/// yellow, Patrol violet, Guard bright yellow. Shared by order lines,
+/// destination markers and route flashes.
 pub fn order_color(order: &UnitOrder) -> Color {
     match order {
         UnitOrder::Move { .. } => Color::srgb(0.3, 1.0, 0.4),
@@ -104,6 +116,7 @@ pub fn order_color(order: &UnitOrder) -> Color {
         UnitOrder::HoldPosition => Color::srgb(0.35, 0.6, 1.0),
         UnitOrder::Idle => Color::srgb(0.7, 0.7, 0.25),
         UnitOrder::Patrol { .. } => Color::srgb(0.75, 0.4, 1.0),
+        UnitOrder::Guard { .. } => Color::srgb(1.0, 0.85, 0.2),
     }
 }
 
@@ -161,6 +174,38 @@ fn issue_move_order(
                 }
             }
             return;
+        }
+        // Friendly unit under cursor: guard it (right-click), Shift queues.
+        // Self-guard is ignored; if nobody was issued (e.g. right-click on
+        // the single selected unit itself), fall through to the ground move
+        // so the click still marches instead of being swallowed.
+        let wards: Vec<_> = enemies
+            .iter()
+            .filter(|(_, _, team)| team.0 == PLAYER_TEAM.0)
+            .map(|(entity, transform, _)| (entity, transform.translation()))
+            .collect();
+        if let Some(ward) = pick_enemy_target(&ray, &wards) {
+            let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+            let mut issued = false;
+            for (entity, _, order) in &selected {
+                if entity == ward {
+                    continue;
+                }
+                issued = true;
+                if additive && is_busy(order, &mut queues, entity) {
+                    enqueue_order(
+                        &mut commands,
+                        &mut queues,
+                        entity,
+                        UnitOrder::Guard { target: ward },
+                    );
+                } else {
+                    queue_guard(&mut commands.entity(entity), ward);
+                }
+            }
+            if issued {
+                return;
+            }
         }
     }
     let Some(center) = ground_position(camera, transform, cursor) else {
@@ -221,6 +266,71 @@ fn enter_patrol_targeting(
     }
 }
 
+/// T arms guard targeting (toggle): left-click a friendly unit to follow
+/// and defend it. ESC or right click disarms.
+fn enter_guard_targeting(
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    selected: Query<Entity, With<Selected>>,
+    mut pending: ResMut<PendingOrder>,
+) {
+    if !window.focused || !keys.just_pressed(KeyCode::KeyT) {
+        return;
+    }
+    if *pending == PendingOrder::Guard {
+        *pending = PendingOrder::None;
+    } else if !selected.is_empty() {
+        *pending = PendingOrder::Guard;
+    }
+}
+
+/// Left click while guard-targeting guards the friendly unit under the
+/// cursor. Self-guard is ignored; targeting stays armed on a miss so the
+/// player can retry, and disarms after issuing.
+#[allow(clippy::too_many_arguments)]
+fn issue_pending_guard(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    selected: Query<Entity, With<Selected>>,
+    friendlies: Query<(Entity, &GlobalTransform, &Team), With<Unit>>,
+    mut pending: ResMut<PendingOrder>,
+) {
+    if *pending != PendingOrder::Guard {
+        return;
+    }
+    if !window.focused || keys.just_pressed(KeyCode::Escape) {
+        *pending = PendingOrder::None;
+        return;
+    }
+    if !mouse.just_released(MouseButton::Left) || selected.is_empty() {
+        return;
+    }
+    let (camera, transform) = *camera;
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok(ray) = camera.viewport_to_world(transform, cursor) else {
+        return;
+    };
+    let wards: Vec<_> = friendlies
+        .iter()
+        .filter(|(_, _, team)| team.0 == PLAYER_TEAM.0)
+        .map(|(entity, transform, _)| (entity, transform.translation()))
+        .collect();
+    let Some(ward) = pick_enemy_target(&ray, &wards) else {
+        return;
+    };
+    for entity in &selected {
+        if entity != ward {
+            queue_guard(&mut commands.entity(entity), ward);
+        }
+    }
+    *pending = PendingOrder::None;
+}
+
 /// Left click while patrol-targeting appends the clicked point to every
 /// selected unit's own patrol loop (capped). Units without a patrol start
 /// one; targeting stays armed for the next point.
@@ -261,13 +371,17 @@ fn issue_pending_patrol(
                     points.push(point);
                 }
                 let leg = points[*next % points.len()];
-                entity_commands.insert((
-                    UnitOrder::Patrol {
-                        points,
-                        next: *next,
-                    },
-                    MoveTarget(leg),
-                ));
+                // Editing the live loop replaces intent: drop any queue
+                // behind the never-completing patrol (dead weight in HUD).
+                entity_commands
+                    .insert((
+                        UnitOrder::Patrol {
+                            points,
+                            next: *next,
+                        },
+                        MoveTarget(leg),
+                    ))
+                    .remove::<UnitOrderQueue>();
             }
             _ => {
                 queue_patrol(&mut entity_commands, vec![point]);
@@ -416,6 +530,14 @@ fn apply_order(entity: &mut EntityCommands, order: UnitOrder) {
                 .insert(order)
                 .remove::<(MoveTarget, Route, AttackTarget, Chasing, HoldFire)>();
         }
+        UnitOrder::Guard { .. } => {
+            // Follow target is dynamic: resolve_behaviour seeds and refreshes
+            // the MoveTarget from the ward's live position each frame, so
+            // the budgeted planner routes around obstacles automatically.
+            entity
+                .insert(order)
+                .remove::<(MoveTarget, Route, AttackTarget, Chasing, HoldFire)>();
+        }
     }
 }
 
@@ -493,6 +615,15 @@ pub fn queue_attack_move(entity: &mut EntityCommands, destination: Vec3) {
     entity.remove::<UnitOrderQueue>();
 }
 
+/// Guard a friendly unit: follow it at close range and engage enemies near the ward.
+/// Acquire within the guard's AcquisitionRange of both itself and the ward;
+/// release beyond 1.5x that radius from either unit.
+/// Resume following when the engagement ends.
+pub fn queue_guard(entity: &mut EntityCommands, target: Entity) {
+    apply_order(entity, UnitOrder::Guard { target });
+    entity.remove::<UnitOrderQueue>();
+}
+
 /// Hold in place: keep any temporary target cleared and never take a route.
 /// The unit acquires enemies and fires from its position without chasing.
 pub fn queue_hold(entity: &mut EntityCommands) {
@@ -533,6 +664,9 @@ mod tests {
                 points: vec![Vec3::ZERO],
                 next: 0,
             },
+            UnitOrder::Guard {
+                target: Entity::from_bits(9),
+            },
         ] {
             assert!(allows_auto_targeting(&order), "{order:?} must acquire");
         }
@@ -549,6 +683,9 @@ mod tests {
         assert!(allows_chase(&UnitOrder::Patrol {
             points: vec![Vec3::ZERO],
             next: 0,
+        }));
+        assert!(allows_chase(&UnitOrder::Guard {
+            target: Entity::from_bits(9)
         }));
         assert!(!allows_chase(&UnitOrder::HoldPosition));
         assert!(!allows_chase(&UnitOrder::Move {

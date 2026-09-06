@@ -204,6 +204,60 @@ fn strategic_order(world: &mut World, attack_move: bool) -> (Vec<Vec3>, f64) {
     (initial, start.elapsed().as_secs_f64() * 1000.0)
 }
 
+/// Sustained escort workload: one patrolling ward per team, all other units
+/// guarding it at speed 7. The teams stay on their own side, so deaths cannot
+/// make follow churn disappear partway through the measurement. This custom
+/// diagnostic is deliberately outside the historical benchmark suites.
+fn guard_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
+    let start = Instant::now();
+    let scenario = *world.resource::<Scenario>();
+    let mut units: Vec<_> = world
+        .query::<(Entity, &Unit, &Team, &Transform, &UnitKind)>()
+        .iter(world)
+        .map(|(entity, unit, team, transform, kind)| {
+            (entity, unit.0, team.0, transform.translation, *kind)
+        })
+        .collect();
+    units.sort_unstable_by_key(|(_, id, _, _, _)| *id);
+    let grid = world.resource::<NavGrid>();
+    let mut patrols = Vec::new();
+    for team in 0..2 {
+        let mut points = Vec::new();
+        for z in [100.0, -100.0] {
+            let ideal = scenario.center(team).with_z(z);
+            let point = grid
+                .formation(1, ideal, 2.5)
+                .and_then(|points| points.into_iter().next())
+                .ok_or_else(|| "guard patrol does not fit the map".to_owned())?;
+            points.push(point);
+        }
+        patrols.push(points);
+    }
+    let mut wards = [None; 2];
+    let mut initial = Vec::with_capacity(units.len());
+    for (entity, id, team, position, kind) in units {
+        let order = if let Some(ward) = wards[team as usize] {
+            UnitOrder::Guard { target: ward }
+        } else {
+            wards[team as usize] = Some(entity);
+            UnitOrder::Patrol {
+                points: patrols[team as usize].clone(),
+                next: 0,
+            }
+        };
+        world
+            .entity_mut(entity)
+            .insert((
+                arm_bundle(id, kind),
+                crate::movement::Movement { speed: 7.0 },
+                order,
+            ))
+            .remove::<(MoveTarget, AttackTarget, Route)>();
+        initial.push(position);
+    }
+    Ok((initial, start.elapsed().as_secs_f64() * 1000.0))
+}
+
 fn collect_telemetry(world: &mut World) -> Telemetry {
     let mut telemetry = Telemetry::default();
     for route in world
@@ -250,7 +304,10 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
     let positions = positions(world);
     let grid = world.resource::<NavGrid>();
     let mut checksum = 0xcbf29ce484222325_u64;
-    let allows_local_steering = matches!(run.workload, Workload::Crowd | Workload::Skirmish);
+    let allows_local_steering = matches!(
+        run.workload,
+        Workload::Crowd | Workload::Skirmish | Workload::Guard
+    );
     let requires_arrival = matches!(run.workload, Workload::Idle | Workload::Crossing);
     let mut valid = positions.len() == expected.len() || run.workload == Workload::Skirmish;
     for ((id, position, moving), goal) in positions.iter().zip(expected) {
@@ -295,9 +352,21 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
                 && run.kills > 0
                 && run.arrived + run.kills == expected.len();
         }
-        Workload::Crowd => {
+        Workload::Crowd | Workload::Guard => {
             run.arrived = positions.len();
             run.correctness_pass = valid && run.failed == 0 && positions.len() == expected.len();
+            if run.workload == Workload::Guard {
+                let mut guards = 0;
+                let mut wards = 0;
+                for order in world.query_filtered::<&UnitOrder, With<Unit>>().iter(world) {
+                    match order {
+                        UnitOrder::Guard { .. } => guards += 1,
+                        UnitOrder::Patrol { .. } => wards += 1,
+                        _ => {}
+                    }
+                }
+                run.correctness_pass &= wards == 2 && guards + 2 == expected.len();
+            }
         }
         Workload::Idle | Workload::Crossing => {
             run.correctness_pass = valid && run.failed == 0 && run.arrived == expected.len();
@@ -383,7 +452,7 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
                 ));
             if case.workload == Workload::Crowd {
                 app.add_plugins(SpatialPlugin);
-            } else if case.workload == Workload::Skirmish {
+            } else if matches!(case.workload, Workload::Skirmish | Workload::Guard) {
                 app.add_plugins((SpatialPlugin, CombatPlugin))
                     .add_plugins(bevy::asset::AssetPlugin::default())
                     .init_asset::<Mesh>()
@@ -410,6 +479,11 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
                 }
                 Workload::Skirmish => {
                     let (initial, ms) = strategic_order(app.world_mut(), true);
+                    run.order_ms = ms;
+                    initial
+                }
+                Workload::Guard => {
+                    let (initial, ms) = guard_order(app.world_mut())?;
                     run.order_ms = ms;
                     initial
                 }
@@ -541,6 +615,7 @@ fn start_graphical(world: &mut World) {
     let result = match workload {
         Workload::Skirmish => Ok(strategic_order(world, true)),
         Workload::Crowd => Ok(strategic_order(world, false)),
+        Workload::Guard => guard_order(world),
         Workload::Crossing => crossing_order(world),
         Workload::Idle => Ok((
             positions(world)

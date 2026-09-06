@@ -9,6 +9,7 @@ pub enum Workload {
     Crossing,
     Crowd,
     Skirmish,
+    Guard,
 }
 
 impl Workload {
@@ -18,6 +19,7 @@ impl Workload {
             Self::Crossing => "crossing",
             Self::Crowd => "crowd",
             Self::Skirmish => "skirmish",
+            Self::Guard => "guard",
         }
     }
 
@@ -27,8 +29,9 @@ impl Workload {
             "crossing" => Ok(Self::Crossing),
             "crowd" => Ok(Self::Crowd),
             "skirmish" => Ok(Self::Skirmish),
+            "guard" => Ok(Self::Guard),
             _ => Err(format!(
-                "Unknown workload '{value}'; use idle, crossing, crowd or skirmish"
+                "Unknown workload '{value}'; use idle, crossing, crowd, skirmish or guard"
             )),
         }
     }
@@ -194,7 +197,7 @@ impl Config {
         Ok(Some(config))
     }
 }
-pub const HELP: &str = "Rust RTS v0.0.9 benchmark and profiler\n\
+pub const HELP: &str = "Rust RTS v0.0.10 benchmark and profiler\n\
   cargo run                                      Playground skirmish\n\
   cargo run -- --benchmark                        Graphical crossing\n\
   cargo run -- --benchmark --headless --workload skirmish\n\
@@ -204,7 +207,7 @@ pub const HELP: &str = "Rust RTS v0.0.9 benchmark and profiler\n\
   cargo run --profile benchmark -- --history-report\n\
   ./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600\n\
   ./scripts/profile-visual.sh --units-per-team 2500 --seconds 60\n\
-Options: --workload idle|crossing|crowd|skirmish, --units-per-team 1..10000,\n\
+Options: --workload idle|crossing|crowd|skirmish|guard, --units-per-team 1..10000,\n\
          --ticks 60..36000, --repeats 1..10, --seconds 1..600,\n\
          --output <new-directory>. --skirmish remains an alias.\n\
 Performance values are descriptive only; only correctness can fail a run.";
@@ -223,6 +226,12 @@ mod tests {
         assert!(quick.headless && quick.suite && quick.benchmark);
         assert_eq!(quick.preset, SuitePreset::Quick);
 
+        assert_eq!(
+            parse(&["--benchmark", "--headless", "--workload", "guard"])
+                .unwrap()
+                .workload,
+            Workload::Guard
+        );
         let legacy = parse(&["--benchmark", "--headless", "--skirmish"]).unwrap();
         assert_eq!(legacy.workload, Workload::Skirmish);
         assert_eq!(

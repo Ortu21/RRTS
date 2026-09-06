@@ -512,6 +512,7 @@ fn aggregates(runs: &[RunSummary]) -> Vec<Aggregate> {
                     "idle" => Workload::Idle,
                     "crossing" => Workload::Crossing,
                     "crowd" => Workload::Crowd,
+                    "guard" => Workload::Guard,
                     _ => Workload::Skirmish,
                 },
                 per_team,

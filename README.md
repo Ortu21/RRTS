@@ -1,4 +1,4 @@
-# Rust RTS — v0.0.9
+# Rust RTS — v0.0.10
 
 A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets. Gameplay depends only on Bevy; benchmark reporting and machine metadata additionally use serde/serde_json and sysinfo (benchmark-only code paths).
 
@@ -10,7 +10,7 @@ Requirements: Rust stable 1.95+, Cargo, a native linker and a Metal/Vulkan/Direc
 cargo run
 ```
 
-The playground contains 100 blue vs 100 red units on a 400 × 400 field with a deterministic random obstacle layout (fixed seed, guaranteed lanes and connectivity). Both squads spawn armed but standing: select units and issue orders manually (right-click move, G attack-move, H hold, S stop) to stage battles. Right-click orders route units into separate free destination slots.
+The playground contains 100 blue vs 100 red units on a 400 × 400 field with a deterministic random obstacle layout (fixed seed, guaranteed lanes and connectivity). Both squads spawn armed but standing: select units and issue orders manually (right-click move, G attack-move, T guard, H hold, S stop) to stage battles. Right-click orders route units into separate free destination slots.
 
 | Control | Action |
 |---|---|
@@ -22,10 +22,12 @@ The playground contains 100 blue vs 100 red units on a 400 × 400 field with a d
 | ESC | Clear selection, cancel drag and disarm targeting |
 | Right click | Replace movement orders (plain Move, fires on the march) — or disarm targeting |
 | Right click on enemy | Direct attack with focus fire (Shift queues it) |
+| Right click on ally | Guard it: follow at close range, engage threats near the ward (Shift queues it) |
 | Shift + right click | Queue a move behind the live order |
 | G | Arm attack-move targeting (toggle), then left-click a destination |
 | Shift + G, Shift + click | Queue an attack-move behind the live order |
 | P | Arm patrol targeting (toggle), then left-click appends loop waypoints |
+| T | Arm guard targeting (toggle), then left-click a friendly unit |
 | H | Hold selected units in place (acquire and fire, never chase) |
 | S | Stop selected units |
 
@@ -46,6 +48,7 @@ The workloads isolate different costs:
 - `crossing`: obstacle-aware path planning and movement without combat or avoidance.
 - `crowd`: movement plus spatial-grid rebuild and local avoidance, without combat.
 - `skirmish`: spatial lookup, targeting, movement, avoidance, projectiles and deaths.
+- `guard` (custom diagnostic, outside the suites): one patrolling ward per team, everyone else escorting at speed 7. With `--units-per-team 51` this keeps 100 guards following throughout the run.
 
 ```sh
 ./scripts/benchmark.sh quick --repeats 2
@@ -70,6 +73,7 @@ Telemetry requiring full-world queries is sampled every 60 ticks outside the tim
 
 ```sh
 ./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600
+./scripts/profile.sh --workload guard --units-per-team 51 --ticks 1800
 ```
 
 The profiler builds with Bevy's native tracing instrumentation and writes:
@@ -124,7 +128,7 @@ Tests cover formation generation, picking, deterministic obstacle-safe paths, un
 
 ## Architecture and limits
 
-`main.rs` composes the Bevy plugins. `scenario` selects the playground or benchmark; `units` separates gameplay spawning from visual entities. `world`, `camera`, `selection`, `orders`, `movement` and `ui` retain their domains. `navigation` owns a 160 × 160 occupancy grid over the 400 × 400 map, deterministic Theta* any-angle routing with line-of-sight clearance, live congestion costs from the spatial index, unit clearance and a budget of 32 path requests per frame. Selected units show BAR-style order graphics: persistent order lines and destination markers in per-order colours, plus a fading flash of the actually planned route on every plan and replan. `benchmark` owns CLI parsing, automatic crossing orders, measurement and reports. `spatial` owns a uniform spatial hash rebuilt every frame, shared by local avoidance and target acquisition. `combat` owns health, weapons, order-driven targeting, homing projectiles and death handling; `orders` owns the `UnitOrder` intent (`Idle`, `Move`, `Attack`, `AttackMove`, `HoldPosition`) plus the temporary `AttackTarget` combat state and the `Chasing`/`HoldFire` locomotion markers. Beyond-All-Reason style rules: `AttackMove` stops to fight then resumes its route, `Move` fires on the march without chasing, holders and idle units defend in place. Bodies face travel direction, turret barrels track their target (forward otherwise), and projectiles leave the muzzle. Units come in three data-driven archetypes (`Scout`, `Tank`, `Artillery`) defined in a single table (`units/archetype.rs`): health, speed, hull turn rate, turret traverse, aim tolerance, weapon and body size. Hulls turn smoothly toward travel, turrets traverse toward locks, and fire is gated on barrel alignment, so handling differs per kind. Adding a unit is a data row, not a systems change.
+`main.rs` composes the Bevy plugins. `scenario` selects the playground or benchmark; `units` separates gameplay spawning from visual entities. `world`, `camera`, `selection`, `orders`, `movement` and `ui` retain their domains. `navigation` owns a 160 × 160 occupancy grid over the 400 × 400 map, deterministic Theta* any-angle routing with line-of-sight clearance, live congestion costs from the spatial index, unit clearance and a budget of 32 path requests per frame. Selected units show BAR-style order graphics: persistent order lines and destination markers in per-order colours, plus a fading flash of the actually planned route on every plan and replan. `benchmark` owns CLI parsing, automatic crossing orders, measurement and reports. `spatial` owns a uniform spatial hash rebuilt every frame, shared by local avoidance and target acquisition. `combat` owns health, weapons, order-driven targeting, homing projectiles and death handling; `orders` owns the `UnitOrder` intent (`Idle`, `Move`, `Attack`, `AttackMove`, `HoldPosition`, `Patrol`, `Guard`) plus the temporary `AttackTarget` combat state and the `Chasing`/`HoldFire` locomotion markers. Beyond-All-Reason style rules: `AttackMove` stops to fight then resumes its route, `Move` fires on the march without chasing, holders and idle units defend in place. `Guard` follows a friendly ward at close range through the budgeted planner and engages enemies like attack-move; explicit `Attack` chases keep a synced `MoveTarget` so pursuit replans around obstacles instead of beelining through walls. Bodies face travel direction, turret barrels track their target (forward otherwise), and projectiles leave the muzzle. Units come in three data-driven archetypes (`Scout`, `Tank`, `Artillery`) defined in a single table (`units/archetype.rs`): health, speed, hull turn rate, turret traverse, aim tolerance, weapon and body size. Hulls turn smoothly toward travel, turrets traverse toward locks, and fire is gated on barrel alignment, so handling differs per kind. Adding a unit is a data row, not a systems change.
 
 Selection and orders remain ECS state. An order replaces the old route; movement waits for planning and consumes waypoints without overshoot. Blocked formation slots are relocated to unique free grid cells. Unreachable routes stop and increment the HUD failure count. Grid slots are 2.5 units apart.
 
@@ -132,4 +136,4 @@ Playground units apply soft local separation so they no longer stack, but there 
 
 Target platforms: macOS Apple Silicon, Windows x86_64 (MSVC tools), Linux x86_64 (C toolchain plus X11/Wayland and udev development libraries). Native validation is currently performed on macOS; Windows/Linux remain untested. `Cargo.lock` pins dependencies.
 
-Possible follow-ups: patrol/guard orders on the same intent pipeline, avoidance cost tuning guided by `scripts/profile.sh`, wider benchmark size sweeps.
+Possible follow-ups: avoidance cost tuning guided by `scripts/profile.sh`, wider benchmark size sweeps, economy/AI foundations.

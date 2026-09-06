@@ -29,7 +29,9 @@ impl Plugin for CombatPlugin {
             .add_systems(
                 Update,
                 (
-                    validate_targets.in_set(ValidateTargets),
+                    (validate_guards, validate_targets)
+                        .chain()
+                        .in_set(ValidateTargets),
                     acquire_targets.in_set(AcquireTargets),
                     resolve_behaviour.in_set(ResolveBehaviour),
                     chase_targets.in_set(ChaseTargets),
@@ -58,7 +60,7 @@ pub(crate) struct ProjectileSystems;
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DeathSystems;
 
-/// Extra leash margin before an attack-move drops a target it chased too far.
+/// Extra leash margin before an automatic chaser drops a distant target.
 /// Hysteresis avoids acquire/drop flicker at the acquisition boundary.
 const LEASH_MULTIPLIER: f32 = 1.5;
 const PROJECTILE_HIT_RADIUS: f32 = 0.7;
@@ -66,6 +68,14 @@ const PROJECTILE_HIT_RADIUS: f32 = 0.7;
 /// dropping it frees the slot for closer acquisitions instead of holding a
 /// target the unit can never shoot.
 const HOLD_MARGIN: f32 = 1.25;
+/// Follow distance: guards hold inside this radius of their ward instead
+/// of stacking onto it, and resume following outside of it.
+pub const GUARD_RADIUS: f32 = 6.0;
+/// Chase replan threshold: when an explicit Attack target drifts this far
+/// from the synced MoveTarget, refresh it and drop the stale Route so the
+/// budgeted planner routes to the target's live position (obstacle-aware
+/// pursuit instead of a straight-line chase through walls).
+pub const CHASE_REPLAN_DISTANCE: f32 = 4.0;
 /// Hysteresis for target re-evaluation (squared distances): switch locks
 /// only when the candidate is clearly closer, to avoid thrash between
 /// equidistant enemies.
@@ -170,6 +180,42 @@ fn target_position(grid: &SpatialGrid, target: Entity) -> Option<Vec3> {
     grid.position(target)
 }
 
+/// Guard ward validation, separate from enemy-lock validation: the ward
+/// lives in the order (not the `AttackTarget` slot, which keeps enemy
+/// locks), so this must visit every guard with or without a lock.
+/// `validate_targets` only sees units carrying `AttackTarget` — a guard
+/// holding near its ward has none, and ward death would go unnoticed.
+/// A dead, despawned or hostile ward completes the order instead of
+/// following a ghost. Health/team queries (not the spatial grid) are
+/// authoritative, so completion never depends on index timing.
+fn validate_guards(
+    mut commands: Commands,
+    health: Query<&Health>,
+    teams: Query<&Team>,
+    units: Query<(Entity, &UnitOrder), With<Unit>>,
+    mut queues: Query<&mut UnitOrderQueue>,
+) {
+    for (entity, order) in &units {
+        let UnitOrder::Guard { target: ward } = order else {
+            continue;
+        };
+        let ward_valid = health
+            .get(*ward)
+            .ok()
+            .filter(|health| !is_dead(health))
+            .is_some()
+            && teams
+                .get(*ward)
+                .ok()
+                .zip(teams.get(entity).ok())
+                .is_some_and(|(ward_team, own_team)| !own_team.is_enemy(*ward_team));
+        if !ward_valid {
+            commands.entity(entity).remove::<AttackTarget>();
+            complete_order(&mut commands, entity, &mut queues);
+        }
+    }
+}
+
 /// Targeting is a service, not a behaviour: it only answers requests from
 /// orders that allow automatic acquisition, and only returns live enemies.
 #[allow(clippy::too_many_arguments)]
@@ -196,14 +242,25 @@ fn validate_targets(
                         Some(own),
                         UnitOrder::AttackMove { .. }
                         | UnitOrder::Move { .. }
-                        | UnitOrder::Patrol { .. },
+                        | UnitOrder::Patrol { .. }
+                        | UnitOrder::Guard { .. },
                     ) if own.is_enemy(*target_team) => {
                         // Leash: drop targets left far behind (marching past)
                         // or chased far outside acquisition.
                         match (ranges.get(entity).ok(), target_position(&grid, target.0)) {
                             (Some(range), Some(target_position)) => {
-                                transform.translation.distance(target_position)
-                                    <= range.0 * LEASH_MULTIPLIER
+                                let leash = range.0 * LEASH_MULTIPLIER;
+                                transform.translation.distance_squared(target_position)
+                                    <= leash * leash
+                                    && match order {
+                                        UnitOrder::Guard { target: ward } => {
+                                            grid.position(*ward).is_some_and(|ward_position| {
+                                                ward_position.distance_squared(target_position)
+                                                    <= leash * leash
+                                            })
+                                        }
+                                        _ => true,
+                                    }
                             }
                             _ => true,
                         }
@@ -290,6 +347,21 @@ fn acquire_targets(
         if !(clock.tick + entity.to_bits()).is_multiple_of(ACQUIRE_STRIDE) {
             continue;
         }
+        // Guard hysteresis is centered on the ward: new locks (including
+        // retargets) must be inside its acquisition radius; validation lets
+        // existing locks persist out to 1.5x. Filtering during the scan also
+        // finds eligible threats hidden behind a closer out-of-bounds enemy.
+        let ward_position = if let UnitOrder::Guard { target: ward } = order {
+            let Some(position) = grid.position(*ward) else {
+                continue;
+            };
+            Some(position)
+        } else {
+            None
+        };
+        let near_ward = |position: Vec3| {
+            ward_position.is_none_or(|ward| ward.distance_squared(position) <= range.0 * range.0)
+        };
         match target {
             None => {
                 if let Some((target, _)) = nearest_enemy(
@@ -299,7 +371,7 @@ fn acquire_targets(
                     transform.translation,
                     range.0,
                     entity,
-                    None,
+                    |_, position| near_ward(position),
                 ) {
                     commands.entity(entity).insert(AttackTarget(target));
                 }
@@ -315,6 +387,7 @@ fn acquire_targets(
                         | UnitOrder::Move { .. }
                         | UnitOrder::HoldPosition
                         | UnitOrder::Patrol { .. }
+                        | UnitOrder::Guard { .. }
                 ) {
                     continue;
                 }
@@ -338,7 +411,7 @@ fn acquire_targets(
                     transform.translation,
                     radius,
                     entity,
-                    Some(target.0),
+                    |candidate, position| candidate != target.0 && near_ward(position),
                 )
                 .filter(|(_, candidate_sq)| {
                     should_retarget(current_sq, *candidate_sq, weapon_range_sq)
@@ -351,7 +424,7 @@ fn acquire_targets(
 }
 
 /// Nearest live enemy within `range` of `position`, excluding `ignore` and
-/// optionally `skip`. Ties break deterministically so repeated runs agree.
+/// candidates rejected by `eligible`. Ties break deterministically.
 fn nearest_enemy(
     grid: &SpatialGrid,
     candidates: &Query<(&Team, &Health), With<Unit>>,
@@ -359,12 +432,12 @@ fn nearest_enemy(
     position: Vec3,
     range: f32,
     ignore: Entity,
-    skip: Option<Entity>,
+    eligible: impl Fn(Entity, Vec3) -> bool,
 ) -> Option<(Entity, f32)> {
     let mut best: Option<(Entity, f32)> = None;
     grid.for_each_nearby(position, range, |entry| {
         let candidate = entry.entity;
-        if candidate == ignore || Some(candidate) == skip {
+        if candidate == ignore || !eligible(candidate, entry.position) {
             return;
         }
         let Ok((candidate_team, health)) = candidates.get(candidate) else {
@@ -480,6 +553,29 @@ fn resolve_behaviour(
                     }
                 }
             }
+            // Guard follow without an enemy lock: stay near the ward via the
+            // budgeted planner (obstacle-aware), hold inside GUARD_RADIUS.
+            // Never completes on its own; ward death is handled by validation.
+            (UnitOrder::Guard { target: ward }, None) => {
+                if chasing || holding {
+                    commands.entity(entity).remove::<(Chasing, HoldFire)>();
+                }
+                let Some(ward_position) = target_position(&grid, *ward) else {
+                    continue;
+                };
+                if transform.translation.distance(ward_position) <= GUARD_RADIUS {
+                    if move_target.is_some() || has_route {
+                        commands.entity(entity).remove::<(MoveTarget, Route)>();
+                    }
+                } else if move_target
+                    .is_none_or(|current| current.0.distance(ward_position) > CHASE_REPLAN_DISTANCE)
+                {
+                    commands
+                        .entity(entity)
+                        .insert(MoveTarget(ward_position))
+                        .remove::<Route>();
+                }
+            }
             // Marching or holding with a lock: no markers, the unit follows
             // its route (or holds) and fires whenever the target is in range.
             (UnitOrder::Move { .. } | UnitOrder::HoldPosition | UnitOrder::Idle, Some(_)) => {
@@ -512,11 +608,36 @@ fn resolve_behaviour(
                         commands.entity(entity).insert(Chasing);
                     }
                 }
+                // Keep pursuit obstacle-aware: explicit Attack chases sync a
+                // MoveTarget to the target's live position (dropping stale
+                // routes past the threshold) so the planner keeps a fresh
+                // route; guards keep theirs pointed at the ward to resume
+                // the follow the moment the engagement ends.
+                let anchor = match order {
+                    UnitOrder::Attack { .. } => target_position(&grid, target.0),
+                    UnitOrder::Guard { target: ward } => target_position(&grid, *ward),
+                    _ => None,
+                };
+                if let Some(anchor) = anchor {
+                    // `is_none_or` covers the missing-target case: a fresh
+                    // chase without any MoveTarget always (re)seeds it.
+                    if move_target
+                        .is_none_or(|current| current.0.distance(anchor) > CHASE_REPLAN_DISTANCE)
+                    {
+                        commands
+                            .entity(entity)
+                            .insert(MoveTarget(anchor))
+                            .remove::<Route>();
+                    }
+                }
             }
             // Unreachable: the guard above covers every chase order, but the
             // compiler cannot prove it.
             (
-                UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. } | UnitOrder::Patrol { .. },
+                UnitOrder::AttackMove { .. }
+                | UnitOrder::Attack { .. }
+                | UnitOrder::Patrol { .. }
+                | UnitOrder::Guard { .. },
                 Some(_),
             ) => {}
             (UnitOrder::HoldPosition, _) => {
@@ -1211,6 +1332,246 @@ mod tests {
             Some(UnitOrder::Patrol { next: 0, .. })
         ));
         assert!(world.entities().contains(unit));
+    }
+
+    #[test]
+    fn guard_follows_ward_and_completes_when_ward_dies() {
+        let mut app = combat_app();
+        let ward = app
+            .world_mut()
+            .spawn(combatant(
+                150,
+                0,
+                Vec3::new(0.0, 0.8, 60.0),
+                UnitOrder::Idle,
+                UnitKind::Tank,
+            ))
+            .id();
+        let guard = app
+            .world_mut()
+            .spawn(combatant(
+                151,
+                0,
+                Vec3::new(-30.0, 0.8, 60.0),
+                UnitOrder::Guard { target: ward },
+                UnitKind::Tank,
+            ))
+            .id();
+        for _ in 0..900 {
+            app.update();
+        }
+        // Closed the 30-unit gap and holds near the ward, order intact.
+        let world = app.world();
+        let guard_pos = world.entity(guard).get::<Transform>().unwrap().translation;
+        let ward_pos = world.entity(ward).get::<Transform>().unwrap().translation;
+        assert!(
+            guard_pos.distance(ward_pos) <= GUARD_RADIUS + 2.0,
+            "guard must close in, at {guard_pos:?} ward at {ward_pos:?}"
+        );
+        assert!(matches!(
+            world.entity(guard).get::<UnitOrder>(),
+            Some(UnitOrder::Guard { .. })
+        ));
+        // Ward destroyed: guard completes to Idle instead of following a ghost.
+        app.world_mut()
+            .entity_mut(ward)
+            .get_mut::<Health>()
+            .unwrap()
+            .current = 0.0;
+        for _ in 0..10 {
+            app.update();
+        }
+        let world = app.world();
+        assert_eq!(
+            world.entity(guard).get::<UnitOrder>(),
+            Some(&UnitOrder::Idle)
+        );
+    }
+
+    #[test]
+    fn guard_leash_is_ward_centered_with_acquisition_and_retarget_hysteresis() {
+        // Isolate targeting from damage/motion so every boundary is exact.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<CombatClock>()
+            .insert_resource(SpatialGrid::new(10.0))
+            .add_systems(
+                Update,
+                (
+                    validate_guards,
+                    validate_targets,
+                    acquire_targets,
+                    resolve_behaviour,
+                )
+                    .chain(),
+            );
+        let ward = app
+            .world_mut()
+            .spawn(combatant(
+                170,
+                0,
+                Vec3::ZERO,
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        let guard = app
+            .world_mut()
+            .spawn(combatant(
+                171,
+                0,
+                Vec3::X * 20.0,
+                UnitOrder::Guard { target: ward },
+                UnitKind::Tank,
+            ))
+            .id();
+        let threat = app
+            .world_mut()
+            .spawn(combatant(
+                172,
+                1,
+                Vec3::X * 30.0,
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        let decoy = app
+            .world_mut()
+            .spawn(combatant(
+                173,
+                1,
+                Vec3::X * 100.0,
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        app.world_mut()
+            .entity_mut(guard)
+            .insert(AcquisitionRange(30.0));
+        for entity in [ward, threat, decoy] {
+            app.world_mut().entity_mut(entity).remove::<Weapon>();
+        }
+        let step = |app: &mut App| {
+            let entries: Vec<_> = app
+                .world_mut()
+                .query::<(Entity, &Transform)>()
+                .iter(app.world())
+                .map(|(entity, transform)| (entity, transform.translation))
+                .collect();
+            let mut grid = app.world_mut().resource_mut::<SpatialGrid>();
+            grid.clear();
+            for (entity, position) in entries {
+                grid.insert(entity, position, 0.5);
+            }
+            for _ in 0..ACQUIRE_STRIDE + 1 {
+                app.update();
+            }
+        };
+        let place = |app: &mut App, entity: Entity, x: f32| {
+            app.world_mut()
+                .entity_mut(entity)
+                .get_mut::<Transform>()
+                .unwrap()
+                .translation = Vec3::X * x;
+        };
+        let locked = |app: &App| {
+            app.world()
+                .entity(guard)
+                .get::<AttackTarget>()
+                .map(|lock| lock.0)
+        };
+        step(&mut app);
+        assert_eq!(locked(&app), Some(threat)); // acquisition boundary inclusive
+
+        place(&mut app, threat, 45.0);
+        place(&mut app, guard, 35.0);
+        place(&mut app, decoy, 34.0); // closer/shootable but outside ward acquisition
+        step(&mut app);
+        assert_eq!(locked(&app), Some(threat)); // retain at release boundary; no retarget
+
+        place(&mut app, threat, 45.1);
+        step(&mut app);
+        assert_eq!(locked(&app), None); // still only 10.1 from guard
+        assert!(!app.world().entity(guard).contains::<Chasing>());
+        assert!(!app.world().entity(guard).contains::<HoldFire>());
+        assert_eq!(
+            app.world().entity(guard).get::<MoveTarget>().unwrap().0,
+            Vec3::ZERO
+        );
+        assert!(matches!(
+            app.world().entity(guard).get::<UnitOrder>(),
+            Some(UnitOrder::Guard { .. })
+        ));
+
+        for x in [44.9, 45.1, 30.1] {
+            place(&mut app, threat, x);
+            step(&mut app);
+            assert_eq!(locked(&app), None); // no reacquisition flicker in the band
+        }
+        place(&mut app, threat, 30.0);
+        step(&mut app);
+        assert_eq!(locked(&app), Some(threat));
+
+        // Moving the ward, with guard/enemy unchanged, also breaks the leash.
+        place(&mut app, ward, -16.0);
+        step(&mut app);
+        assert_eq!(locked(&app), None);
+        assert_eq!(
+            app.world().entity(guard).get::<MoveTarget>().unwrap().0,
+            Vec3::X * -16.0
+        );
+
+        // A closer excluded enemy must not hide an eligible second candidate.
+        place(&mut app, ward, 0.0);
+        place(&mut app, decoy, 34.0);
+        step(&mut app);
+        assert_eq!(locked(&app), Some(threat));
+        // An eligible closer threat can still win a retarget.
+        place(&mut app, threat, 25.0);
+        place(&mut app, decoy, 29.5);
+        step(&mut app);
+        assert_eq!(locked(&app), Some(decoy));
+        // Ordinary guard-to-enemy leash remains enforced too.
+        place(&mut app, guard, -20.0);
+        step(&mut app);
+        assert_eq!(locked(&app), None);
+    }
+
+    #[test]
+    fn attack_chase_syncs_move_target_to_moving_quarry() {
+        let mut app = combat_app();
+        let quarry = app
+            .world_mut()
+            .spawn(combatant(
+                160,
+                1,
+                Vec3::new(0.0, 0.8, -20.0),
+                UnitOrder::Idle,
+                UnitKind::Tank,
+            ))
+            .id();
+        let hunter = app
+            .world_mut()
+            .spawn(combatant(
+                161,
+                0,
+                Vec3::new(-25.0, 0.8, -20.0),
+                UnitOrder::Attack { target: quarry },
+                UnitKind::Tank,
+            ))
+            .id();
+        for _ in 0..30 {
+            app.update();
+        }
+        // Hunter acquired the quarry and synced a MoveTarget near it.
+        let world = app.world();
+        assert!(world.entity(hunter).get::<AttackTarget>().is_some());
+        let synced = world.entity(hunter).get::<MoveTarget>().unwrap().0;
+        let quarry_pos = world.entity(quarry).get::<Transform>().unwrap().translation;
+        assert!(
+            synced.distance(quarry_pos) <= CHASE_REPLAN_DISTANCE + 0.01,
+            "chase must track quarry, synced at {synced:?} quarry at {quarry_pos:?}"
+        );
     }
 
     #[test]

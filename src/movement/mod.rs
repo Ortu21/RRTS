@@ -1,7 +1,7 @@
 use crate::{
     combat::{AttackTarget, Chasing, HoldFire},
     navigation::{HALF_SIZE, PlanPaths, Route, UNIT_CLEARANCE},
-    orders::UnitOrder,
+    orders::{UnitOrder, UnitOrderQueue},
     units::UnitKind,
 };
 use bevy::prelude::*;
@@ -31,11 +31,11 @@ pub const ARRIVE_RADIUS: f32 = 0.5;
 
 /// A plain move order: march to the destination, firing at enemies on the
 /// way without ever stopping or chasing. Replaces any other intent and
-/// drops temporary combat state.
+/// drops temporary combat state plus the queue (plain click replaces).
 pub fn queue_move(entity: &mut EntityCommands, destination: Vec3) {
     entity
         .insert((UnitOrder::Move { destination }, MoveTarget(destination)))
-        .remove::<(Route, AttackTarget, Chasing, HoldFire)>();
+        .remove::<(Route, AttackTarget, Chasing, HoldFire, UnitOrderQueue)>();
 }
 
 #[allow(clippy::type_complexity)]

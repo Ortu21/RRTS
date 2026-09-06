@@ -7,6 +7,7 @@ use crate::{
     combat::{AttackTarget, Projectile},
     movement::MoveTarget,
     navigation::{NavigationStats, Route},
+    orders::{PendingOrder, UnitOrderQueue},
     selection::{Selected, SelectionSystems},
     units::{Team, Unit, UnitKind, archetype},
 };
@@ -29,7 +30,7 @@ type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
-        Text::new("RTS Prototype v0.0.7\n\nFPS: ...\nUnits: 200\nSelected: 0"),
+        Text::new("RTS Prototype v0.0.8\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -45,7 +46,7 @@ fn setup_hud(mut commands: Commands) {
         BackgroundColor(Color::srgba(0.03, 0.05, 0.07, 0.85)),
     ));
     commands.spawn((
-        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add   Esc: clear   Right click: move   G: attack-move   H: hold   S: stop"),
+        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add / queue orders   Esc: clear   Right click: move   G: attack-move, then left-click   H: hold   S: stop"),
         TextFont { font_size: FontSize::Px(15.0), ..default() },
         Node { position_type: PositionType::Absolute, bottom: px(16), left: px(16), ..default() },
     ));
@@ -59,7 +60,9 @@ fn update_hud(
     kinds: Query<&UnitKind, With<Unit>>,
     engaging: Query<(), (With<Unit>, With<AttackTarget>)>,
     projectiles: Query<(), With<Projectile>>,
+    queued: Query<&UnitOrderQueue, With<Selected>>,
     navigation: Res<NavigationStats>,
+    pending_order: Res<PendingOrder>,
     benchmark: Option<Res<crate::benchmark::VisualRun>>,
     mut hud: Single<&mut Text, With<DebugHud>>,
     time: Res<Time>,
@@ -89,13 +92,20 @@ fn update_hud(
         .join("  ");
     let engaging = engaging.iter().len();
     let projectiles = projectiles.iter().len();
+    let queued: usize = queued.iter().map(|queue| queue.0.len()).sum();
     let pending = units
         .iter()
         .filter(|(_, target, route)| *target && !*route)
         .count();
     let failed = navigation.failed;
     let mode = benchmark.as_ref().map_or("PLAYGROUND", |run| run.label());
+    let targeting = match *pending_order {
+        PendingOrder::None => String::new(),
+        PendingOrder::AttackMove => {
+            "\nAWAITING ATTACK-MOVE: left-click destination (ESC/right-click cancels)".to_string()
+        }
+    };
     hud.0 = format!(
-        "RTS Prototype v0.0.7\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
+        "RTS Prototype v0.0.8\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
     );
 }

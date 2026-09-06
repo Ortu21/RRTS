@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "rust_rts"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bevy",
  "serde",

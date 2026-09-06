@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::{
     movement::{ARRIVE_RADIUS, MoveTarget, Movement, MovementSystems, face_toward},
     navigation::Route,
-    orders::{UnitOrder, allows_auto_targeting, allows_chase, queue_stop},
+    orders::{UnitOrder, UnitOrderQueue, allows_auto_targeting, allows_chase, complete_order},
     spatial::SpatialGrid,
     units::{Team, Unit, UnitKind},
 };
@@ -172,6 +172,7 @@ fn target_position(grid: &SpatialGrid, target: Entity) -> Option<Vec3> {
 
 /// Targeting is a service, not a behaviour: it only answers requests from
 /// orders that allow automatic acquisition, and only returns live enemies.
+#[allow(clippy::too_many_arguments)]
 fn validate_targets(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
@@ -180,6 +181,7 @@ fn validate_targets(
     ranges: Query<&AcquisitionRange>,
     weapons: Query<&Weapon>,
     units: Query<(Entity, &Transform, &UnitOrder, &AttackTarget), With<Unit>>,
+    mut queues: Query<&mut UnitOrderQueue>,
 ) {
     for (entity, transform, order, target) in &units {
         let valid = match target_position(&grid, target.0)
@@ -231,7 +233,7 @@ fn validate_targets(
             commands.entity(entity).remove::<AttackTarget>();
             if matches!(order, UnitOrder::Attack { .. }) {
                 // Explicit attack order completes instead of roaming.
-                queue_stop(&mut commands.entity(entity));
+                complete_order(&mut commands, entity, &mut queues);
             }
         }
     }
@@ -263,6 +265,7 @@ fn acquire_targets(
         (With<Unit>, With<Weapon>),
     >,
     candidates: Query<(&Team, &Health), With<Unit>>,
+    mut queues: Query<&mut UnitOrderQueue>,
 ) {
     clock.tick += 1;
     for (entity, transform, team, order, range, target) in &units {
@@ -274,7 +277,7 @@ fn acquire_targets(
             if valid {
                 commands.entity(entity).insert(AttackTarget(*target));
             } else {
-                queue_stop(&mut commands.entity(entity));
+                complete_order(&mut commands, entity, &mut queues);
             }
             continue;
         }
@@ -408,6 +411,7 @@ fn resolve_behaviour(
         ),
         With<Unit>,
     >,
+    mut queues: Query<&mut UnitOrderQueue>,
 ) {
     for (entity, transform, order, target, move_target, has_route, chasing, holding) in &units {
         // Stale markers strand units (executors filter on them), so clear
@@ -420,7 +424,7 @@ fn resolve_behaviour(
             (UnitOrder::Move { destination }, None) => {
                 if move_target.is_none() && !has_route {
                     if transform.translation.distance(*destination) <= ARRIVE_RADIUS {
-                        commands.entity(entity).insert(UnitOrder::Idle);
+                        complete_order(&mut commands, entity, &mut queues);
                     } else {
                         commands.entity(entity).insert(MoveTarget(*destination));
                     }
@@ -434,7 +438,7 @@ fn resolve_behaviour(
             (UnitOrder::AttackMove { destination }, None) => {
                 if move_target.is_none() && !has_route {
                     // Destination reached: the order completes.
-                    commands.entity(entity).insert(UnitOrder::Idle);
+                    complete_order(&mut commands, entity, &mut queues);
                 } else if move_target.is_none_or(|current| current.0 != *destination) {
                     commands
                         .entity(entity)
@@ -484,7 +488,7 @@ fn resolve_behaviour(
                 }
             }
             (UnitOrder::Attack { .. }, None) => {
-                commands.entity(entity).insert(UnitOrder::Idle);
+                complete_order(&mut commands, entity, &mut queues);
             }
         }
     }
@@ -1093,6 +1097,45 @@ mod tests {
             "mover must fire on the march, bystander at {bystander_hp}"
         );
         assert!(world.entities().contains(bystander));
+    }
+
+    #[test]
+    fn queued_orders_pop_on_completion() {
+        let mut app = combat_app();
+        let unit = app
+            .world_mut()
+            .spawn(combatant(
+                130,
+                0,
+                Vec3::new(-30.0, 0.8, 60.0),
+                UnitOrder::Move {
+                    destination: Vec3::new(30.0, 0.8, 60.0),
+                },
+                UnitKind::Tank,
+            ))
+            .id();
+        app.world_mut()
+            .entity_mut(unit)
+            .insert(UnitOrderQueue(vec![UnitOrder::HoldPosition]));
+        for _ in 0..900 {
+            app.update();
+        }
+        let world = app.world();
+        // Arrived AND popped: Hold is live (never plain Idle), the queue
+        // drained, the body sits at the march destination.
+        assert_eq!(
+            world.entity(unit).get::<UnitOrder>(),
+            Some(&UnitOrder::HoldPosition)
+        );
+        assert!(
+            world
+                .entity(unit)
+                .get::<UnitOrderQueue>()
+                .map(|queue| queue.0.is_empty())
+                .unwrap_or(true)
+        );
+        let position = world.entity(unit).get::<Transform>().unwrap().translation;
+        assert!(position.distance(Vec3::new(30.0, 0.8, 60.0)) < 1.0);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use bevy::{prelude::*, transform::TransformSystems, window::PrimaryWindow};
 
 use crate::{
     camera::RtsCamera,
+    orders::PendingOrder,
     picking::ray_box_distance,
     units::{PLAYER_TEAM, Selectable, SelectionRing, Team, UNIT_HALF_SIZE},
 };
@@ -53,6 +54,7 @@ fn setup_rectangle(mut commands: Commands) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_units(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -61,6 +63,7 @@ fn select_units(
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
     units: Query<(Entity, &GlobalTransform, &Team, Has<Selected>), With<Selectable>>,
     mut drag: ResMut<DragSelection>,
+    pending: Res<PendingOrder>,
 ) {
     if keys.just_pressed(KeyCode::Escape) {
         for (entity, _, _, selected) in &units {
@@ -70,6 +73,12 @@ fn select_units(
         }
     }
     if !window.focused || keys.just_pressed(KeyCode::Escape) {
+        drag.start = None;
+        return;
+    }
+    // While an order is being targeted, left clicks belong to the order
+    // system (which runs first): selection stays frozen, no stale drag.
+    if *pending != PendingOrder::None {
         drag.start = None;
         return;
     }

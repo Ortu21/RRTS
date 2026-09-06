@@ -183,8 +183,10 @@ impl Config {
         if config.headless && !config.benchmark {
             return Err("Use --headless with --benchmark or --benchmark-suite".into());
         }
-        if config.profile_capture && (!config.benchmark || !config.headless || config.suite) {
-            return Err("Profile capture requires one headless benchmark case".into());
+        if config.profile_capture && (!config.benchmark || config.suite) {
+            return Err(
+                "Profile capture requires one benchmark case (headless or graphical)".into(),
+            );
         }
         if config.record_history && !config.suite {
             return Err("Benchmark history can only record a complete suite".into());
@@ -192,8 +194,7 @@ impl Config {
         Ok(Some(config))
     }
 }
-
-pub const HELP: &str = "Rust RTS benchmark and profiler\n\
+pub const HELP: &str = "Rust RTS v0.0.5 benchmark and profiler\n\
   cargo run                                      Playground skirmish\n\
   cargo run -- --benchmark                        Graphical crossing\n\
   cargo run -- --benchmark --headless --workload skirmish\n\
@@ -202,6 +203,7 @@ pub const HELP: &str = "Rust RTS benchmark and profiler\n\
   cargo run --profile benchmark -- --benchmark-suite full --record-history\n\
   cargo run --profile benchmark -- --history-report\n\
   ./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600\n\
+  ./scripts/profile-visual.sh --units-per-team 2500 --seconds 60\n\
 Options: --workload idle|crossing|crowd|skirmish, --units-per-team 1..10000,\n\
          --ticks 60..36000, --repeats 1..10, --seconds 1..600,\n\
          --output <new-directory>. --skirmish remains an alias.\n\
@@ -241,11 +243,25 @@ mod tests {
             &["--headless"],
             &["--profile-systems"],
             &["--benchmark-suite", "unknown"],
-            &["--benchmark", "--profile-capture"],
-            &["--benchmark", "--headless", "--record-history"],
+            &[
+                "--benchmark",
+                "--headless",
+                "--profile-capture",
+                "--record-history",
+            ][..],
+            &[
+                "--benchmark",
+                "--headless",
+                "--profile-capture",
+                "--benchmark-suite",
+                "quick",
+            ][..],
             &["--profile-report", "trace.json"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should fail");
         }
+        // Capture works headless and graphical, but never for a suite.
+        assert!(parse(&["--benchmark", "--headless", "--profile-capture"]).is_ok());
+        assert!(parse(&["--benchmark", "--profile-capture"]).is_ok());
     }
 }

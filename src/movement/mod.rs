@@ -1,5 +1,5 @@
 use crate::{
-    combat::AttackTarget,
+    combat::{AttackTarget, Chasing, HoldFire},
     navigation::{PlanPaths, Route},
     orders::UnitOrder,
 };
@@ -22,12 +22,19 @@ pub struct Movement {
 #[derive(Component)]
 pub struct MoveTarget(pub Vec3);
 
-/// A plain move order: go to the destination and ignore enemies.
-/// Replaces any attack-move intent and drops temporary combat targets.
+/// Arrival radius: route/beeline arrivals snap exactly, so anything inside
+/// counts as arrived and completes the order instead of re-issuing it.
+/// Without this, completed move orders resurrect every frame and churn the
+/// budgeted path planner forever.
+pub const ARRIVE_RADIUS: f32 = 0.5;
+
+/// A plain move order: march to the destination, firing at enemies on the
+/// way without ever stopping or chasing. Replaces any other intent and
+/// drops temporary combat state.
 pub fn queue_move(entity: &mut EntityCommands, destination: Vec3) {
     entity
         .insert((UnitOrder::Move { destination }, MoveTarget(destination)))
-        .remove::<(Route, crate::combat::AttackTarget)>();
+        .remove::<(Route, AttackTarget, Chasing, HoldFire)>();
 }
 
 #[allow(clippy::type_complexity)]
@@ -42,7 +49,7 @@ fn move_units(
             &MoveTarget,
             Option<&mut Route>,
         ),
-        Without<AttackTarget>,
+        (Without<Chasing>, Without<HoldFire>),
     >,
 ) {
     for (entity, mut transform, movement, target, route) in &mut units {
@@ -53,6 +60,11 @@ fn move_units(
                     let destination = route.points[route.next].with_y(transform.translation.y);
                     let offset = destination - transform.translation;
                     let distance = offset.length();
+                    if distance <= f32::EPSILON {
+                        route.next += 1;
+                        continue;
+                    }
+                    face_toward(&mut transform, offset);
                     if distance <= remaining {
                         transform.translation = destination;
                         remaining -= distance;
@@ -79,6 +91,7 @@ fn move_units(
                     transform.translation = goal;
                     commands.entity(entity).remove::<MoveTarget>();
                 } else if distance > f32::EPSILON {
+                    face_toward(&mut transform, offset);
                     transform.translation += offset / distance * step;
                 }
             }
@@ -86,12 +99,44 @@ fn move_units(
     }
 }
 
+/// Yaw (radians, Y-up) facing `direction` on the XZ plane with -Z forward.
+/// Pure helper shared by body facing and turret aim.
+pub fn yaw_toward(direction: Vec3) -> f32 {
+    (-direction.x).atan2(-direction.z)
+}
+
+/// Yaw (radians) wrapped to [-PI, PI] for stable turret-relative angles.
+pub fn wrap_angle(angle: f32) -> f32 {
+    let two_pi = std::f32::consts::TAU;
+    ((angle + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI
+}
+
+/// Snap a unit body toward its current step direction. Idle units keep
+/// their last facing; rotation never feeds back into the simulation.
+pub fn face_toward(transform: &mut Transform, offset: Vec3) {
+    if offset.xz().length_squared() > f32::EPSILON {
+        transform.rotation = Quat::from_rotation_y(yaw_toward(offset));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::navigation::{NavigationPlugin, NavigationStats, PATHS_PER_FRAME};
+    use crate::navigation::{
+        CELL_SIZE, HALF_SIZE, NavGrid, NavigationPlugin, NavigationStats, PATHS_PER_FRAME,
+    };
     use bevy::time::TimeUpdateStrategy;
+    use std::f32::consts::{FRAC_PI_2, PI};
     use std::time::Duration;
+
+    #[test]
+    fn yaw_faces_travel_direction_with_minus_z_forward() {
+        assert!(yaw_toward(Vec3::new(0.0, 0.0, -1.0)).abs() < 0.000001);
+        assert!((yaw_toward(Vec3::X) + FRAC_PI_2).abs() < 0.000001);
+        assert!((yaw_toward(Vec3::Z).abs() - PI).abs() < 0.000001);
+        assert_eq!(wrap_angle(0.0), 0.0);
+        assert!((wrap_angle(3.0 * PI).abs() - PI).abs() < 0.0001);
+    }
 
     fn simulation(dt: f64) -> App {
         let mut app = App::new();
@@ -99,7 +144,10 @@ mod tests {
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                 dt,
             )))
-            .add_plugins((NavigationPlugin, MovementPlugin));
+            .add_plugins((NavigationPlugin, MovementPlugin))
+            // Hermetic open field: movement logic must not depend on the
+            // generated map layout.
+            .insert_resource(NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new()));
         app.update();
         app
     }
@@ -140,11 +188,13 @@ mod tests {
     #[test]
     fn planning_is_bounded_and_failures_stop_units() {
         let mut app = simulation(1.0 / 60.0);
+        // Off-map goals can never plan: failures stop units and count.
+        let unreachable = Vec3::new(HALF_SIZE + 50.0, 0.0, 0.0);
         for _ in 0..PATHS_PER_FRAME + 1 {
             app.world_mut().spawn((
                 Transform::from_xyz(-55.0, 0.8, 0.0),
                 Movement { speed: 7.0 },
-                MoveTarget(Vec3::ZERO),
+                MoveTarget(unreachable),
             ));
         }
         app.update();

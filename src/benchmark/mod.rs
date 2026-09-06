@@ -8,8 +8,8 @@ use crate::{
     navigation::{NavGrid, NavigationPlugin, NavigationStats, PlanPaths, Route},
     orders::UnitOrder,
     scenario::Scenario,
-    spatial::SpatialPlugin,
-    units::{Team, Unit, UnitPlugin},
+    spatial::{DEFAULT_UNIT_RADIUS, SpatialPlugin},
+    units::{CollisionRadius, Team, Unit, UnitPlugin, arm_bundle},
 };
 use bevy::{prelude::*, time::TimeUpdateStrategy};
 use cli::{Config, SuitePreset, Workload};
@@ -50,7 +50,7 @@ fn suite_cases(config: &Config) -> Vec<Case> {
             Case {
                 workload: Workload::Crossing,
                 per_team: 1000,
-                ticks: 1800,
+                ticks: 3600,
                 repeats: 3,
             },
             Case {
@@ -80,7 +80,7 @@ fn suite_cases(config: &Config) -> Vec<Case> {
                 cases.push(Case {
                     workload: Workload::Crossing,
                     per_team,
-                    ticks: 1800,
+                    ticks: 3600,
                     repeats: 5,
                 });
             }
@@ -160,6 +160,8 @@ fn crossing_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
     Ok((expected, start.elapsed().as_secs_f64() * 1000.0))
 }
 
+/// Strategic crowd/combat order issued after neutral warmup. Combat cases
+/// are armed here so setup does not leak into the measured simulation.
 fn strategic_order(world: &mut World, attack_move: bool) -> (Vec<Vec3>, f64) {
     let start = Instant::now();
     let scenario = *world.resource::<Scenario>();
@@ -176,9 +178,17 @@ fn strategic_order(world: &mut World, attack_move: bool) -> (Vec<Vec3>, f64) {
         let destination = scenario.attack_target(team as usize);
         let mut entity = world.entity_mut(entity);
         if attack_move {
-            entity.insert(UnitOrder::AttackMove { destination });
+            entity
+                .insert(arm_bundle(entity.id()))
+                .insert(UnitOrder::AttackMove { destination });
         } else {
-            entity.insert(UnitOrder::Move { destination });
+            // Crowd: same march, plus body separation. CollisionRadius turns
+            // on avoidance (SpatialPlugin is loaded for this workload), so
+            // crowd measures movement + avoidance without any combat.
+            entity.insert((
+                UnitOrder::Move { destination },
+                CollisionRadius(DEFAULT_UNIT_RADIUS),
+            ));
         }
         entity
             .insert(MoveTarget(destination))
@@ -242,8 +252,8 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
             run.arrived += 1;
         }
         valid &= position.is_finite()
-            && position.x.abs() <= 100.0
-            && position.z.abs() <= 100.0
+            && position.x.abs() <= crate::navigation::HALF_SIZE
+            && position.z.abs() <= crate::navigation::HALF_SIZE
             && (allows_local_steering
                 || (grid.is_walkable(*position) && grid.has_clearance(*position)));
         for value in [
@@ -549,6 +559,21 @@ fn start_graphical(world: &mut World) {
     state.run.order_ms = ms;
     state.telemetry = telemetry;
     state.started = Some(now);
+    #[cfg(feature = "profile-chrome")]
+    if state.config.profile_capture {
+        measurement_marker(workload);
+    }
+}
+
+/// Boundary marker for the measurement window. Entered and exited in the
+/// same scope (same thread): `EnteredSpan` is explicitly `!Send` and can
+/// never live in a resource across frames. The post-processor bounds the
+/// window by min/max over every `benchmark_measurement` span, so the single
+/// headless span keeps working unchanged. No-op without the trace layer.
+#[cfg(feature = "profile-chrome")]
+fn measurement_marker(workload: Workload) {
+    let _span =
+        bevy::log::info_span!("benchmark_measurement", workload = workload.as_str()).entered();
 }
 
 fn track_occlusion(
@@ -608,6 +633,10 @@ fn record_graphical(world: &mut World) {
         state.run.timing_valid &= focused && !state.occluded && !keys && !mouse && !wheel;
         if now - started >= state.config.seconds {
             state.completed = true;
+            #[cfg(feature = "profile-chrome")]
+            if state.config.profile_capture {
+                measurement_marker(state.run.workload);
+            }
             let mut run = std::mem::replace(
                 &mut state.run,
                 empty_run(0, Workload::Crossing, 0, "graphical", 0),

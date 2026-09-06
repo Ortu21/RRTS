@@ -396,6 +396,8 @@ impl Report {
             crate::navigation::PATHS_PER_FRAME
         )?;
         writeln!(metadata, "cell_size={}", crate::navigation::CELL_SIZE)?;
+        writeln!(metadata, "map_half_size={}", crate::navigation::HALF_SIZE)?;
+        writeln!(metadata, "map_seed={}", crate::navigation::MAP_SEED)?;
         writeln!(metadata, "acquire_stride={}", crate::combat::ACQUIRE_STRIDE)?;
         Ok(())
     }

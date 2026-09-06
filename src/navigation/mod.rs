@@ -6,15 +6,165 @@ use std::{
     time::Instant,
 };
 
-pub const HALF_SIZE: f32 = 100.0;
+pub const HALF_SIZE: f32 = 200.0;
 pub const CELL_SIZE: f32 = 2.5;
 pub const UNIT_CLEARANCE: f32 = 0.8;
 pub const PATHS_PER_FRAME: usize = 32;
 
-#[derive(Clone, Copy)]
+/// Fixed map seed: obstacle layout is identical every run, on every
+/// platform, so benchmark checksums stay comparable.
+pub const MAP_SEED: u64 = 20260907;
+/// Target obstacle count for the default map.
+pub const MAP_OBSTACLES: usize = 44;
+
+#[derive(Clone, Copy, Debug)]
 pub struct Obstacle {
     pub center: Vec2,
     pub half_size: Vec2,
+}
+
+/// Deterministic splitmix64: no external RNG dependency, identical output
+/// on every platform for a given seed.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * ((self.next() >> 11) as f32 / ((1u64 << 53) as f32))
+    }
+}
+
+fn rects_overlap(a: Obstacle, b: Obstacle, lane: f32) -> bool {
+    (a.center.x - b.center.x).abs() < a.half_size.x + b.half_size.x + lane
+        && (a.center.y - b.center.y).abs() < a.half_size.y + b.half_size.y + lane
+}
+
+/// Cell walkability for a candidate obstacle set, shared by grid building
+/// and connectivity checks so both agree exactly. Blocks every cell touched
+/// by an obstacle expanded by the unit radius, so routes through the
+/// remaining cells keep clearance even at diagonal turns.
+fn build_walkable(
+    obstacles: &[Obstacle],
+    half_size: f32,
+    cell_size: f32,
+    width: usize,
+) -> Vec<bool> {
+    let margin = UNIT_CLEARANCE + cell_size * 0.5;
+    (0..width * width)
+        .map(|index| {
+            let center = Vec3::new(
+                (index % width) as f32 * cell_size - half_size + cell_size * 0.5,
+                0.0,
+                (index / width) as f32 * cell_size - half_size + cell_size * 0.5,
+            )
+            .xz();
+            obstacles.iter().all(|obstacle| {
+                let delta = (center - obstacle.center).abs();
+                delta.x > obstacle.half_size.x + margin || delta.y > obstacle.half_size.y + margin
+            })
+        })
+        .collect()
+}
+
+/// Key gameplay points (fractions of half size) that must stay walkable and
+/// mutually reachable: team spawns, attack targets, map arteries. Adding a
+/// rect that breaks any of them discards the rect, so generation always
+/// terminates with a connected map.
+fn key_points(half_size: f32) -> [Vec2; 6] {
+    let (a, b, c) = (half_size * 0.55, half_size * 0.35, half_size - 10.0);
+    [
+        Vec2::new(-a, 0.0),
+        Vec2::new(a, 0.0),
+        Vec2::new(-b, 0.0),
+        Vec2::new(b, 0.0),
+        Vec2::new(0.0, -c),
+        Vec2::new(0.0, c),
+    ]
+}
+
+fn key_points_connected(walkable: &[bool], width: usize, half_size: f32, cell_size: f32) -> bool {
+    let cell_of = |point: Vec2| {
+        let x = ((point.x + half_size) / cell_size) as isize;
+        let z = ((point.y + half_size) / cell_size) as isize;
+        if x < 0 || z < 0 || x >= width as isize || z >= width as isize {
+            None
+        } else {
+            Some(z as usize * width + x as usize)
+        }
+    };
+    let starts: Option<Vec<usize>> = key_points(half_size)
+        .iter()
+        .map(|point| cell_of(*point).filter(|cell| walkable[*cell]))
+        .collect();
+    let Some(starts) = starts else {
+        return false;
+    };
+    let mut seen = vec![false; walkable.len()];
+    let mut open = vec![starts[0]];
+    seen[starts[0]] = true;
+    while let Some(current) = open.pop() {
+        let (x, z) = (current % width, current / width);
+        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let (nx, nz) = (x as isize + dx, z as isize + dz);
+            if nx < 0 || nz < 0 || nx >= width as isize || nz >= width as isize {
+                continue;
+            }
+            let next = nz as usize * width + nx as usize;
+            if walkable[next] && !seen[next] {
+                seen[next] = true;
+                open.push(next);
+            }
+        }
+    }
+    starts.iter().all(|cell| seen[*cell])
+}
+
+/// Random-but-deterministic obstacle layout: varied rects with guaranteed
+/// lanes between them, capped coverage, and enforced connectivity. Adding
+/// rects one by one and keeping only connectivity-preserving ones makes
+/// termination certain (the empty set is always connected).
+pub fn generate_obstacles(seed: u64, half_size: f32, target_count: usize) -> Vec<Obstacle> {
+    let mut rng = SplitMix64(seed);
+    let mut obstacles = Vec::new();
+    let mut attempts = 0;
+    while obstacles.len() < target_count && attempts < target_count * 40 {
+        attempts += 1;
+        let half = Vec2::new(rng.range(4.0, 16.0), rng.range(4.0, 26.0));
+        let bound = half_size - 24.0 - half.max_element();
+        if bound <= 0.0 {
+            continue;
+        }
+        let candidate = Obstacle {
+            center: Vec2::new(rng.range(-bound, bound), rng.range(-bound, bound)),
+            half_size: half,
+        };
+        if obstacles
+            .iter()
+            .any(|other| rects_overlap(candidate, *other, 7.0))
+        {
+            continue;
+        }
+        let mut trial = obstacles.clone();
+        trial.push(candidate);
+        let width = (half_size * 2.0 / CELL_SIZE).round() as usize;
+        let walkable = build_walkable(&trial, half_size, CELL_SIZE, width);
+        let blocked = walkable.iter().filter(|cell| !**cell).count();
+        if blocked as f32 / walkable.len() as f32 > 0.15 {
+            continue;
+        }
+        if !key_points_connected(&walkable, width, half_size, CELL_SIZE) {
+            continue;
+        }
+        obstacles = trial;
+    }
+    obstacles
 }
 
 #[derive(Resource)]
@@ -31,20 +181,7 @@ impl Default for NavGrid {
         Self::new(
             HALF_SIZE,
             CELL_SIZE,
-            vec![
-                Obstacle {
-                    center: Vec2::new(0.0, -57.5),
-                    half_size: Vec2::new(3.5, 32.5),
-                },
-                Obstacle {
-                    center: Vec2::ZERO,
-                    half_size: Vec2::new(3.5, 15.0),
-                },
-                Obstacle {
-                    center: Vec2::new(0.0, 57.5),
-                    half_size: Vec2::new(3.5, 32.5),
-                },
-            ],
+            generate_obstacles(MAP_SEED, HALF_SIZE, MAP_OBSTACLES),
         )
     }
 }
@@ -52,24 +189,68 @@ impl Default for NavGrid {
 impl NavGrid {
     pub fn new(half_size: f32, cell_size: f32, obstacles: Vec<Obstacle>) -> Self {
         let width = (half_size * 2.0 / cell_size).round() as usize;
-        let mut grid = Self {
+        let walkable = build_walkable(&obstacles, half_size, cell_size, width);
+        Self {
             obstacles,
             half_size,
             cell_size,
             width,
-            walkable: vec![true; width * width],
-        };
-        // Block every cell touched by an obstacle expanded by the unit radius.
-        // Routes through the remaining cells have clearance even at diagonal turns.
-        let margin = UNIT_CLEARANCE + cell_size * 0.5;
-        for index in 0..grid.walkable.len() {
-            let center = grid.cell_center(index).xz();
-            grid.walkable[index] = grid.obstacles.iter().all(|obstacle| {
-                let delta = (center - obstacle.center).abs();
-                delta.x > obstacle.half_size.x + margin || delta.y > obstacle.half_size.y + margin
-            });
+            walkable,
         }
-        grid
+    }
+
+    /// Push a spawn point out of obstacle margins (plus unit clearance) and
+    /// back inside the map. Grid-fill layouts cannot dodge random rects, so
+    /// skirmish slots are repaired here instead of failing pathfinding.
+    /// Converges: obstacle lanes guarantee free space within a few passes.
+    pub fn clear_point(&self, point: Vec3) -> Vec3 {
+        let mut point = point;
+        point.x = point.x.clamp(
+            -self.half_size + UNIT_CLEARANCE,
+            self.half_size - UNIT_CLEARANCE,
+        );
+        point.z = point.z.clamp(
+            -self.half_size + UNIT_CLEARANCE,
+            self.half_size - UNIT_CLEARANCE,
+        );
+        for _ in 0..4 {
+            let mut moved = false;
+            for obstacle in &self.obstacles {
+                let delta = (point.xz() - obstacle.center).abs();
+                let push_x = obstacle.half_size.x + UNIT_CLEARANCE - delta.x;
+                let push_z = obstacle.half_size.y + UNIT_CLEARANCE - delta.y;
+                if push_x > 0.0 && push_z > 0.0 {
+                    if push_x < push_z {
+                        let sign = if point.x >= obstacle.center.x {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        point.x += push_x * sign;
+                    } else {
+                        let sign = if point.z >= obstacle.center.y {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        point.z += push_z * sign;
+                    }
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+            point.x = point.x.clamp(
+                -self.half_size + UNIT_CLEARANCE,
+                self.half_size - UNIT_CLEARANCE,
+            );
+            point.z = point.z.clamp(
+                -self.half_size + UNIT_CLEARANCE,
+                self.half_size - UNIT_CLEARANCE,
+            );
+        }
+        point
     }
 
     fn cell(&self, point: Vec3) -> Option<usize> {
@@ -281,8 +462,9 @@ mod tests {
     #[test]
     fn paths_are_deterministic_and_clear_obstacles() {
         let grid = NavGrid::default();
-        let start = Vec3::new(-55.0, 0.0, 0.0);
-        let goal = Vec3::new(55.0, 0.0, 0.0);
+        // Guaranteed-connected key points (see key_points).
+        let start = Vec3::new(-HALF_SIZE * 0.55, 0.0, 0.0);
+        let goal = Vec3::new(HALF_SIZE * 0.55, 0.0, 0.0);
         let path = grid.find_path(start, goal).unwrap();
         assert_eq!(Some(path.clone()), grid.find_path(start, goal));
         let mut previous = start;
@@ -295,11 +477,44 @@ mod tests {
         assert_eq!(previous, goal);
     }
     #[test]
+    fn generated_layout_is_deterministic_connected_and_bounded() {
+        let first = generate_obstacles(MAP_SEED, HALF_SIZE, MAP_OBSTACLES);
+        let second = generate_obstacles(MAP_SEED, HALF_SIZE, MAP_OBSTACLES);
+        assert!(!first.is_empty());
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!((a.center, a.half_size), (b.center, b.half_size));
+        }
+        assert_ne!(
+            generate_obstacles(MAP_SEED + 1, HALF_SIZE, MAP_OBSTACLES)[0].center,
+            first[0].center
+        );
+        for obstacle in &first {
+            assert!(obstacle.center.x.abs() + obstacle.half_size.x <= HALF_SIZE);
+            assert!(obstacle.center.y.abs() + obstacle.half_size.y <= HALF_SIZE);
+        }
+        // Key points stay walkable and mutually reachable.
+        let grid = NavGrid::default();
+        for x in [-0.55, -0.35, 0.35, 0.55] {
+            let point = Vec3::new(HALF_SIZE * x, 0.0, 0.0);
+            assert!(grid.has_clearance(point));
+            assert!(
+                grid.find_path(point, Vec3::new(HALF_SIZE * 0.55, 0.0, 0.0))
+                    .is_some()
+            );
+        }
+    }
+    #[test]
     fn invalid_and_unreachable_targets_are_rejected() {
         let grid = NavGrid::default();
+        // The first obstacle's core has no clearance by construction.
+        let inside = grid.obstacles.first().unwrap().center;
         assert!(
-            grid.find_path(Vec3::new(-55.0, 0.0, 0.0), Vec3::ZERO)
-                .is_none()
+            grid.find_path(
+                Vec3::new(-HALF_SIZE * 0.55, 0.0, 0.0),
+                Vec3::new(inside.x, 0.0, inside.y)
+            )
+            .is_none()
         );
         assert!(grid.find_path(Vec3::splat(f32::NAN), Vec3::ZERO).is_none());
         let sealed = NavGrid::new(
@@ -319,7 +534,7 @@ mod tests {
     #[test]
     fn formations_near_edges_and_obstacles_have_unique_free_slots() {
         let grid = NavGrid::default();
-        for center in [Vec3::ZERO, Vec3::new(99.0, 0.0, 99.0)] {
+        for center in [Vec3::ZERO, Vec3::new(195.0, 0.0, 195.0)] {
             let slots = grid.formation(1000, center, 2.5).unwrap();
             assert_eq!(slots.len(), 1000);
             let cells: HashSet<_> = slots.iter().map(|slot| grid.cell(*slot).unwrap()).collect();

@@ -2,7 +2,7 @@ use bevy::{prelude::*, window::PrimaryWindow};
 
 use crate::{
     camera::RtsCamera,
-    combat::AttackTarget,
+    combat::{AttackTarget, Chasing, HoldFire},
     movement::{MoveTarget, queue_move},
     navigation::{NavGrid, Route},
     picking::ground_position,
@@ -45,13 +45,17 @@ pub enum UnitOrder {
     HoldPosition,
 }
 
-/// Behaviour rule: only some orders may acquire enemies on their own.
-/// `Move` deliberately returns false so armed units never chase while
-/// executing a plain move order. `HoldPosition` acquires but never chases.
+/// Behaviour rule: which orders may acquire enemies on their own.
+/// Beyond-All-Reason style: every order acquires — `Move` fires on the
+/// march without chasing, `Idle` defends itself in place. Only units
+/// without nearby enemies (or without weapons) stay quiet.
 pub fn allows_auto_targeting(order: &UnitOrder) -> bool {
     matches!(
         order,
-        UnitOrder::AttackMove { .. } | UnitOrder::HoldPosition
+        UnitOrder::AttackMove { .. }
+            | UnitOrder::Move { .. }
+            | UnitOrder::HoldPosition
+            | UnitOrder::Idle
     )
 }
 
@@ -141,7 +145,7 @@ fn issue_hold_stop_keys(
 pub fn queue_attack(entity: &mut EntityCommands, target: Entity) {
     entity
         .insert(UnitOrder::Attack { target })
-        .remove::<Route>();
+        .remove::<(Route, Chasing, HoldFire)>();
 }
 
 /// Attack-move foundation: the strategic destination is stored in the order
@@ -152,7 +156,7 @@ pub fn queue_attack_move(entity: &mut EntityCommands, destination: Vec3) {
             UnitOrder::AttackMove { destination },
             MoveTarget(destination),
         ))
-        .remove::<(AttackTarget, Route)>();
+        .remove::<(AttackTarget, Route, Chasing, HoldFire)>();
 }
 
 /// Hold in place: keep any temporary target cleared and never take a route.
@@ -160,14 +164,14 @@ pub fn queue_attack_move(entity: &mut EntityCommands, destination: Vec3) {
 pub fn queue_hold(entity: &mut EntityCommands) {
     entity
         .insert(UnitOrder::HoldPosition)
-        .remove::<(MoveTarget, Route, AttackTarget)>();
+        .remove::<(MoveTarget, Route, AttackTarget, Chasing, HoldFire)>();
 }
 
 /// Stop: clear intent and any temporary combat state.
 pub fn queue_stop(entity: &mut EntityCommands) {
     entity
         .insert(UnitOrder::Idle)
-        .remove::<(MoveTarget, Route, AttackTarget)>();
+        .remove::<(MoveTarget, Route, AttackTarget, Chasing, HoldFire)>();
 }
 
 #[cfg(test)]
@@ -175,18 +179,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_attack_move_allows_automatic_acquisition() {
-        assert!(!allows_auto_targeting(&UnitOrder::Idle));
-        assert!(!allows_auto_targeting(&UnitOrder::Move {
-            destination: Vec3::ZERO
-        }));
+    fn auto_targeting_matrix() {
         assert!(!allows_auto_targeting(&UnitOrder::Attack {
             target: Entity::from_bits(9)
         }));
-        assert!(allows_auto_targeting(&UnitOrder::AttackMove {
-            destination: Vec3::ZERO
-        }));
-        assert!(allows_auto_targeting(&UnitOrder::HoldPosition));
+        for order in [
+            UnitOrder::AttackMove {
+                destination: Vec3::ZERO,
+            },
+            UnitOrder::Move {
+                destination: Vec3::ZERO,
+            },
+            UnitOrder::HoldPosition,
+            UnitOrder::Idle,
+        ] {
+            assert!(allows_auto_targeting(&order), "{order:?} must acquire");
+        }
     }
 
     #[test]
@@ -217,6 +225,8 @@ mod tests {
                 destination: Vec3::X
             }
         );
-        assert!(!allows_auto_targeting(&order));
+        // Marching units acquire, but never chase (see allows_chase).
+        assert!(allows_auto_targeting(&order));
+        assert!(!allows_chase(&order));
     }
 }

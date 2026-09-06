@@ -29,7 +29,7 @@ type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
-        Text::new("RTS Prototype v0.0.4\n\nFPS: ...\nUnits: 200\nSelected: 0"),
+        Text::new("RTS Prototype v0.0.5\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -86,6 +86,6 @@ fn update_hud(
     let failed = navigation.failed;
     let mode = benchmark.as_ref().map_or("PLAYGROUND", |run| run.label());
     hud.0 = format!(
-        "RTS Prototype v0.0.4\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
+        "RTS Prototype v0.0.5\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
     );
 }

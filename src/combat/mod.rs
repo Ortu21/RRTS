@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    movement::{MoveTarget, Movement, MovementSystems},
+    movement::{ARRIVE_RADIUS, MoveTarget, Movement, MovementSystems, face_toward},
     navigation::Route,
     orders::{UnitOrder, allows_auto_targeting, allows_chase, queue_stop},
     spatial::{MAP_BOUND, SpatialGrid},
@@ -154,6 +154,17 @@ pub struct AcquisitionRange(pub f32);
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttackTarget(pub Entity);
 
+/// Locomotion arbitration markers, resolved once per frame by
+/// `resolve_behaviour` so executors never duplicate order logic:
+/// - `Chasing`: steer directly at the target (out of range, chase order).
+/// - `HoldFire`: stand and shoot (in range with a stop-to-fight order).
+/// - neither: follow routes / beeline / hold naturally, firing whenever a
+///   valid target is in weapon range.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chasing;
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldFire;
+
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Projectile {
     pub target: Entity,
@@ -189,8 +200,11 @@ fn validate_targets(
             Some(target_team) => {
                 let own_team = teams.get(entity).ok();
                 match (own_team, order) {
-                    (Some(own), UnitOrder::AttackMove { .. }) if own.is_enemy(*target_team) => {
-                        // Leash: drop targets chased far outside acquisition.
+                    (Some(own), UnitOrder::AttackMove { .. } | UnitOrder::Move { .. })
+                        if own.is_enemy(*target_team) =>
+                    {
+                        // Leash: drop targets left far behind (marching past)
+                        // or chased far outside acquisition.
                         match (ranges.get(entity).ok(), target_position(&grid, target.0)) {
                             (Some(range), Some(target_position)) => {
                                 transform.translation.distance(target_position)
@@ -204,9 +218,12 @@ fn validate_targets(
                     {
                         true
                     }
-                    (Some(own), UnitOrder::HoldPosition) if own.is_enemy(*target_team) => {
-                        // Holders cannot chase: keep the lock only while the
-                        // target stays within weapon reach (plus margin).
+                    (Some(own), UnitOrder::HoldPosition | UnitOrder::Idle)
+                        if own.is_enemy(*target_team) =>
+                    {
+                        // Static defenders never close distance: keep the lock
+                        // only while the target stays within weapon reach
+                        // (plus margin), freeing the slot for closer enemies.
                         match (weapons.get(entity).ok(), target_position(&grid, target.0)) {
                             (Some(weapon), Some(target_position)) => {
                                 transform.translation.distance(target_position)
@@ -341,7 +358,12 @@ fn retarget_stale_locks(
     candidates: Query<(&Team, &Health), With<Unit>>,
 ) {
     for (entity, transform, team, order, target, range) in &units {
-        if !matches!(order, UnitOrder::AttackMove { .. }) {
+        // Retarget every auto-acquiring order except transient Idle:
+        // marchers walking past enemies need fresh locks as much as chasers.
+        if !matches!(
+            order,
+            UnitOrder::AttackMove { .. } | UnitOrder::Move { .. } | UnitOrder::HoldPosition
+        ) {
             continue;
         }
         if !(clock.tick + entity.to_bits()).is_multiple_of(ACQUIRE_STRIDE) {
@@ -375,32 +397,48 @@ fn retarget_stale_locks(
     }
 }
 
-/// Resolves order intent into movement/fire state. Attack-move keeps its
-/// strategic destination in the order while engaging temporary targets.
-/// Engaged units deliberately keep their `MoveTarget`/`Route`: route
-/// following pauses for them (see `move_units`), so when the engagement
-/// ends the previous route resumes instantly without replanning. Dropping
-/// routes on every engagement would churn the budgeted path planner and
-/// strand units without routes for hundreds of ticks at scale.
+/// Resolves order intent into locomotion arbitration markers plus movement
+/// state. Attack-move keeps its strategic destination in the order while
+/// engaging temporary targets. Engaged units deliberately keep their
+/// `MoveTarget`/`Route`: route following pauses for them (see `move_units`),
+/// so when the engagement ends the previous route resumes instantly without
+/// replanning. Dropping routes on every engagement would churn the budgeted
+/// path planner and strand units without routes for hundreds of ticks.
 #[allow(clippy::type_complexity)]
 fn resolve_behaviour(
     mut commands: Commands,
+    grid: Res<SpatialGrid>,
+    weapons: Query<&Weapon>,
     units: Query<
         (
             Entity,
+            &Transform,
             &UnitOrder,
             Option<&AttackTarget>,
             Option<&MoveTarget>,
             Has<Route>,
+            Has<Chasing>,
+            Has<HoldFire>,
         ),
         With<Unit>,
     >,
 ) {
-    for (entity, order, target, move_target, has_route) in &units {
+    for (entity, transform, order, target, move_target, has_route, chasing, holding) in &units {
+        // Stale markers strand units (executors filter on them), so clear
+        // them the moment the lock is gone, for every order uniformly.
+        if target.is_none() && (chasing || holding) {
+            commands.entity(entity).remove::<(Chasing, HoldFire)>();
+        }
         match (order, target) {
-            (UnitOrder::Idle, _) => {}
-            (UnitOrder::Move { destination }, _) => {
-                if move_target.is_none_or(|current| current.0 != *destination) {
+            (UnitOrder::Idle, None) => {}
+            (UnitOrder::Move { destination }, None) => {
+                if move_target.is_none() && !has_route {
+                    if transform.translation.distance(*destination) <= ARRIVE_RADIUS {
+                        commands.entity(entity).insert(UnitOrder::Idle);
+                    } else {
+                        commands.entity(entity).insert(MoveTarget(*destination));
+                    }
+                } else if move_target.is_none_or(|current| current.0 != *destination) {
                     commands
                         .entity(entity)
                         .insert(MoveTarget(*destination))
@@ -418,10 +456,41 @@ fn resolve_behaviour(
                         .remove::<Route>();
                 }
             }
-            // Engaging: chase steering and holding are handled by the combat
-            // systems; the strategic route waits untouched underneath.
-            // Holders simply keep firing from their position: no route, and
-            // chase is gated off for their order (see `allows_chase`).
+            // Marching or holding with a lock: no markers, the unit follows
+            // its route (or holds) and fires whenever the target is in range.
+            (UnitOrder::Move { .. } | UnitOrder::HoldPosition | UnitOrder::Idle, Some(_)) => {
+                if chasing || holding {
+                    commands.entity(entity).remove::<(Chasing, HoldFire)>();
+                }
+            }
+            // Stop-to-fight orders: hold position and shoot inside weapon
+            // range, chase outside of it. Markers are mutually exclusive.
+            (order, Some(target)) if allows_chase(order) => {
+                let in_range = weapons
+                    .get(entity)
+                    .ok()
+                    .zip(target_position(&grid, target.0))
+                    .is_some_and(|(weapon, target_position)| {
+                        in_weapon_range(transform.translation, target_position, weapon.range)
+                    });
+                if in_range {
+                    if chasing {
+                        commands.entity(entity).remove::<Chasing>();
+                    }
+                    if !holding {
+                        commands.entity(entity).insert(HoldFire);
+                    }
+                } else {
+                    if holding {
+                        commands.entity(entity).remove::<HoldFire>();
+                    }
+                    if !chasing {
+                        commands.entity(entity).insert(Chasing);
+                    }
+                }
+            }
+            // Unreachable: the guard above covers every chase order, but the
+            // compiler cannot prove it.
             (UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. }, Some(_)) => {}
             (UnitOrder::HoldPosition, _) => {
                 if move_target.is_some() || has_route {
@@ -438,28 +507,20 @@ fn resolve_behaviour(
 /// Direct kinematic chase toward the temporary target while outside weapon
 /// range. No pathfinding here: strategic routes use the nav grid, combat
 /// steering is local. Runs after route movement.
+#[allow(clippy::type_complexity)]
 fn chase_targets(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
     mut units: Query<
-        (
-            &mut Transform,
-            &Movement,
-            &Weapon,
-            &AttackTarget,
-            &UnitOrder,
-        ),
-        With<Unit>,
+        (&mut Transform, &Movement, &Weapon, &AttackTarget),
+        (With<Unit>, With<Chasing>),
     >,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for (mut transform, movement, weapon, target, order) in &mut units {
-        if !allows_chase(order) {
-            continue;
-        }
+    for (mut transform, movement, weapon, target) in &mut units {
         let Some(target_position) = target_position(&grid, target.0) else {
             continue;
         };
@@ -470,6 +531,7 @@ fn chase_targets(
         let step = movement.speed * dt;
         let distance = offset.length();
         if distance > f32::EPSILON {
+            face_toward(&mut transform, offset);
             transform.translation += offset / distance * step.min(distance);
             transform.translation.x = transform.translation.x.clamp(-MAP_BOUND, MAP_BOUND);
             transform.translation.z = transform.translation.z.clamp(-MAP_BOUND, MAP_BOUND);
@@ -537,6 +599,14 @@ fn fire_weapons(
             continue;
         }
         state.remaining = weapon.cooldown;
+        // Spawn at the muzzle: in front of the hull toward the target, so
+        // shots visibly leave the barrel instead of the unit center.
+        let muzzle = (target_position - transform.translation).xz();
+        let muzzle = if muzzle.length_squared() > f32::EPSILON {
+            muzzle.normalize() * crate::units::MUZZLE_REACH
+        } else {
+            Vec2::ZERO
+        };
         commands.spawn((
             Projectile {
                 target: target.0,
@@ -544,7 +614,7 @@ fn fire_weapons(
                 damage: weapon.damage,
             },
             *team,
-            Transform::from_translation(transform.translation),
+            Transform::from_translation(transform.translation + Vec3::new(muzzle.x, 0.0, muzzle.y)),
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(assets.team_material[team.0 as usize % 2].clone()),
         ));
@@ -595,13 +665,39 @@ mod tests {
     use super::*;
     use crate::{
         movement::MovementPlugin,
-        navigation::NavigationPlugin,
+        navigation::{CELL_SIZE, HALF_SIZE, NavGrid, NavigationPlugin},
         scenario::Scenario,
         spatial::SpatialPlugin,
         units::{CollisionRadius, UnitPlugin},
     };
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
+
+    /// Headless combat harness on a hermetic open field: gameplay logic
+    /// must not depend on the generated map layout.
+    fn combat_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / 60.0,
+            )))
+            .insert_resource(Scenario::Benchmark { per_team: 1 })
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .add_plugins((
+                NavigationPlugin,
+                SpatialPlugin,
+                UnitPlugin { visuals: false },
+                CombatPlugin,
+                MovementPlugin,
+            ))
+            .insert_resource(NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new()));
+        app.finish();
+        app.cleanup();
+        app.update();
+        app
+    }
 
     fn combatant(
         id: u32,
@@ -659,26 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn attack_move_squads_meet_fight_and_move_ignores_enemies() {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                1.0 / 60.0,
-            )))
-            .insert_resource(Scenario::Benchmark { per_team: 1 })
-            .add_plugins(bevy::asset::AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_asset::<StandardMaterial>()
-            .add_plugins((
-                NavigationPlugin,
-                SpatialPlugin,
-                UnitPlugin { visuals: false },
-                CombatPlugin,
-                MovementPlugin,
-            ));
-        app.finish();
-        app.cleanup();
-        app.update();
+    fn attack_move_squads_meet_fight_and_move_fires_on_the_march() {
+        let mut app = combat_app();
 
         // Two armed enemies 25 units apart: inside acquisition (30),
         // outside weapon range (18). A third unit on plain Move nearby.
@@ -730,8 +808,13 @@ mod tests {
                 let world = app.world();
                 assert!(world.entity(blue).get::<AttackTarget>().is_some());
                 assert!(world.entity(red).get::<AttackTarget>().is_some());
-                // The plain move never acquires, even with enemies close.
-                assert!(world.entity(mover).get::<AttackTarget>().is_none());
+                // The marching unit acquires too, but keeps marching: it
+                // fires on the move instead of stopping or chasing.
+                assert!(world.entity(mover).get::<AttackTarget>().is_some());
+                assert!(matches!(
+                    world.entity(mover).get::<UnitOrder>(),
+                    Some(UnitOrder::Move { .. })
+                ));
             }
         }
 
@@ -744,10 +827,12 @@ mod tests {
             .map(|health| health.current)
             .sum();
         assert!(health_sum < 300.0);
-        // The mover kept its order and never engaged.
+        // The mover kept marching (or arrived) and never held a stale state.
         let mover_order = world.entity(mover).get::<UnitOrder>().unwrap();
-        assert!(matches!(mover_order, UnitOrder::Move { .. }));
-        assert!(world.entity(mover).get::<AttackTarget>().is_none());
+        assert!(matches!(
+            mover_order,
+            UnitOrder::Move { .. } | UnitOrder::Idle
+        ));
         // Survivors keep a coherent order: attack-move destination preserved
         // or clean idle after arrival/completion, never a stale target.
         for entity in [blue, red] {
@@ -763,25 +848,7 @@ mod tests {
 
     #[test]
     fn dense_melee_keeps_fighting_until_resolved() {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                1.0 / 60.0,
-            )))
-            .insert_resource(Scenario::Benchmark { per_team: 1 })
-            .add_plugins(bevy::asset::AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_asset::<StandardMaterial>()
-            .add_plugins((
-                NavigationPlugin,
-                SpatialPlugin,
-                UnitPlugin { visuals: false },
-                CombatPlugin,
-                MovementPlugin,
-            ));
-        app.finish();
-        app.cleanup();
-        app.update();
+        let mut app = combat_app();
 
         // 24v24 interleaved on a tight grid: everybody starts inside
         // acquisition range of several enemies.
@@ -851,26 +918,131 @@ mod tests {
     }
 
     #[test]
+    fn attack_move_stops_to_fight_while_move_fires_on_the_march() {
+        let mut app = combat_app();
+
+        // Unarmed stand-ins: valid targets that never fight back, so the
+        // measured behaviour belongs to the blue orders under test.
+        let attacker = app
+            .world_mut()
+            .spawn(combatant(
+                120,
+                0,
+                Vec3::new(-30.0, 0.8, -40.0),
+                UnitOrder::AttackMove {
+                    destination: Vec3::new(60.0, 0.8, -40.0),
+                },
+            ))
+            .id();
+        let victim = app
+            .world_mut()
+            .spawn(combatant(
+                121,
+                1,
+                Vec3::new(-10.0, 0.8, -40.0),
+                UnitOrder::Idle,
+            ))
+            .id();
+        let marcher = app
+            .world_mut()
+            .spawn(combatant(
+                122,
+                0,
+                Vec3::new(-30.0, 0.8, 40.0),
+                UnitOrder::Move {
+                    destination: Vec3::new(60.0, 0.8, 40.0),
+                },
+            ))
+            .id();
+        let bystander = app
+            .world_mut()
+            .spawn(combatant(
+                123,
+                1,
+                Vec3::new(30.0, 0.8, 30.0),
+                UnitOrder::Idle,
+            ))
+            .id();
+        for target in [victim, bystander] {
+            app.world_mut()
+                .entity_mut(target)
+                .remove::<(Weapon, WeaponState)>();
+        }
+
+        // Displacement of the attacker while its victim lives: stop-to-fight
+        // must hold it near its start while the marcher crosses the map.
+        // The marcher's detour around the north wall needs ~1100 ticks.
+        // Lanes sit 80 units apart so the pairs never interact.
+        let mut held_disp = 0.0_f32;
+        let mut march_yaw = 0.0_f32;
+        for tick in 0..1100 {
+            app.update();
+            let world = app.world();
+            if world.entities().contains(victim) {
+                held_disp = held_disp.max(
+                    (world
+                        .entity(attacker)
+                        .get::<Transform>()
+                        .unwrap()
+                        .translation
+                        .x
+                        + 30.0)
+                        .abs(),
+                );
+            }
+            // Mid-march the route runs due east: body must face travel.
+            if tick == 500 {
+                march_yaw = world
+                    .entity(marcher)
+                    .get::<Transform>()
+                    .unwrap()
+                    .rotation
+                    .to_euler(EulerRot::YXZ)
+                    .0;
+            }
+        }
+        let world = app.world();
+        assert!(!world.entities().contains(victim), "attacker must kill");
+        assert!(
+            held_disp < 12.0,
+            "attack-move must stop to fight, drifted {held_disp}"
+        );
+        // Destination far from reached: the order (not just the target)
+        // survives the engagement.
+        assert!(matches!(
+            world.entity(attacker).get::<UnitOrder>(),
+            Some(UnitOrder::AttackMove { .. })
+        ));
+        // The marcher arrives while wounding the bystander in passing.
+        let marched = world
+            .entity(marcher)
+            .get::<Transform>()
+            .unwrap()
+            .translation;
+        assert!(
+            marched.distance(Vec3::new(60.0, 0.8, 40.0)) < 1.0,
+            "mover must arrive, at {marched:?}"
+        );
+        assert!(matches!(
+            world.entity(marcher).get::<UnitOrder>(),
+            Some(UnitOrder::Move { .. }) | Some(UnitOrder::Idle)
+        ));
+        // Marching body faces travel direction (due east mid-route).
+        assert!(
+            -march_yaw.sin() > 0.9,
+            "body must face east mid-march, yaw={march_yaw}"
+        );
+        let bystander_hp = world.entity(bystander).get::<Health>().unwrap().current;
+        assert!(
+            bystander_hp < 100.0,
+            "mover must fire on the march, bystander at {bystander_hp}"
+        );
+        assert!(world.entities().contains(bystander));
+    }
+
+    #[test]
     fn holders_fire_without_chasing_and_ignore_out_of_reach_targets() {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                1.0 / 60.0,
-            )))
-            .insert_resource(Scenario::Benchmark { per_team: 1 })
-            .add_plugins(bevy::asset::AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_asset::<StandardMaterial>()
-            .add_plugins((
-                NavigationPlugin,
-                SpatialPlugin,
-                UnitPlugin { visuals: false },
-                CombatPlugin,
-                MovementPlugin,
-            ));
-        app.finish();
-        app.cleanup();
-        app.update();
+        let mut app = combat_app();
 
         let post = Vec3::new(-20.0, 0.8, -40.0);
         let holder = app

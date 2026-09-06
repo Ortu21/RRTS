@@ -74,17 +74,26 @@ pub fn write_profile_report(
         serde_json::from_reader(BufReader::new(File::open(benchmark_run)?))?;
     let parsed_trace: TraceRoot = serde_json::from_reader(BufReader::new(File::open(trace)?))?;
     let spans = parse_spans(parsed_trace);
-    let measurement = spans
-        .iter()
-        .filter(|span| span.name.starts_with("benchmark_measurement"))
-        .max_by(|left, right| left.duration_us.total_cmp(&right.duration_us))
-        .ok_or_else(|| io::Error::other("trace has no benchmark_measurement span"))?;
+    // Window bounds span every `benchmark_measurement` marker: a single
+    // long span for headless captures, a zero-duration open/close pair for
+    // graphical ones (whose guard cannot cross frames).
+    let mut bounds: Option<(f64, f64)> = None;
+    for span in &spans {
+        if span.name.starts_with("benchmark_measurement") {
+            let end = span.start_us + span.duration_us;
+            bounds = Some(match bounds {
+                None => (span.start_us, end),
+                Some((lo, hi)) => (lo.min(span.start_us), hi.max(end)),
+            });
+        }
+    }
+    let (window_start, window_end) =
+        bounds.ok_or_else(|| io::Error::other("trace has no benchmark_measurement span"))?;
 
     let mut durations: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let measurement_end = measurement.start_us + measurement.duration_us;
     for span in &spans {
         let end = span.start_us + span.duration_us;
-        if span.start_us < measurement.start_us || end > measurement_end {
+        if span.start_us < window_start || end > window_end {
             continue;
         }
         if let Some(system) = system_name(&span.name) {
@@ -126,7 +135,7 @@ pub fn write_profile_report(
         schema_version: REPORT_SCHEMA_VERSION,
         metadata: benchmark.metadata,
         case_id: case_id.clone(),
-        measurement_wall_ms: measurement.duration_us / 1000.0,
+        measurement_wall_ms: (window_end - window_start) / 1000.0,
         systems,
     };
 
@@ -235,5 +244,44 @@ mod tests {
             system_name("system: name=move_units").as_deref(),
             Some("move_units")
         );
+    }
+
+    #[test]
+    fn measurement_window_spans_marker_pairs() {
+        // Graphical captures bound the window with two zero-duration
+        // open/close markers instead of one long span.
+        let trace: TraceRoot = serde_json::from_value(serde_json::json!([
+            {"name":"system: name=warmup", "ph":"X", "ts":5.0, "dur":2.0, "pid":1, "tid":1},
+            {"name":"benchmark_measurement", "ph":"B", "ts":10.0, "pid":1, "tid":1},
+            {"name":"benchmark_measurement", "ph":"E", "ts":10.5, "pid":1, "tid":1},
+            {"name":"system: name=acquire_targets", "ph":"X", "ts":20.0, "dur":5.0, "pid":1, "tid":2},
+            {"name":"system: name=late", "ph":"X", "ts":98.0, "dur":5.0, "pid":1, "tid":2},
+            {"name":"benchmark_measurement", "ph":"B", "ts":100.0, "pid":1, "tid":1},
+            {"name":"benchmark_measurement", "ph":"E", "ts":100.5, "pid":1, "tid":1}
+        ]))
+        .unwrap();
+        let spans = parse_spans(trace);
+        let mut bounds: Option<(f64, f64)> = None;
+        for span in &spans {
+            if span.name.starts_with("benchmark_measurement") {
+                let end = span.start_us + span.duration_us;
+                bounds = Some(match bounds {
+                    None => (span.start_us, end),
+                    Some((lo, hi)) => (lo.min(span.start_us), hi.max(end)),
+                });
+            }
+        }
+        assert_eq!(bounds, Some((10.0, 100.5)));
+        // Only the in-window system span would survive filtering.
+        let inside: Vec<_> = spans
+            .iter()
+            .filter(|span| {
+                system_name(&span.name).is_some()
+                    && span.start_us >= 10.0
+                    && span.start_us + span.duration_us <= 100.5
+            })
+            .map(|span| span.name.clone())
+            .collect();
+        assert_eq!(inside, vec!["system: name=acquire_targets".to_string()]);
     }
 }

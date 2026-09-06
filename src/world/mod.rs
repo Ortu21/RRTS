@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub use crate::navigation::HALF_SIZE as GROUND_HALF_SIZE;
-use crate::navigation::NavGrid;
+use crate::navigation::{HALF_SIZE, NavGrid};
 
 pub struct WorldPlugin;
 
@@ -17,13 +17,15 @@ fn setup_world(
     mut materials: ResMut<Assets<StandardMaterial>>,
     grid: Res<NavGrid>,
 ) {
+    let map_size = HALF_SIZE * 2.0;
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(200.0, 200.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(map_size, map_size))),
         MeshMaterial3d(materials.add(Color::srgb(0.21, 0.29, 0.23))),
     ));
-    let line_mesh = meshes.add(Cuboid::new(0.035, 0.015, 200.0));
+    let line_mesh = meshes.add(Cuboid::new(0.035, 0.015, map_size));
     let line_material = materials.add(Color::srgb(0.30, 0.38, 0.31));
-    for index in -20..=20 {
+    let lines = (HALF_SIZE / 5.0) as i32;
+    for index in -lines..=lines {
         for rotation in [0.0, std::f32::consts::FRAC_PI_2] {
             let rotation = Quat::from_rotation_y(rotation);
             commands.spawn((

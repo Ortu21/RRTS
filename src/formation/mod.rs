@@ -22,31 +22,32 @@ pub fn formation_slots(count: usize, center: Vec3, spacing: f32) -> Vec<Vec3> {
     slots
 }
 
-/// Deterministic grid fill of one map half for skirmish stress tests.
-/// Unlike `formation_slots`, the layout scales to any count: spacing shrinks
-/// to fit instead of overflowing the map. Team 0 takes the west half, team 1
-/// is mirrored so front lines face each other across a narrow gap.
-pub fn skirmish_slots(count: usize, team: usize) -> Vec<Vec3> {
+/// Deterministic grid fill staging one army at its front edge for skirmish
+/// stress tests. Unlike `formation_slots`, the layout scales to any count:
+/// spacing shrinks once the block outgrows the map half. Team 0 masses west
+/// of the center gap, team 1 mirrors east, so front lines always start
+/// inside acquisition range of each other.
+pub fn skirmish_slots(count: usize, team: usize, half_size: f32) -> Vec<Vec3> {
     if count == 0 {
         return Vec::new();
     }
-    let (x_lo, x_hi) = (-95.0, -8.0);
-    let (z_lo, z_hi) = (-95.0, 95.0);
-    let width = x_hi - x_lo;
-    let height = z_hi - z_lo;
-    let cols = ((count as f32 * width / height).sqrt().ceil() as usize).max(1);
+    let depth_limit = half_size - 5.0 - 8.0;
+    let width_limit = (half_size - 5.0) * 2.0;
+    let cols = (count as f32).sqrt().ceil() as usize;
     let rows = count.div_ceil(cols);
-    let step_x = width / cols as f32;
-    let step_z = height / rows as f32;
+    let spacing = 2.2_f32
+        .min(depth_limit / cols as f32)
+        .min(width_limit / rows as f32);
+    let height = rows as f32 * spacing;
     (0..count)
         .map(|index| {
             let column = index % cols;
             let row = index / cols;
-            let west_x = x_lo + (column as f32 + 0.5) * step_x;
+            let west_x = -8.0 - (column as f32 + 0.5) * spacing;
             Vec3::new(
                 if team == 0 { west_x } else { -west_x },
                 0.0,
-                z_lo + (row as f32 + 0.5) * step_z,
+                -height * 0.5 + (row as f32 + 0.5) * spacing,
             )
         })
         .collect()
@@ -83,24 +84,21 @@ mod tests {
 
     #[test]
     fn skirmish_halves_scale_and_face_each_other() {
+        use crate::navigation::HALF_SIZE;
         for count in [1, 100, 1000, 10_000] {
-            let west = skirmish_slots(count, 0);
-            let east = skirmish_slots(count, 1);
+            let west = skirmish_slots(count, 0, HALF_SIZE);
+            let east = skirmish_slots(count, 1, HALF_SIZE);
             assert_eq!(west.len(), count);
             assert_eq!(east.len(), count);
-            assert_eq!(west, skirmish_slots(count, 0));
+            assert_eq!(west, skirmish_slots(count, 0, HALF_SIZE));
             for slot in west.iter().chain(&east) {
-                // Stays inside the map, clear of the middle walls.
-                assert!(slot.x.abs() <= 95.0 && slot.z.abs() <= 95.0);
-                assert!(slot.x.abs() >= 8.0 - 0.0001 || slot.z.abs() > 15.0 + 0.8);
+                assert!(slot.x.abs() <= HALF_SIZE - 5.0 && slot.z.abs() <= HALF_SIZE - 5.0);
             }
             let west_front = west.iter().map(|slot| slot.x).fold(f32::MIN, f32::max);
             let east_front = east.iter().map(|slot| slot.x).fold(f32::MAX, f32::min);
             assert!(west_front <= -8.0 + 0.0001 && east_front >= 8.0 - 0.0001);
-            // Dense front lines start inside acquisition range of each other.
-            if count >= 100 {
-                assert!(east_front - west_front <= 30.0);
-            }
+            // Front-packed blocks always open inside acquisition range.
+            assert!(east_front - west_front <= 30.0);
         }
     }
 }

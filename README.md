@@ -1,6 +1,6 @@
-# Rust RTS — v0.0.4
+# Rust RTS — v0.0.5
 
-A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets or direct dependencies beyond Bevy.
+A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets. Gameplay depends only on Bevy; benchmark reporting and machine metadata additionally use serde/serde_json and sysinfo (benchmark-only code paths).
 
 ## Run and controls
 
@@ -10,7 +10,7 @@ Requirements: Rust stable 1.95+, Cargo, a native linker and a Metal/Vulkan/Direc
 cargo run
 ```
 
-The playground contains 100 blue vs 100 red units on a 200 × 200 field with three walls and passages. Both squads open with attack-move orders toward the center: they advance, separate locally, acquire enemies through a shared spatial grid, chase, fire homing projectiles and resume their destination when engagements end. Right-click orders route units around the walls into separate free destination slots.
+The playground contains 100 blue vs 100 red units on a 400 × 400 field with a deterministic random obstacle layout (fixed seed, guaranteed lanes and connectivity). Both squads open with attack-move orders toward the center: they advance, separate locally, acquire enemies through a shared spatial grid, chase, fire homing projectiles and resume their destination when engagements end. Right-click orders route units around the walls into separate free destination slots.
 
 | Control | Action |
 |---|---|
@@ -79,6 +79,14 @@ Chrome Trace is used as the standard raw event format and timeline viewer; the p
 
 Pass `--record` to `scripts/profile.sh` to retain the compact profile summary in Git history after profiling a clean commit. Raw traces are deliberately never tracked.
 
+For a massive visual stress test with the same profiler (simulation + rendering + presentation in one frame):
+
+```sh
+./scripts/profile-visual.sh --units-per-team 2500 --seconds 60
+```
+
+Keep the window visible and focused and avoid all input; occlusion, focus loss or input invalidates graphical timing. At high unit counts expect GPU-bound frames: compare `frame_ms` against `update_ms` in the samples to separate CPU simulation cost from rendering cost. Scale up to `--units-per-team 10000` to find the rendering limit.
+
 ### Graphical benchmark
 
 ```sh
@@ -112,7 +120,7 @@ Tests cover formation generation, picking, deterministic obstacle-safe paths, un
 
 ## Architecture and limits
 
-`main.rs` composes the Bevy plugins. `scenario` selects the playground or benchmark; `units` separates gameplay spawning from visual entities. `world`, `camera`, `selection`, `orders`, `movement` and `ui` retain their domains. `navigation` owns an 80 × 80 occupancy grid, deterministic eight-neighbor A*, unit clearance and a budget of 32 path requests per frame. `benchmark` owns CLI parsing, automatic crossing orders, measurement and reports. `spatial` owns a uniform spatial hash rebuilt every frame, shared by local avoidance and target acquisition. `combat` owns health, weapons, order-driven targeting, homing projectiles and death handling; `orders` owns the `UnitOrder` intent (`Idle`, `Move`, `Attack`, `AttackMove`, `HoldPosition`) plus the temporary `AttackTarget` combat state. Holders acquire and fire without chasing; first-volley cooldowns are staggered deterministically per unit.
+`main.rs` composes the Bevy plugins. `scenario` selects the playground or benchmark; `units` separates gameplay spawning from visual entities. `world`, `camera`, `selection`, `orders`, `movement` and `ui` retain their domains. `navigation` owns an 80 × 80 occupancy grid, deterministic eight-neighbor A*, unit clearance and a budget of 32 path requests per frame. `benchmark` owns CLI parsing, automatic crossing orders, measurement and reports. `spatial` owns a uniform spatial hash rebuilt every frame, shared by local avoidance and target acquisition. `combat` owns health, weapons, order-driven targeting, homing projectiles and death handling; `orders` owns the `UnitOrder` intent (`Idle`, `Move`, `Attack`, `AttackMove`, `HoldPosition`) plus the temporary `AttackTarget` combat state and the `Chasing`/`HoldFire` locomotion markers. Beyond-All-Reason style rules: `AttackMove` stops to fight then resumes its route, `Move` fires on the march without chasing, holders and idle units defend in place. Bodies face travel direction, turret barrels track their target (forward otherwise), and projectiles leave the muzzle.
 
 Selection and orders remain ECS state. An order replaces the old route; movement waits for planning and consumes waypoints without overshoot. Blocked formation slots are relocated to unique free grid cells. Unreachable routes stop and increment the HUD failure count. Grid slots are 2.5 units apart.
 

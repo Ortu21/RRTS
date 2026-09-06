@@ -34,9 +34,9 @@ fn setup_camera(mut commands: Commands, scenario: Res<Scenario>) {
         focus: Vec3::ZERO,
         yaw: 0.0,
         distance: if matches!(*scenario, Scenario::Playground) {
-            100.0
+            180.0
         } else {
-            220.0
+            440.0
         },
     };
     commands.spawn((Camera3d::default(), controller.transform(), controller));
@@ -66,7 +66,7 @@ fn control_camera(
     };
     let dt = time.delta_secs();
     controller.yaw += axis(&[KeyCode::KeyQ], &[KeyCode::KeyE]) * 1.5 * dt;
-    controller.distance = (controller.distance * (-scroll * 0.12).exp()).clamp(15.0, 240.0);
+    controller.distance = (controller.distance * (-scroll * 0.12).exp()).clamp(15.0, 520.0);
     let local = Vec3::new(
         axis(
             &[KeyCode::KeyD, KeyCode::ArrowRight],

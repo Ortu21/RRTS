@@ -29,9 +29,9 @@ impl Scenario {
 
     pub fn center(self, team: usize) -> Vec3 {
         match self {
-            Self::Playground => Vec3::new(if team == 0 { -35.0 } else { 35.0 }, 0.0, 0.0),
+            Self::Playground => Vec3::new(if team == 0 { -70.0 } else { 70.0 }, 0.0, 0.0),
             Self::Benchmark { .. } | Self::Skirmish { .. } => {
-                Vec3::new(if team == 0 { -55.0 } else { 55.0 }, 0.0, 0.0)
+                Vec3::new(if team == 0 { -110.0 } else { 110.0 }, 0.0, 0.0)
             }
         }
     }

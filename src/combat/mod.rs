@@ -5,7 +5,7 @@ use crate::{
     navigation::Route,
     orders::{UnitOrder, allows_auto_targeting, allows_chase, queue_stop},
     spatial::{MAP_BOUND, SpatialGrid},
-    units::{Team, Unit},
+    units::{Team, Unit, UnitKind},
 };
 
 pub struct CombatPlugin;
@@ -35,7 +35,9 @@ impl Plugin for CombatPlugin {
                         .in_set(AcquireTargets),
                     resolve_behaviour.in_set(ResolveBehaviour),
                     chase_targets.in_set(ChaseTargets),
-                    (tick_cooldowns, fire_weapons).chain().in_set(WeaponSystems),
+                    (traverse_turrets, tick_cooldowns, fire_weapons)
+                        .chain()
+                        .in_set(WeaponSystems),
                     move_projectiles.in_set(ProjectileSystems),
                     process_deaths.in_set(DeathSystems),
                 ),
@@ -101,13 +103,6 @@ pub struct Health {
     pub max: f32,
 }
 
-pub fn full_health() -> Health {
-    Health {
-        current: 100.0,
-        max: 100.0,
-    }
-}
-
 pub fn apply_damage_to(current: f32, damage: f32) -> f32 {
     (current - damage).max(0.0)
 }
@@ -124,15 +119,6 @@ pub struct Weapon {
     pub projectile_speed: f32,
 }
 
-pub fn default_weapon() -> Weapon {
-    Weapon {
-        range: 18.0,
-        cooldown: 1.0,
-        damage: 10.0,
-        projectile_speed: 30.0,
-    }
-}
-
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct WeaponState {
     pub remaining: f32,
@@ -140,9 +126,9 @@ pub struct WeaponState {
 
 /// Deterministic cooldown phase in [0, 1): spreads first volleys over time
 /// so damage arrives smoothly instead of synchronized waves. Pure function
-/// of the entity, so repeated runs stay deterministic.
-pub fn desync_phase(entity: Entity) -> f32 {
-    (entity.to_bits().wrapping_mul(0x9E3779B97F4A7C15) % 1000) as f32 / 1000.0
+/// of the numeric unit id, so repeated runs stay deterministic.
+pub fn desync_phase(id: u32) -> f32 {
+    ((id as u64).wrapping_mul(0x9E3779B97F4A7C15) % 1000) as f32 / 1000.0
 }
 
 /// Acquisition range is deliberately separate from weapon range.
@@ -153,6 +139,12 @@ pub struct AcquisitionRange(pub f32);
 /// when it is removed, the behaviour resumes the standing order.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttackTarget(pub Entity);
+
+/// Turret world yaw, owned by the simulation. The visual barrel mirrors it;
+/// fire is gated on it (see aim tolerance), so traverse rate is real DPS
+/// handling rather than decoration.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct TurretYaw(pub f32);
 
 /// Locomotion arbitration markers, resolved once per frame by
 /// `resolve_behaviour` so executors never duplicate order logic:
@@ -512,7 +504,7 @@ fn chase_targets(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
     mut units: Query<
-        (&mut Transform, &Movement, &Weapon, &AttackTarget),
+        (&mut Transform, &Movement, &Weapon, &AttackTarget, &UnitKind),
         (With<Unit>, With<Chasing>),
     >,
 ) {
@@ -520,7 +512,7 @@ fn chase_targets(
     if dt <= 0.0 {
         return;
     }
-    for (mut transform, movement, weapon, target) in &mut units {
+    for (mut transform, movement, weapon, target, kind) in &mut units {
         let Some(target_position) = target_position(&grid, target.0) else {
             continue;
         };
@@ -531,7 +523,8 @@ fn chase_targets(
         let step = movement.speed * dt;
         let distance = offset.length();
         if distance > f32::EPSILON {
-            face_toward(&mut transform, offset);
+            let turn_rate = crate::units::archetype(*kind).hull_turn;
+            face_toward(&mut transform, offset, turn_rate, dt);
             transform.translation += offset / distance * step.min(distance);
             transform.translation.x = transform.translation.x.clamp(-MAP_BOUND, MAP_BOUND);
             transform.translation.z = transform.translation.z.clamp(-MAP_BOUND, MAP_BOUND);
@@ -543,6 +536,37 @@ fn tick_cooldowns(time: Res<Time>, mut states: Query<&mut WeaponState>) {
     let dt = time.delta_secs();
     for mut state in &mut states {
         state.remaining = (state.remaining - dt).max(0.0);
+    }
+}
+
+/// Traverse turret yaw toward the current lock (or hull-forward when
+/// targetless) at the archetype traverse rate. slowly-traversing kinds
+/// genuinely aim slower: fire is gated on alignment (see `fire_weapons`).
+#[allow(clippy::type_complexity)]
+fn traverse_turrets(
+    time: Res<Time>,
+    grid: Res<SpatialGrid>,
+    mut units: Query<
+        (&Transform, &UnitKind, &mut TurretYaw, Option<&AttackTarget>),
+        (With<Unit>, With<Weapon>),
+    >,
+) {
+    use crate::movement::{rotate_toward, yaw_toward};
+    use crate::units::archetype;
+
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for (transform, kind, mut turret, target) in &mut units {
+        let stats = archetype(*kind);
+        let body_yaw = transform.rotation.to_euler(EulerRot::YXZ).0;
+        let aim = target
+            .and_then(|target| grid.position(target.0))
+            .filter(|aim| aim.xz().distance_squared(transform.translation.xz()) > f32::EPSILON)
+            .map(|aim| yaw_toward(aim - transform.translation))
+            .unwrap_or(body_yaw);
+        turret.0 = rotate_toward(turret.0, aim, stats.traverse * dt);
     }
 }
 
@@ -576,17 +600,29 @@ fn setup_projectile_assets(
     });
 }
 
+#[allow(clippy::type_complexity)]
 fn fire_weapons(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
     assets: Option<Res<ProjectileAssets>>,
     health: Query<&Health>,
-    mut shooters: Query<(&Transform, &Team, &Weapon, &mut WeaponState, &AttackTarget), With<Unit>>,
+    mut shooters: Query<
+        (
+            &Transform,
+            &Team,
+            &Weapon,
+            &mut WeaponState,
+            &AttackTarget,
+            &TurretYaw,
+            &UnitKind,
+        ),
+        With<Unit>,
+    >,
 ) {
     let Some(assets) = assets else {
         return;
     };
-    for (transform, team, weapon, mut state, target) in &mut shooters {
+    for (transform, team, weapon, mut state, target, turret, kind) in &mut shooters {
         if state.remaining > 0.0 {
             continue;
         }
@@ -598,15 +634,16 @@ fn fire_weapons(
         {
             continue;
         }
+        // Fire only when the barrel has traversed onto the target: slow
+        // turrets genuinely shoot later, fast ones snap-shoot on the move.
+        let stats = crate::units::archetype(*kind);
+        let aim = crate::movement::yaw_toward(target_position - transform.translation);
+        if crate::movement::wrap_angle(aim - turret.0).abs() > stats.aim_tolerance {
+            continue;
+        }
         state.remaining = weapon.cooldown;
-        // Spawn at the muzzle: in front of the hull toward the target, so
-        // shots visibly leave the barrel instead of the unit center.
-        let muzzle = (target_position - transform.translation).xz();
-        let muzzle = if muzzle.length_squared() > f32::EPSILON {
-            muzzle.normalize() * crate::units::MUZZLE_REACH
-        } else {
-            Vec2::ZERO
-        };
+        // Spawn at the muzzle: forward of the traversing barrel.
+        let muzzle = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos()) * crate::units::MUZZLE_REACH;
         commands.spawn((
             Projectile {
                 target: target.0,
@@ -614,7 +651,7 @@ fn fire_weapons(
                 damage: weapon.damage,
             },
             *team,
-            Transform::from_translation(transform.translation + Vec3::new(muzzle.x, 0.0, muzzle.y)),
+            Transform::from_translation(transform.translation + muzzle),
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(assets.team_material[team.0 as usize % 2].clone()),
         ));
@@ -699,40 +736,49 @@ mod tests {
         app
     }
 
+    #[allow(clippy::type_complexity)]
     fn combatant(
         id: u32,
         team: u8,
         position: Vec3,
         order: UnitOrder,
+        kind: UnitKind,
     ) -> (
         Unit,
         Team,
         crate::movement::Movement,
-        CollisionRadius,
         UnitOrder,
         MoveTarget,
+        Transform,
+        UnitKind,
+        CollisionRadius,
         Health,
         Weapon,
         WeaponState,
         AcquisitionRange,
-        Transform,
+        TurretYaw,
     ) {
         let destination = match order {
             UnitOrder::Move { destination } | UnitOrder::AttackMove { destination } => destination,
             _ => position,
         };
+        let stats = crate::units::archetype(kind);
+        let (kind_component, radius, health, weapon, weapon_state, acquisition, turret) =
+            crate::units::arm_bundle(id, kind);
         (
             Unit(id),
             Team(team),
-            crate::movement::Movement { speed: 7.0 },
-            CollisionRadius(crate::spatial::DEFAULT_UNIT_RADIUS),
+            crate::movement::Movement { speed: stats.speed },
             order,
             MoveTarget(destination),
-            full_health(),
-            default_weapon(),
-            WeaponState::default(),
-            AcquisitionRange(30.0),
             Transform::from_translation(position),
+            kind_component,
+            radius,
+            health,
+            weapon,
+            weapon_state,
+            acquisition,
+            turret,
         )
     }
 
@@ -744,7 +790,10 @@ mod tests {
             current: 0.0,
             max: 100.0
         }));
-        assert!(!is_dead(&full_health()));
+        assert!(!is_dead(&Health {
+            current: 100.0,
+            max: 100.0
+        }));
     }
 
     #[test]
@@ -769,6 +818,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(30.0, 0.8, -40.0),
                 },
+                UnitKind::Tank,
             ))
             .id();
         let red = app
@@ -780,6 +830,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(-60.0, 0.8, -40.0),
                 },
+                UnitKind::Tank,
             ))
             .id();
         let mover = app
@@ -791,6 +842,7 @@ mod tests {
                 UnitOrder::Move {
                     destination: Vec3::new(30.0, 0.8, -30.0),
                 },
+                UnitKind::Tank,
             ))
             .id();
 
@@ -864,6 +916,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(if team == 0 { 30.0 } else { -60.0 }, 0.8, -40.0),
                 },
+                UnitKind::Tank,
             ));
         }
 
@@ -932,6 +985,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(60.0, 0.8, -40.0),
                 },
+                UnitKind::Tank,
             ))
             .id();
         let victim = app
@@ -941,6 +995,7 @@ mod tests {
                 1,
                 Vec3::new(-10.0, 0.8, -40.0),
                 UnitOrder::Idle,
+                UnitKind::Tank,
             ))
             .id();
         let marcher = app
@@ -952,6 +1007,7 @@ mod tests {
                 UnitOrder::Move {
                     destination: Vec3::new(60.0, 0.8, 40.0),
                 },
+                UnitKind::Tank,
             ))
             .id();
         let bystander = app
@@ -961,6 +1017,7 @@ mod tests {
                 1,
                 Vec3::new(30.0, 0.8, 30.0),
                 UnitOrder::Idle,
+                UnitKind::Tank,
             ))
             .id();
         for target in [victim, bystander] {
@@ -1047,7 +1104,13 @@ mod tests {
         let post = Vec3::new(-20.0, 0.8, -40.0);
         let holder = app
             .world_mut()
-            .spawn(combatant(110, 0, post, UnitOrder::HoldPosition))
+            .spawn(combatant(
+                110,
+                0,
+                post,
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
             .id();
         // Unarmed: marches into holder range and stops 5 units past it.
         // Must die to holder fire without the holder ever chasing.
@@ -1060,6 +1123,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(-25.0, 0.8, -40.0),
                 },
+                UnitKind::Tank,
             ))
             .id();
         app.world_mut()
@@ -1069,10 +1133,16 @@ mod tests {
         let bystander_spot = Vec3::new(-20.0, 0.8, -15.0);
         let bystander = app
             .world_mut()
-            .spawn(combatant(112, 1, bystander_spot, UnitOrder::Idle))
+            .spawn(combatant(
+                112,
+                1,
+                bystander_spot,
+                UnitOrder::Idle,
+                UnitKind::Tank,
+            ))
             .id();
 
-        for _ in 0..800 {
+        for _ in 0..900 {
             app.update();
         }
         let world = app.world();
@@ -1095,7 +1165,7 @@ mod tests {
         assert!(idle.distance(bystander_spot) < 0.5);
         assert_eq!(
             world.entity(bystander).get::<Health>().unwrap().current,
-            100.0
+            crate::units::archetype(UnitKind::Tank).max_health
         );
     }
 

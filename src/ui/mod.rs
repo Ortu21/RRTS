@@ -8,7 +8,7 @@ use crate::{
     movement::MoveTarget,
     navigation::{NavigationStats, Route},
     selection::{Selected, SelectionSystems},
-    units::{Team, Unit},
+    units::{Team, Unit, UnitKind, archetype},
 };
 
 pub struct UiPlugin;
@@ -29,7 +29,7 @@ type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
-        Text::new("RTS Prototype v0.0.5\n\nFPS: ...\nUnits: 200\nSelected: 0"),
+        Text::new("RTS Prototype v0.0.6\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -56,6 +56,7 @@ fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     units: Query<UnitStatus, With<Unit>>,
     teams: Query<&Team, With<Unit>>,
+    kinds: Query<&UnitKind, With<Unit>>,
     engaging: Query<(), (With<Unit>, With<AttackTarget>)>,
     projectiles: Query<(), With<Projectile>>,
     navigation: Res<NavigationStats>,
@@ -77,6 +78,15 @@ fn update_hud(
     let selected = units.iter().filter(|(selected, _, _)| *selected).count();
     let blue = teams.iter().filter(|team| team.0 == 0).count();
     let red = teams.iter().filter(|team| team.0 != 0).count();
+    let mut by_kind = [0; 3];
+    for kind in &kinds {
+        by_kind[kind.index()] += 1;
+    }
+    let kinds_line = UnitKind::ALL
+        .iter()
+        .map(|kind| format!("{}:{}", archetype(*kind).name, by_kind[kind.index()]))
+        .collect::<Vec<_>>()
+        .join("  ");
     let engaging = engaging.iter().len();
     let projectiles = projectiles.iter().len();
     let pending = units
@@ -86,6 +96,6 @@ fn update_hud(
     let failed = navigation.failed;
     let mode = benchmark.as_ref().map_or("PLAYGROUND", |run| run.label());
     hud.0 = format!(
-        "RTS Prototype v0.0.5\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
+        "RTS Prototype v0.0.6\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nPaths queued: {pending}\nPaths failed: {failed}"
     );
 }

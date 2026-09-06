@@ -8,8 +8,8 @@ use crate::{
     navigation::{NavGrid, NavigationPlugin, NavigationStats, PlanPaths, Route},
     orders::UnitOrder,
     scenario::Scenario,
-    spatial::{DEFAULT_UNIT_RADIUS, SpatialPlugin},
-    units::{CollisionRadius, Team, Unit, UnitPlugin, arm_bundle},
+    spatial::SpatialPlugin,
+    units::{CollisionRadius, Team, Unit, UnitKind, UnitPlugin, arm_bundle},
 };
 use bevy::{prelude::*, time::TimeUpdateStrategy};
 use cli::{Config, SuitePreset, Workload};
@@ -166,20 +166,26 @@ fn strategic_order(world: &mut World, attack_move: bool) -> (Vec<Vec3>, f64) {
     let start = Instant::now();
     let scenario = *world.resource::<Scenario>();
     let mut units: Vec<_> = world
-        .query::<(Entity, &Unit, &Team, &Transform)>()
+        .query::<(Entity, &Unit, &Team, &Transform, &UnitKind)>()
         .iter(world)
-        .map(|(entity, unit, team, transform)| {
-            (entity, unit.0, team.0, transform.translation.with_y(0.8))
+        .map(|(entity, unit, team, transform, kind)| {
+            (
+                entity,
+                unit.0,
+                team.0,
+                transform.translation.with_y(0.8),
+                *kind,
+            )
         })
         .collect();
-    units.sort_unstable_by_key(|(_, id, _, _)| *id);
+    units.sort_unstable_by_key(|(_, id, _, _, _)| *id);
     let mut initial = Vec::with_capacity(units.len());
-    for (entity, _, team, position) in units {
+    for (entity, id, team, position, kind) in units {
         let destination = scenario.attack_target(team as usize);
         let mut entity = world.entity_mut(entity);
         if attack_move {
             entity
-                .insert(arm_bundle(entity.id()))
+                .insert(arm_bundle(id, kind))
                 .insert(UnitOrder::AttackMove { destination });
         } else {
             // Crowd: same march, plus body separation. CollisionRadius turns
@@ -187,7 +193,7 @@ fn strategic_order(world: &mut World, attack_move: bool) -> (Vec<Vec3>, f64) {
             // crowd measures movement + avoidance without any combat.
             entity.insert((
                 UnitOrder::Move { destination },
-                CollisionRadius(DEFAULT_UNIT_RADIUS),
+                CollisionRadius(crate::units::archetype(kind).radius),
             ));
         }
         entity

@@ -1,17 +1,16 @@
 use crate::{
     camera::RtsCamera,
-    combat::{
-        AcquisitionRange, AttackTarget, Health, Weapon, WeaponState, default_weapon, desync_phase,
-        full_health,
-    },
+    combat::{AcquisitionRange, Health, Weapon, WeaponState, desync_phase},
     formation::{formation_slots, skirmish_slots},
-    movement::{MoveTarget, Movement, wrap_angle, yaw_toward},
+    movement::{Movement, wrap_angle},
     navigation::{HALF_SIZE, NavGrid},
     orders::UnitOrder,
     scenario::Scenario,
-    spatial::{DEFAULT_UNIT_RADIUS, SpatialGrid},
 };
 use bevy::prelude::*;
+
+pub mod archetype;
+pub use archetype::{UnitKind, archetype, kind_for_index};
 
 pub const UNIT_HALF_SIZE: Vec3 = Vec3::new(0.55, 0.8, 0.55);
 /// Health bar dimensions: full-width quad floating above the unit.
@@ -88,50 +87,70 @@ fn spawn_units(mut commands: Commands, scenario: Res<Scenario>, grid: Res<NavGri
         .map(|slot| grid.clear_point(slot))
         .collect();
         for (index, position) in slots.into_iter().enumerate() {
+            let global = team * count + index;
+            // Playground and skirmish field the same mixed force; plain
+            // benchmarks stay uniform tanks so movement numbers remain
+            // comparable across versions.
+            let kind = match *scenario {
+                Scenario::Benchmark { .. } => UnitKind::Tank,
+                _ => kind_for_index(global),
+            };
+            let stats = archetype(kind);
             let mut unit = commands.spawn((
-                Unit((team * count + index) as u32),
+                Unit(global as u32),
                 Selectable,
                 Team(team as u8),
-                Movement { speed: 7.0 },
+                kind,
+                Movement { speed: stats.speed },
                 UnitOrder::Idle,
                 Transform::from_translation(position + Vec3::Y * UNIT_HALF_SIZE.y),
             ));
             if combat_demo {
-                let id = unit.id();
-                unit.insert(arm_bundle(id));
-                // The demo fights immediately; benchmark orders are
-                // issued at measurement start for timing symmetry.
-                let destination = scenario.attack_target(team);
-                unit.insert((
-                    UnitOrder::AttackMove { destination },
-                    MoveTarget(destination),
-                ));
+                // Armed but standing: no orders at spawn, so the playground
+                // is a manual test bench (right-click move, G attack-move,
+                // H hold, S stop) instead of an auto-battle.
+                unit.insert(arm_bundle(global as u32, kind));
             }
         }
     }
 }
 
 /// Combat capability bundle shared by gameplay spawns and benchmark orders.
-/// Deterministic per entity (see desync_phase), so repeats stay comparable.
+/// Deterministic per numeric id (see desync_phase), so repeats stay
+/// comparable. Every value comes from the archetype table: no per-kind
+/// branching anywhere in systems code.
 pub fn arm_bundle(
-    id: Entity,
+    id: u32,
+    kind: UnitKind,
 ) -> (
+    UnitKind,
     CollisionRadius,
     Health,
     Weapon,
     WeaponState,
     AcquisitionRange,
+    crate::combat::TurretYaw,
 ) {
-    let weapon = default_weapon();
+    let stats = archetype(kind);
     (
-        CollisionRadius(DEFAULT_UNIT_RADIUS),
-        full_health(),
-        weapon,
+        kind,
+        CollisionRadius(stats.radius),
+        Health {
+            current: stats.max_health,
+            max: stats.max_health,
+        },
+        Weapon {
+            range: stats.range,
+            cooldown: stats.cooldown,
+            damage: stats.damage,
+            projectile_speed: stats.projectile_speed,
+        },
         WeaponState {
             // Stagger first volleys deterministically (see desync_phase).
-            remaining: desync_phase(id) * weapon.cooldown,
+            remaining: desync_phase(id) * stats.cooldown,
         },
-        AcquisitionRange(30.0),
+        AcquisitionRange(stats.acquisition),
+        crate::combat::TurretYaw::default(),
     )
 }
 
@@ -139,9 +158,13 @@ fn add_visuals(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    units: Query<(Entity, &Team), With<Unit>>,
+    units: Query<(Entity, &Team, &UnitKind), With<Unit>>,
 ) {
-    let body = meshes.add(Cuboid::from_size(UNIT_HALF_SIZE * 2.0));
+    // One body mesh per archetype (sizes differ); team colors stay shared.
+    let body_meshes: [Handle<Mesh>; 3] = UnitKind::ALL.map(|kind| {
+        let half = archetype(kind).body;
+        meshes.add(Cuboid::from_size(half * 2.0))
+    });
     let materials_by_team = [
         materials.add(Color::srgb(0.28, 0.58, 0.90)),
         materials.add(Color::srgb(0.90, 0.28, 0.20)),
@@ -174,11 +197,11 @@ fn add_visuals(
         unlit: false,
         ..default()
     });
-    for (entity, team) in &units {
+    for (entity, team, kind) in &units {
         commands
             .entity(entity)
             .insert((
-                Mesh3d(body.clone()),
+                Mesh3d(body_meshes[kind.index()].clone()),
                 MeshMaterial3d(materials_by_team[team.0 as usize].clone()),
             ))
             .with_children(|parent| {
@@ -212,25 +235,12 @@ fn add_visuals(
     }
 }
 
-/// Turret local yaw for a hull facing `body_yaw`: aim at the target in
-/// world space, or align forward when targetless. Pure math; the system
-/// below only applies it.
-pub fn turret_local_yaw(body_yaw: f32, body_pos: Vec3, target_pos: Option<Vec3>) -> f32 {
-    let aim_world = target_pos
-        .filter(|aim| aim.xz().distance_squared(body_pos.xz()) > f32::EPSILON)
-        .map(|aim| yaw_toward(aim - body_pos))
-        .unwrap_or(body_yaw);
-    wrap_angle(aim_world - body_yaw)
-}
-/// Turret aim, visual-only: point the barrel at the unit's current target
-/// in world space, or align forward with the hull when targetless. Reads
-/// target positions from the spatial grid (one frame stale, irrelevant for
-/// a visual) so dead targets simply recenter instead of panicking.
-/// Simulation never reads turret transforms back: determinism untouched.
+/// Turret aim, visual-only: mirror the simulation-owned `TurretYaw` onto
+/// the barrel child, relative to the hull. Simulation never reads turret
+/// transforms back: determinism untouched. Headless runs spawn no turrets.
 #[allow(clippy::type_complexity)]
 fn aim_turrets(
-    grid: Option<Res<SpatialGrid>>,
-    units: Query<(&Transform, Option<&AttackTarget>), With<Unit>>,
+    units: Query<(&Transform, &crate::combat::TurretYaw), With<Unit>>,
     mut turrets: Query<
         (&ChildOf, &mut Transform),
         (
@@ -241,17 +251,12 @@ fn aim_turrets(
         ),
     >,
 ) {
-    let Some(grid) = grid else {
-        return;
-    };
     for (parent, mut transform) in &mut turrets {
-        let Ok((body, target)) = units.get(parent.parent()) else {
+        let Ok((body, turret)) = units.get(parent.parent()) else {
             continue;
         };
         let body_yaw = body.rotation.to_euler(EulerRot::YXZ).0;
-        let target_pos = target.and_then(|target| grid.position(target.0));
-        transform.rotation =
-            Quat::from_rotation_y(turret_local_yaw(body_yaw, body.translation, target_pos));
+        transform.rotation = Quat::from_rotation_y(wrap_angle(turret.0 - body_yaw));
     }
 }
 /// Camera-facing health bars: copy the camera rotation onto every bar so
@@ -308,31 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn turret_tracks_target_and_centers_otherwise() {
-        use std::f32::consts::{FRAC_PI_2, PI};
-        let body = Vec3::new(-20.0, 0.8, -40.0);
-        // Hull facing -Z, target due east: barrel swings -90 degrees.
-        let local = turret_local_yaw(0.0, body, Some(body + Vec3::X * 10.0));
-        assert!((local + FRAC_PI_2).abs() < 0.0001);
-        // Target straight ahead: aligned.
-        let local = turret_local_yaw(0.0, body, Some(body - Vec3::Z * 10.0));
-        assert!(local.abs() < 0.0001);
-        // No target: barrel stays aligned with the hull.
-        assert_eq!(turret_local_yaw(1.2, body, None), 0.0);
-        // Wrap-around: hull at +179 degrees, target at -179 → -2 degrees.
-        let local = turret_local_yaw(PI - 0.01, body, Some(body + Vec3::new(-0.01, 0.0, 10.0)));
-        assert!(local.abs() < 0.1);
-    }
-
-    #[test]
     fn desync_phases_are_deterministic_and_spread() {
         use crate::combat::desync_phase;
-        let phases: Vec<f32> = (1..=16)
-            .map(|index| desync_phase(Entity::from_bits(index)))
-            .collect();
+        let phases: Vec<f32> = (1..=16).map(desync_phase).collect();
         assert!(phases.iter().all(|phase| (0.0..1.0).contains(phase)));
-        // Same entity, same phase across calls.
-        assert_eq!(desync_phase(Entity::from_bits(3)), phases[2]);
+        // Same id, same phase across calls.
+        assert_eq!(desync_phase(3), phases[2]);
         // Spread out instead of clustered like raw sequential indices.
         let mut sorted = phases.clone();
         sorted.sort_by(f32::total_cmp);

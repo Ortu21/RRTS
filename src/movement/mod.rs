@@ -2,6 +2,7 @@ use crate::{
     combat::{AttackTarget, Chasing, HoldFire},
     navigation::{PlanPaths, Route},
     orders::UnitOrder,
+    units::UnitKind,
 };
 use bevy::prelude::*;
 
@@ -47,15 +48,18 @@ fn move_units(
             &mut Transform,
             &Movement,
             &MoveTarget,
+            &UnitKind,
             Option<&mut Route>,
         ),
         (Without<Chasing>, Without<HoldFire>),
     >,
 ) {
-    for (entity, mut transform, movement, target, route) in &mut units {
+    let dt = time.delta_secs();
+    for (entity, mut transform, movement, target, kind, route) in &mut units {
+        let turn_rate = crate::units::archetype(*kind).hull_turn;
         match route {
             Some(mut route) => {
-                let mut remaining = movement.speed * time.delta_secs();
+                let mut remaining = movement.speed * dt;
                 while route.next < route.points.len() {
                     let destination = route.points[route.next].with_y(transform.translation.y);
                     let offset = destination - transform.translation;
@@ -64,7 +68,7 @@ fn move_units(
                         route.next += 1;
                         continue;
                     }
-                    face_toward(&mut transform, offset);
+                    face_toward(&mut transform, offset, turn_rate, dt);
                     if distance <= remaining {
                         transform.translation = destination;
                         remaining -= distance;
@@ -83,7 +87,7 @@ fn move_units(
                 // unplannable start: steer directly so units keep closing in
                 // instead of stranding. The planner upgrades them to a real
                 // route when budget allows; arrival snaps exactly.
-                let step = movement.speed * time.delta_secs();
+                let step = movement.speed * dt;
                 let goal = target.0.with_y(transform.translation.y);
                 let offset = goal - transform.translation;
                 let distance = offset.length();
@@ -91,7 +95,7 @@ fn move_units(
                     transform.translation = goal;
                     commands.entity(entity).remove::<MoveTarget>();
                 } else if distance > f32::EPSILON {
-                    face_toward(&mut transform, offset);
+                    face_toward(&mut transform, offset, turn_rate, dt);
                     transform.translation += offset / distance * step;
                 }
             }
@@ -111,19 +115,37 @@ pub fn wrap_angle(angle: f32) -> f32 {
     ((angle + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI
 }
 
-/// Snap a unit body toward its current step direction. Idle units keep
-/// their last facing; rotation never feeds back into the simulation.
-pub fn face_toward(transform: &mut Transform, offset: Vec3) {
-    if offset.xz().length_squared() > f32::EPSILON {
-        transform.rotation = Quat::from_rotation_y(yaw_toward(offset));
+/// Step `current` yaw toward `target` by at most `max_step` radians, taking
+/// the short way around. Snaps exactly when close. Pure and deterministic.
+pub fn rotate_toward(current: f32, target: f32, max_step: f32) -> f32 {
+    let delta = wrap_angle(target - current);
+    if delta.abs() <= max_step {
+        target
+    } else {
+        current + delta.signum() * max_step
     }
+}
+
+/// Turn a unit body toward its current step direction at `turn_rate` rad/s.
+/// Idle units keep their last facing; rotation never feeds back into the
+/// simulation. Translation is untouched: facing is smooth, arrival exact.
+pub fn face_toward(transform: &mut Transform, offset: Vec3, turn_rate: f32, dt: f32) {
+    if offset.xz().length_squared() <= f32::EPSILON {
+        return;
+    }
+    let current = transform.rotation.to_euler(EulerRot::YXZ).0;
+    transform.rotation =
+        Quat::from_rotation_y(rotate_toward(current, yaw_toward(offset), turn_rate * dt));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::navigation::{
-        CELL_SIZE, HALF_SIZE, NavGrid, NavigationPlugin, NavigationStats, PATHS_PER_FRAME,
+    use crate::{
+        navigation::{
+            CELL_SIZE, HALF_SIZE, NavGrid, NavigationPlugin, NavigationStats, PATHS_PER_FRAME,
+        },
+        units::UnitKind,
     };
     use bevy::time::TimeUpdateStrategy;
     use std::f32::consts::{FRAC_PI_2, PI};
@@ -136,6 +158,20 @@ mod tests {
         assert!((yaw_toward(Vec3::Z).abs() - PI).abs() < 0.000001);
         assert_eq!(wrap_angle(0.0), 0.0);
         assert!((wrap_angle(3.0 * PI).abs() - PI).abs() < 0.0001);
+    }
+
+    #[test]
+    fn rotate_toward_takes_short_steps_and_snaps() {
+        assert_eq!(rotate_toward(0.0, 1.0, 0.1), 0.1);
+        assert_eq!(rotate_toward(0.0, 0.05, 0.1), 0.05);
+        // Short way around the wrap: +179° to -179° snaps across the seam.
+        assert_eq!(rotate_toward(PI - 0.01, -PI + 0.01, 0.1), -PI + 0.01);
+        // Full sweep converges in bounded steps, frame-rate independent.
+        let mut yaw = 0.0;
+        for _ in 0..100 {
+            yaw = rotate_toward(yaw, PI, 0.1);
+        }
+        assert!((yaw.abs() - PI).abs() < 0.0001);
     }
 
     fn simulation(dt: f64) -> App {
@@ -161,6 +197,7 @@ mod tests {
                     Transform::from_xyz(-55.0, 0.8, 0.0),
                     Movement { speed: 7.0 },
                     MoveTarget(Vec3::new(55.0, 0.0, 0.0)),
+                    UnitKind::Tank,
                 ))
                 .id();
             for _ in 0..(4.0 / dt) as usize {
@@ -195,6 +232,7 @@ mod tests {
                 Transform::from_xyz(-55.0, 0.8, 0.0),
                 Movement { speed: 7.0 },
                 MoveTarget(unreachable),
+                UnitKind::Tank,
             ));
         }
         app.update();

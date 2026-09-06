@@ -1,4 +1,4 @@
-# Rust RTS — v0.0.5
+# Rust RTS — v0.0.6
 
 A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets. Gameplay depends only on Bevy; benchmark reporting and machine metadata additionally use serde/serde_json and sysinfo (benchmark-only code paths).
 
@@ -10,7 +10,7 @@ Requirements: Rust stable 1.95+, Cargo, a native linker and a Metal/Vulkan/Direc
 cargo run
 ```
 
-The playground contains 100 blue vs 100 red units on a 400 × 400 field with a deterministic random obstacle layout (fixed seed, guaranteed lanes and connectivity). Both squads open with attack-move orders toward the center: they advance, separate locally, acquire enemies through a shared spatial grid, chase, fire homing projectiles and resume their destination when engagements end. Right-click orders route units around the walls into separate free destination slots.
+The playground contains 100 blue vs 100 red units on a 400 × 400 field with a deterministic random obstacle layout (fixed seed, guaranteed lanes and connectivity). Both squads spawn armed but standing: select units and issue orders manually (right-click move, G attack-move, H hold, S stop) to stage battles. Right-click orders route units into separate free destination slots.
 
 | Control | Action |
 |---|---|
@@ -120,7 +120,7 @@ Tests cover formation generation, picking, deterministic obstacle-safe paths, un
 
 ## Architecture and limits
 
-`main.rs` composes the Bevy plugins. `scenario` selects the playground or benchmark; `units` separates gameplay spawning from visual entities. `world`, `camera`, `selection`, `orders`, `movement` and `ui` retain their domains. `navigation` owns an 80 × 80 occupancy grid, deterministic eight-neighbor A*, unit clearance and a budget of 32 path requests per frame. `benchmark` owns CLI parsing, automatic crossing orders, measurement and reports. `spatial` owns a uniform spatial hash rebuilt every frame, shared by local avoidance and target acquisition. `combat` owns health, weapons, order-driven targeting, homing projectiles and death handling; `orders` owns the `UnitOrder` intent (`Idle`, `Move`, `Attack`, `AttackMove`, `HoldPosition`) plus the temporary `AttackTarget` combat state and the `Chasing`/`HoldFire` locomotion markers. Beyond-All-Reason style rules: `AttackMove` stops to fight then resumes its route, `Move` fires on the march without chasing, holders and idle units defend in place. Bodies face travel direction, turret barrels track their target (forward otherwise), and projectiles leave the muzzle.
+`main.rs` composes the Bevy plugins. `scenario` selects the playground or benchmark; `units` separates gameplay spawning from visual entities. `world`, `camera`, `selection`, `orders`, `movement` and `ui` retain their domains. `navigation` owns an 80 × 80 occupancy grid, deterministic eight-neighbor A*, unit clearance and a budget of 32 path requests per frame. `benchmark` owns CLI parsing, automatic crossing orders, measurement and reports. `spatial` owns a uniform spatial hash rebuilt every frame, shared by local avoidance and target acquisition. `combat` owns health, weapons, order-driven targeting, homing projectiles and death handling; `orders` owns the `UnitOrder` intent (`Idle`, `Move`, `Attack`, `AttackMove`, `HoldPosition`) plus the temporary `AttackTarget` combat state and the `Chasing`/`HoldFire` locomotion markers. Beyond-All-Reason style rules: `AttackMove` stops to fight then resumes its route, `Move` fires on the march without chasing, holders and idle units defend in place. Bodies face travel direction, turret barrels track their target (forward otherwise), and projectiles leave the muzzle. Units come in three data-driven archetypes (`Scout`, `Tank`, `Artillery`) defined in a single table (`units/archetype.rs`): health, speed, hull turn rate, turret traverse, aim tolerance, weapon and body size. Hulls turn smoothly toward travel, turrets traverse toward locks, and fire is gated on barrel alignment, so handling differs per kind. Adding a unit is a data row, not a systems change.
 
 Selection and orders remain ECS state. An order replaces the old route; movement waits for planning and consumes waypoints without overshoot. Blocked formation slots are relocated to unique free grid cells. Unreachable routes stop and increment the HUD failure count. Grid slots are 2.5 units apart.
 

@@ -191,6 +191,40 @@ impl Default for NavGrid {
 }
 
 impl NavGrid {
+    /// Called only when a building footprint is added/removed, never per frame.
+    pub fn replace_dynamic(&mut self, previous_count: usize, dynamic: &[Obstacle]) {
+        self.obstacles
+            .truncate(self.obstacles.len() - previous_count);
+        self.obstacles.extend_from_slice(dynamic);
+        self.walkable = build_walkable(&self.obstacles, self.half_size, self.cell_size, self.width);
+    }
+    /// Exact swept XZ clearance against expanded obstacle AABBs.
+    pub fn segment_clear(&self, from: Vec3, to: Vec3) -> bool {
+        if !self.has_clearance(from) || !self.has_clearance(to) {
+            return false;
+        }
+        let delta = to.xz() - from.xz();
+        self.obstacles.iter().all(|o| {
+            let lo = o.center - o.half_size - Vec2::splat(UNIT_CLEARANCE);
+            let hi = o.center + o.half_size + Vec2::splat(UNIT_CLEARANCE);
+            let mut enter: f32 = 0.0;
+            let mut leave: f32 = 1.0;
+            for axis in 0..2 {
+                if delta[axis].abs() < 1e-8 {
+                    if from.xz()[axis] <= lo[axis] || from.xz()[axis] >= hi[axis] {
+                        return true;
+                    }
+                } else {
+                    let a = (lo[axis] - from.xz()[axis]) / delta[axis];
+                    let b = (hi[axis] - from.xz()[axis]) / delta[axis];
+                    enter = enter.max(a.min(b));
+                    leave = leave.min(a.max(b));
+                }
+            }
+            enter >= leave
+        })
+    }
+
     pub fn new(half_size: f32, cell_size: f32, obstacles: Vec<Obstacle>) -> Self {
         let width = (half_size * 2.0 / cell_size).round() as usize;
         let walkable = build_walkable(&obstacles, half_size, cell_size, width);
@@ -201,6 +235,103 @@ impl NavGrid {
             width,
             walkable,
         }
+    }
+
+    /// Body-aware clearance margin for a unit radius. Default grid routing
+    /// stays at UNIT_CLEARANCE (cheap, comparable); spawn points and builder
+    /// destinations use this so large hulls never spawn intersecting rock.
+    /// +0.3 keeps a visual gap without choking the map like a full diameter.
+    pub fn clearance_for(radius: f32) -> f32 {
+        radius + 0.3
+    }
+
+    pub fn has_clearance_for(&self, point: Vec3, radius: f32) -> bool {
+        let margin = Self::clearance_for(radius);
+        point.is_finite()
+            && point.x.abs() <= self.half_size - margin
+            && point.z.abs() <= self.half_size - margin
+            && self.obstacles.iter().all(|obstacle| {
+                let delta = (point.xz() - obstacle.center).abs();
+                delta.x >= obstacle.half_size.x + margin
+                    || delta.y >= obstacle.half_size.y + margin
+            })
+    }
+
+    /// Exact swept XZ clearance for a body radius (buildings use the default
+    /// 0.8 margin via segment_clear; units check their own hull here).
+    pub fn segment_clear_for(&self, from: Vec3, to: Vec3, radius: f32) -> bool {
+        let margin = Self::clearance_for(radius);
+        if !self.has_clearance_for(from, radius) || !self.has_clearance_for(to, radius) {
+            return false;
+        }
+        let delta = to.xz() - from.xz();
+        self.obstacles.iter().all(|o| {
+            let lo = o.center - o.half_size - Vec2::splat(margin);
+            let hi = o.center + o.half_size + Vec2::splat(margin);
+            let mut enter: f32 = 0.0;
+            let mut leave: f32 = 1.0;
+            for axis in 0..2 {
+                if delta[axis].abs() < 1e-8 {
+                    if from.xz()[axis] <= lo[axis] || from.xz()[axis] >= hi[axis] {
+                        return true;
+                    }
+                } else {
+                    let a = (lo[axis] - from.xz()[axis]) / delta[axis];
+                    let b = (hi[axis] - from.xz()[axis]) / delta[axis];
+                    enter = enter.max(a.min(b));
+                    leave = leave.min(a.max(b));
+                }
+            }
+            enter >= leave
+        })
+    }
+
+    /// Repair a spawn point for a body radius. Same deterministic spiral as
+    /// clear_point but the goal cell must fit the hull, not just the default
+    /// scout margin. Falls back to the clamped point if nothing fits in range.
+    pub fn clear_point_for(&self, point: Vec3, radius: f32) -> Vec3 {
+        let margin = Self::clearance_for(radius);
+        let mut point = point;
+        point.x = point.x.clamp(-self.half_size + margin, self.half_size - margin);
+        point.z = point.z.clamp(-self.half_size + margin, self.half_size - margin);
+        if self.is_walkable(point) && self.has_clearance_for(point, radius) {
+            return point;
+        }
+        let (cx, cz) = (
+            ((point.x + self.half_size) / self.cell_size) as isize,
+            ((point.z + self.half_size) / self.cell_size) as isize,
+        );
+        for ring in 1..=16 {
+            for dx in -ring..=ring {
+                for dz in [-ring, ring] {
+                    if let Some(found) = self.clear_cell_for(cx + dx, cz + dz, point.y, radius)
+                    {
+                        return found;
+                    }
+                }
+            }
+            for dz in -ring + 1..=ring - 1 {
+                for dx in [-ring, ring] {
+                    if let Some(found) = self.clear_cell_for(cx + dx, cz + dz, point.y, radius)
+                    {
+                        return found;
+                    }
+                }
+            }
+        }
+        point
+    }
+
+    fn clear_cell_for(&self, x: isize, z: isize, y: f32, radius: f32) -> Option<Vec3> {
+        if x < 0 || z < 0 || x >= self.width as isize || z >= self.width as isize {
+            return None;
+        }
+        let index = z as usize * self.width + x as usize;
+        if !self.walkable[index] {
+            return None;
+        }
+        let center = self.cell_center(index).with_y(y);
+        self.has_clearance_for(center, radius).then_some(center)
     }
 
     /// Repair a spawn point into walkable, clear ground. Grid-fill layouts
@@ -782,5 +913,35 @@ mod tests {
                     .all(|slot| grid.is_walkable(*slot) && grid.has_clearance(*slot))
             );
         }
+    }
+    #[test]
+    fn body_aware_clearance_fits_hull_not_just_scout_margin() {
+        let grid = NavGrid::new(
+            20.0,
+            2.5,
+            vec![Obstacle {
+                center: Vec2::ZERO,
+                half_size: Vec2::splat(2.0),
+            }],
+        );
+        // 3.5m from the wall: fine for a scout (margin 0.8), too tight for
+        // the commander hull (margin 1.7). Exact predicate, no grid rounding.
+        let tight = Vec3::new(3.5, 0.0, 0.0);
+        assert!(grid.has_clearance(tight));
+        assert!(grid.has_clearance_for(tight, 0.45));
+        assert!(!grid.has_clearance_for(tight, 1.4));
+        // Swept check agrees along a wall-hugging lane that stays outside
+        // the scout margin: scout slips past, commander does not fit.
+        let across = Vec3::new(8.0, 0.0, 3.5);
+        assert!(grid.segment_clear(tight, across));
+        assert!(!grid.segment_clear_for(tight, across, 1.4));
+        // Repair near the map edge, where the hull margin (not the baked
+        // walkability at 0.8) is the binding constraint.
+        let open = NavGrid::new(20.0, 2.5, vec![]);
+        let edge = Vec3::new(19.0, 0.0, 0.0);
+        assert_eq!(open.clear_point_for(edge, 0.45), edge);
+        let repaired = open.clear_point_for(edge, 1.4);
+        assert!(open.has_clearance_for(repaired, 1.4));
+        assert!(repaired.x <= 20.0 - 1.7);
     }
 }

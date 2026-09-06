@@ -1,11 +1,12 @@
 use bevy::prelude::*;
 
 use crate::{
+    fog::{VisibilityMap, can_target},
     movement::{ARRIVE_RADIUS, MoveTarget, Movement, MovementSystems, face_toward},
     navigation::Route,
     orders::{UnitOrder, UnitOrderQueue, allows_auto_targeting, allows_chase, complete_order},
     spatial::SpatialGrid,
-    units::{Team, Unit, UnitKind},
+    units::{Builder, CollisionRadius, Team, Unit, UnitKind},
 };
 
 pub struct CombatPlugin;
@@ -35,7 +36,13 @@ impl Plugin for CombatPlugin {
                     acquire_targets.in_set(AcquireTargets),
                     resolve_behaviour.in_set(ResolveBehaviour),
                     chase_targets.in_set(ChaseTargets),
-                    (traverse_turrets, tick_cooldowns, fire_weapons)
+                    (
+                        traverse_turrets,
+                        traverse_secondary,
+                        tick_cooldowns,
+                        fire_weapons,
+                        fire_secondary,
+                    )
                         .chain()
                         .in_set(WeaponSystems),
                     move_projectiles.in_set(ProjectileSystems),
@@ -132,6 +139,29 @@ pub struct WeaponState {
     pub remaining: f32,
 }
 
+/// Secondary weapon (Commander missiles, prova). Shares the same
+/// `AttackTarget` lock as the primary (mitra): no separate acquisition pass.
+/// Own range/cooldown/yaw so the two guns feel different and can be tuned
+/// independently. Upgrade hook: fields are components, future levels just
+/// swap values.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct SecondaryWeapon {
+    pub range: f32,
+    pub cooldown: f32,
+    pub damage: f32,
+    pub projectile_speed: f32,
+}
+
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct SecondaryWeaponState {
+    pub remaining: f32,
+}
+
+/// Turret world yaw for the secondary gun, owned by the simulation like
+/// `TurretYaw`. Visual barrel mirrors it; fire is gated on alignment.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct SecondaryTurretYaw(pub f32);
+
 /// Deterministic cooldown phase in [0, 1): spreads first volleys over time
 /// so damage arrives smoothly instead of synchronized waves. Pure function
 /// of the numeric unit id, so repeated runs stay deterministic.
@@ -226,11 +256,23 @@ fn validate_targets(
     teams: Query<&Team>,
     ranges: Query<&AcquisitionRange>,
     weapons: Query<&Weapon>,
+    secondary: Query<&SecondaryWeapon>,
+    map: Option<Res<VisibilityMap>>,
     units: Query<(Entity, &Transform, &UnitOrder, &AttackTarget), With<Unit>>,
     mut queues: Query<&mut UnitOrderQueue>,
 ) {
     for (entity, transform, order, target) in &units {
-        let valid = match target_position(&grid, target.0)
+        // Fog: locks need team visibility. Headless harnesses without fog
+        // data stay open (see can_target); in game every team registers on
+        // the first fog tick.
+        let seen = target_position(&grid, target.0).is_some_and(|p| {
+            teams
+                .get(entity)
+                .ok()
+                .is_some_and(|own| can_target(map.as_deref(), own.0, p))
+        });
+        let valid = seen
+            && match target_position(&grid, target.0)
             .and_then(|_| health.get(target.0).ok())
             .filter(|health| !is_dead(health))
             .and(teams.get(target.0).ok())
@@ -243,7 +285,8 @@ fn validate_targets(
                         UnitOrder::AttackMove { .. }
                         | UnitOrder::Move { .. }
                         | UnitOrder::Patrol { .. }
-                        | UnitOrder::Guard { .. },
+                        | UnitOrder::Guard { .. }
+                        | UnitOrder::Build { .. },
                     ) if own.is_enemy(*target_team) => {
                         // Leash: drop targets left far behind (marching past)
                         // or chased far outside acquisition.
@@ -274,12 +317,16 @@ fn validate_targets(
                         if own.is_enemy(*target_team) =>
                     {
                         // Static defenders never close distance: keep the lock
-                        // only while the target stays within weapon reach
-                        // (plus margin), freeing the slot for closer enemies.
+                        // while ANY gun reaches (plus margin). Dual-gun units
+                        // hold missile locks beyond mitra range.
                         match (weapons.get(entity).ok(), target_position(&grid, target.0)) {
                             (Some(weapon), Some(target_position)) => {
+                                let reach = secondary
+                                    .get(entity)
+                                    .ok()
+                                    .map_or(weapon.range, |s| weapon.range.max(s.range));
                                 transform.translation.distance(target_position)
-                                    <= weapon.range * HOLD_MARGIN
+                                    <= reach * HOLD_MARGIN
                             }
                             _ => true,
                         }
@@ -307,12 +354,13 @@ fn validate_targets(
 /// Without re-evaluation a unit chases its first lock forever, running
 /// past nearer enemies: packed battles decay into tail-chasing with almost
 /// no time spent inside weapon range.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn acquire_targets(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
     mut clock: ResMut<CombatClock>,
     weapons: Query<&Weapon>,
+    map: Option<Res<VisibilityMap>>,
     units: Query<
         (
             Entity,
@@ -324,16 +372,20 @@ fn acquire_targets(
         ),
         (With<Unit>, With<Weapon>),
     >,
-    candidates: Query<(&Team, &Health), With<Unit>>,
+    candidates: Query<(&Team, &Health)>,
     mut queues: Query<&mut UnitOrderQueue>,
 ) {
     clock.tick += 1;
     for (entity, transform, team, order, range, target) in &units {
         if let UnitOrder::Attack { target } = order {
-            // Explicit order, not automatic acquisition.
+            // Explicit order, not automatic acquisition — but still gated on
+            // team visibility: no firing at what nobody sees.
             let valid = candidates
                 .get(*target)
-                .is_ok_and(|(target_team, health)| team.is_enemy(*target_team) && !is_dead(health));
+                .is_ok_and(|(target_team, health)| team.is_enemy(*target_team) && !is_dead(health))
+                && grid
+                    .position(*target)
+                    .is_some_and(|p| can_target(map.as_deref(), team.0, p));
             if valid {
                 commands.entity(entity).insert(AttackTarget(*target));
             } else {
@@ -362,6 +414,9 @@ fn acquire_targets(
         let near_ward = |position: Vec3| {
             ward_position.is_none_or(|ward| ward.distance_squared(position) <= range.0 * range.0)
         };
+        // Fog: only team-visible candidates may be (re)acquired. Headless
+        // harnesses without fog data stay open via can_target.
+        let in_sight = |position: Vec3| can_target(map.as_deref(), team.0, position);
         match target {
             None => {
                 if let Some((target, _)) = nearest_enemy(
@@ -371,7 +426,7 @@ fn acquire_targets(
                     transform.translation,
                     range.0,
                     entity,
-                    |_, position| near_ward(position),
+                    |_, position| near_ward(position) && in_sight(position),
                 ) {
                     commands.entity(entity).insert(AttackTarget(target));
                 }
@@ -388,6 +443,7 @@ fn acquire_targets(
                         | UnitOrder::HoldPosition
                         | UnitOrder::Patrol { .. }
                         | UnitOrder::Guard { .. }
+                        | UnitOrder::Build { .. }
                 ) {
                     continue;
                 }
@@ -411,7 +467,9 @@ fn acquire_targets(
                     transform.translation,
                     radius,
                     entity,
-                    |candidate, position| candidate != target.0 && near_ward(position),
+                    |candidate, position| {
+                        candidate != target.0 && near_ward(position) && in_sight(position)
+                    },
                 )
                 .filter(|(_, candidate_sq)| {
                     should_retarget(current_sq, *candidate_sq, weapon_range_sq)
@@ -427,7 +485,7 @@ fn acquire_targets(
 /// candidates rejected by `eligible`. Ties break deterministically.
 fn nearest_enemy(
     grid: &SpatialGrid,
-    candidates: &Query<(&Team, &Health), With<Unit>>,
+    candidates: &Query<(&Team, &Health)>,
     team: &Team,
     position: Vec3,
     range: f32,
@@ -472,10 +530,12 @@ fn nearest_enemy(
 /// so when the engagement ends the previous route resumes instantly without
 /// replanning. Dropping routes on every engagement would churn the budgeted
 /// path planner and strand units without routes for hundreds of ticks.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn resolve_behaviour(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
+    nav: Option<Res<crate::navigation::NavGrid>>,
+    gameplay: Option<Res<crate::structures::Placement>>,
     weapons: Query<&Weapon>,
     units: Query<
         (
@@ -487,12 +547,34 @@ fn resolve_behaviour(
             Has<Route>,
             Has<Chasing>,
             Has<HoldFire>,
+            Option<&Builder>,
+            Option<&CollisionRadius>,
         ),
         With<Unit>,
     >,
+    sites: Query<
+        (
+            Entity,
+            &Transform,
+            &crate::economy::balance::BuildingKind,
+            Has<crate::structures::Construction>,
+        ),
+        With<crate::structures::Building>,
+    >,
     mut queues: Query<&mut UnitOrderQueue>,
 ) {
-    for (entity, transform, order, target, move_target, has_route, chasing, holding) in &units {
+    for (
+        entity,
+        transform,
+        order,
+        target,
+        move_target,
+        has_route,
+        chasing,
+        holding,
+        builder,
+        body,
+    ) in &units {
         // Stale markers strand units (executors filter on them), so clear
         // them the moment the lock is gone, for every order uniformly.
         if target.is_none() && (chasing || holding) {
@@ -502,7 +584,9 @@ fn resolve_behaviour(
             (UnitOrder::Idle, None) => {}
             (UnitOrder::Move { destination }, None) => {
                 if move_target.is_none() && !has_route {
-                    if transform.translation.distance(*destination) <= ARRIVE_RADIUS {
+                    if crate::movement::flat_distance(transform.translation, *destination)
+                        <= ARRIVE_RADIUS
+                    {
                         complete_order(&mut commands, entity, &mut queues);
                     } else {
                         commands.entity(entity).insert(MoveTarget(*destination));
@@ -531,7 +615,9 @@ fn resolve_behaviour(
                 } else {
                     let leg = points[*next % points.len()];
                     if move_target.is_none() && !has_route {
-                        if transform.translation.distance(leg) <= ARRIVE_RADIUS {
+                        if crate::movement::flat_distance(transform.translation, leg)
+                            <= ARRIVE_RADIUS
+                        {
                             // Waypoint reached: advance the loop, never complete.
                             let advanced = (*next + 1) % points.len();
                             commands.entity(entity).insert((
@@ -563,22 +649,81 @@ fn resolve_behaviour(
                 let Some(ward_position) = target_position(&grid, *ward) else {
                     continue;
                 };
-                if transform.translation.distance(ward_position) <= GUARD_RADIUS {
+                if crate::movement::flat_distance(transform.translation, ward_position)
+                    <= GUARD_RADIUS
+                {
                     if move_target.is_some() || has_route {
                         commands.entity(entity).remove::<(MoveTarget, Route)>();
                     }
-                } else if move_target
-                    .is_none_or(|current| current.0.distance(ward_position) > CHASE_REPLAN_DISTANCE)
-                {
+                } else if move_target.is_none_or(|current| {
+                    crate::movement::flat_distance(current.0, ward_position)
+                        > CHASE_REPLAN_DISTANCE
+                }) {
                     commands
                         .entity(entity)
                         .insert(MoveTarget(ward_position))
                         .remove::<Route>();
                 }
             }
-            // Marching or holding with a lock: no markers, the unit follows
-            // its route (or holds) and fires whenever the target is in range.
-            (UnitOrder::Move { .. } | UnitOrder::HoldPosition | UnitOrder::Idle, Some(_)) => {
+            // Explicit construction task: hold inside the builder's own
+            // radius of the site (power flows there, see economy); march to
+            // a footprint-edge stand-off while out of range. Completes when
+            // the site finishes or vanishes (cancelled/destroyed). Builders
+            // never chase: they hold the site and fire from there.
+            (UnitOrder::Build { site }, None) => {
+                if chasing || holding {
+                    commands.entity(entity).remove::<(Chasing, HoldFire)>();
+                }
+                let live = sites
+                    .get(*site)
+                    .ok()
+                    .filter(|(_, _, _, under_construction)| *under_construction);
+                let Some((_, site_transform, site_kind, _)) = live else {
+                    complete_order(&mut commands, entity, &mut queues);
+                    continue;
+                };
+                let radius = builder.map_or(0.0, |b| b.radius);
+                if crate::movement::flat_distance(transform.translation, site_transform.translation)
+                    <= radius
+                {
+                    if move_target.is_some() || has_route {
+                        commands.entity(entity).remove::<(MoveTarget, Route)>();
+                    }
+                } else {
+                    let body_radius = body.map_or(0.5, |r| r.0);
+                    let approach = nav.as_ref().map_or(
+                        site_transform.translation,
+                        |nav| {
+                            crate::structures::site_approach(
+                                nav,
+                                site_transform.translation,
+                                transform.translation,
+                                site_kind.stats().half,
+                                body_radius,
+                            )
+                        },
+                    );
+                    if move_target.is_none_or(|current| {
+                        crate::movement::flat_distance(current.0, approach)
+                            > CHASE_REPLAN_DISTANCE
+                    }) {
+                        commands
+                            .entity(entity)
+                            .insert(MoveTarget(approach))
+                            .remove::<Route>();
+                    }
+                }
+            }
+            // Marching, holding or building with a lock: no markers, the unit
+            // follows its route (or holds) and fires whenever the target is
+            // in range.
+            (
+                UnitOrder::Move { .. }
+                | UnitOrder::HoldPosition
+                | UnitOrder::Idle
+                | UnitOrder::Build { .. },
+                Some(_),
+            ) => {
                 if chasing || holding {
                     commands.entity(entity).remove::<(Chasing, HoldFire)>();
                 }
@@ -613,10 +758,15 @@ fn resolve_behaviour(
                 // routes past the threshold) so the planner keeps a fresh
                 // route; guards keep theirs pointed at the ward to resume
                 // the follow the moment the engagement ends.
-                let anchor = match order {
-                    UnitOrder::Attack { .. } => target_position(&grid, target.0),
-                    UnitOrder::Guard { target: ward } => target_position(&grid, *ward),
-                    _ => None,
+                let anchor = if gameplay.is_some() && !in_range {
+                    target_position(&grid, target.0)
+                        .map(|p| nav.as_ref().map_or(p, |nav| nav.clear_point(p.with_y(0.0))))
+                } else {
+                    match order {
+                        UnitOrder::Attack { .. } => target_position(&grid, target.0),
+                        UnitOrder::Guard { target: ward } => target_position(&grid, *ward),
+                        _ => None,
+                    }
                 };
                 if let Some(anchor) = anchor {
                     // `is_none_or` covers the missing-target case: a fresh
@@ -659,8 +809,17 @@ fn resolve_behaviour(
 fn chase_targets(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
+    nav: Option<Res<crate::navigation::NavGrid>>,
+    gameplay: Option<Res<crate::structures::Placement>>,
     mut units: Query<
-        (&mut Transform, &Movement, &Weapon, &AttackTarget, &UnitKind),
+        (
+            &mut Transform,
+            &Movement,
+            &Weapon,
+            &AttackTarget,
+            &UnitKind,
+            Option<&mut Route>,
+        ),
         (With<Unit>, With<Chasing>),
     >,
 ) {
@@ -668,11 +827,30 @@ fn chase_targets(
     if dt <= 0.0 {
         return;
     }
-    for (mut transform, movement, weapon, target, kind) in &mut units {
+    for (mut transform, movement, weapon, target, kind, route) in &mut units {
         let Some(target_position) = target_position(&grid, target.0) else {
             continue;
         };
-        let offset = target_position - transform.translation;
+        let mut aim = target_position;
+        if gameplay.is_some()
+            && nav
+                .as_ref()
+                .is_some_and(|nav| !nav.segment_clear(transform.translation, target_position))
+            && let Some(mut route) = route
+        {
+            while route.next < route.points.len()
+                && route.points[route.next]
+                    .xz()
+                    .distance(transform.translation.xz())
+                    < 1.0
+            {
+                route.next += 1;
+            }
+            if let Some(point) = route.points.get(route.next) {
+                aim = point.with_y(transform.translation.y);
+            }
+        }
+        let offset = aim - transform.translation;
         if in_weapon_range(transform.translation, target_position, weapon.range) {
             continue;
         }
@@ -692,9 +870,16 @@ fn chase_targets(
     }
 }
 
-fn tick_cooldowns(time: Res<Time>, mut states: Query<&mut WeaponState>) {
+fn tick_cooldowns(
+    time: Res<Time>,
+    mut states: Query<&mut WeaponState>,
+    mut secondary: Query<&mut SecondaryWeaponState>,
+) {
     let dt = time.delta_secs();
     for mut state in &mut states {
+        state.remaining = (state.remaining - dt).max(0.0);
+    }
+    for mut state in &mut secondary {
         state.remaining = (state.remaining - dt).max(0.0);
     }
 }
@@ -727,6 +912,36 @@ fn traverse_turrets(
             .map(|aim| yaw_toward(aim - transform.translation))
             .unwrap_or(body_yaw);
         turret.0 = rotate_toward(turret.0, aim, stats.traverse * dt);
+    }
+}
+
+/// Secondary traverse: same lock, independent yaw rate from
+/// `COMMANDER_MISSILES`. Missiles aim slower, so at close range the mitra
+/// fires first while missiles still traverse — double gun feeling.
+#[allow(clippy::type_complexity)]
+fn traverse_secondary(
+    time: Res<Time>,
+    grid: Res<SpatialGrid>,
+    mut units: Query<
+        (&Transform, &mut SecondaryTurretYaw, Option<&AttackTarget>),
+        (With<Unit>, With<SecondaryWeapon>),
+    >,
+) {
+    use crate::movement::{rotate_toward, yaw_toward};
+    use crate::units::archetype::COMMANDER_MISSILES;
+
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for (transform, mut turret, target) in &mut units {
+        let body_yaw = transform.rotation.to_euler(EulerRot::YXZ).0;
+        let aim = target
+            .and_then(|target| grid.position(target.0))
+            .filter(|aim| aim.xz().distance_squared(transform.translation.xz()) > f32::EPSILON)
+            .map(|aim| yaw_toward(aim - transform.translation))
+            .unwrap_or(body_yaw);
+        turret.0 = rotate_toward(turret.0, aim, COMMANDER_MISSILES.traverse * dt);
     }
 }
 
@@ -818,6 +1033,66 @@ fn fire_weapons(
     }
 }
 
+/// Missile fire for the Commander. Same `AttackTarget` as the mitra but own
+/// range/cooldown/yaw gate, so the two weapons overlap without syncing.
+/// Prova tuning lives in `COMMANDER_MISSILES`.
+#[allow(clippy::type_complexity)]
+fn fire_secondary(
+    mut commands: Commands,
+    grid: Res<SpatialGrid>,
+    assets: Option<Res<ProjectileAssets>>,
+    health: Query<&Health>,
+    mut shooters: Query<
+        (
+            &Transform,
+            &Team,
+            &SecondaryWeapon,
+            &mut SecondaryWeaponState,
+            &AttackTarget,
+            &SecondaryTurretYaw,
+        ),
+        With<Unit>,
+    >,
+) {
+    use crate::units::archetype::COMMANDER_MISSILES;
+
+    let Some(assets) = assets else {
+        return;
+    };
+    for (transform, team, weapon, mut state, target, turret) in &mut shooters {
+        if state.remaining > 0.0 {
+            continue;
+        }
+        let Some(target_position) = target_position(&grid, target.0) else {
+            continue;
+        };
+        if health.get(target.0).is_ok_and(is_dead)
+            || !in_weapon_range(transform.translation, target_position, weapon.range)
+        {
+            continue;
+        }
+        let aim = crate::movement::yaw_toward(target_position - transform.translation);
+        if crate::movement::wrap_angle(aim - turret.0).abs() > COMMANDER_MISSILES.aim_tolerance {
+            continue;
+        }
+        state.remaining = weapon.cooldown;
+        // Missiles launch higher off the hull so the two muzzles read apart.
+        let muzzle = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos()) * 2.2
+            + Vec3::Y * 1.6;
+        commands.spawn((
+            Projectile {
+                target: target.0,
+                speed: weapon.projectile_speed,
+                damage: weapon.damage,
+            },
+            *team,
+            Transform::from_translation(transform.translation + muzzle),
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(assets.team_material[team.0 as usize % 2].clone()),
+        ));
+    }
+}
+
 /// Simple homing projectiles: steer at the target's current position,
 /// apply damage on impact, despawn quietly if the target is already gone.
 fn move_projectiles(
@@ -825,7 +1100,7 @@ fn move_projectiles(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
     mut projectiles: Query<(Entity, &mut Transform, &Projectile)>,
-    mut health: Query<&mut Health, With<Unit>>,
+    mut health: Query<&mut Health>,
 ) {
     let dt = time.delta_secs();
     for (entity, mut transform, projectile) in &mut projectiles {
@@ -848,7 +1123,7 @@ fn move_projectiles(
     }
 }
 
-fn process_deaths(mut commands: Commands, units: Query<(Entity, &Health), With<Unit>>) {
+fn process_deaths(mut commands: Commands, units: Query<(Entity, &Health)>) {
     for (entity, health) in &units {
         if is_dead(health) {
             // Descendants (selection rings) are despawned automatically.
@@ -961,6 +1236,276 @@ mod tests {
         let from = Vec3::ZERO;
         assert!(in_weapon_range(from, Vec3::new(18.0, 0.0, 0.0), 18.0));
         assert!(!in_weapon_range(from, Vec3::new(18.1, 0.0, 0.0), 18.0));
+    }
+
+    /// Fog harness: same combat scene plus the visibility plugin, so locks
+    /// need team sight. Plain combat_app (no fog data) stays open.
+    fn combat_fog_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / 60.0,
+            )))
+            .insert_resource(Scenario::Benchmark { per_team: 1 })
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .add_plugins((
+                NavigationPlugin,
+                SpatialPlugin,
+                UnitPlugin { visuals: false },
+                CombatPlugin,
+                MovementPlugin,
+                crate::fog::FogPlugin { render: false },
+            ))
+            .insert_resource(NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new()));
+        app.finish();
+        app.cleanup();
+        app.update();
+        app
+    }
+
+    #[test]
+    fn fog_blocks_locks_until_spotted_then_drops_them() {
+        // Tank sights (15m) are shorter than guns (18m): holders 25m apart
+        // are mutually blind and must not engage.
+        let mut app = combat_fog_app();
+        let blue = app
+            .world_mut()
+            .spawn(combatant(
+                600,
+                0,
+                Vec3::new(-30.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        let red = app
+            .world_mut()
+            .spawn(combatant(
+                601,
+                1,
+                Vec3::new(-5.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        // Warmup activates fog (first 0.25s are open), then 1s blind.
+        for _ in 0..20 {
+            app.update();
+        }
+        for _ in 0..60 {
+            app.update();
+        }
+        assert!(app.world().get::<AttackTarget>(blue).is_none());
+        assert!(app.world().get::<AttackTarget>(red).is_none());
+        // Walked into sight: both lock.
+        app.world_mut()
+            .get_mut::<Transform>(red)
+            .unwrap()
+            .translation = Vec3::new(-20.0, 0.8, 0.0);
+        for _ in 0..60 {
+            app.update();
+        }
+        assert!(app.world().get::<AttackTarget>(blue).is_some());
+        assert!(app.world().get::<AttackTarget>(red).is_some());
+        // Gone far beyond sight and leash: locks drop.
+        app.world_mut()
+            .get_mut::<Transform>(red)
+            .unwrap()
+            .translation = Vec3::new(70.0, 0.8, 0.0);
+        for _ in 0..60 {
+            app.update();
+        }
+        assert!(app.world().get::<AttackTarget>(blue).is_none());
+        assert!(app.world().get::<AttackTarget>(red).is_none());
+    }
+
+    #[test]
+    fn spotter_shares_vision_for_long_guns() {
+        // Blue tank at 0, red at 20: beyond the tank's own sight (15) but
+        // inside its gun (18) and acquisition (30). A forward engineer at 12
+        // (sight 22) spots red for the team, so the tank locks a target its
+        // own eyes cannot see — without firing out of range.
+        let mut app = combat_fog_app();
+        let gun = app
+            .world_mut()
+            .spawn(combatant(
+                610,
+                0,
+                Vec3::new(0.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        let red = app
+            .world_mut()
+            .spawn(combatant(
+                611,
+                1,
+                Vec3::new(20.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        let _spotter = crate::units::spawn_combat_unit(
+            &mut app.world_mut().commands(),
+            612,
+            Team(0),
+            UnitKind::Engineer,
+            Vec3::new(12.0, 0.0, 0.0),
+        );
+        app.world_mut().flush();
+        for _ in 0..80 {
+            app.update();
+        }
+        assert!(app.world().get::<AttackTarget>(gun).is_some());
+        // Lock holds (20m inside 18m gun + margin) but no shot can land yet:
+        // red stays healthy until the gun closes in.
+        let hp = app.world().get::<Health>(red).unwrap().current;
+        assert!((hp - 120.0).abs() < 0.001, "spotted but out of range: {hp}");
+    }
+
+    #[test]
+    fn explicit_attack_on_unseen_target_completes() {
+        let mut app = combat_fog_app();
+        let blue = app
+            .world_mut()
+            .spawn(combatant(
+                620,
+                0,
+                Vec3::new(0.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::Tank,
+            ))
+            .id();
+        let red = app
+            .world_mut()
+            .spawn(combatant(
+                621,
+                1,
+                Vec3::new(100.0, 0.8, 0.0),
+                UnitOrder::Idle,
+                UnitKind::Tank,
+            ))
+            .id();
+        crate::orders::queue_attack(&mut app.world_mut().commands().entity(blue), red);
+        app.world_mut().flush();
+        for _ in 0..40 {
+            app.update();
+        }
+        assert!(app.world().get::<AttackTarget>(blue).is_none());
+        assert!(matches!(
+            app.world().get::<UnitOrder>(blue),
+            Some(UnitOrder::Idle)
+        ));
+    }
+
+    #[test]
+    fn commander_fires_missiles_beyond_mitra_range() {
+        use crate::units::{Commander, secondary_bundle};
+        let mut app = combat_app();
+        // Commander vs tank a 30m: fuori mitra (20), dentro missili (34) e
+        // dentro acquisition (36). Solo i missili devono partire.
+        let commander = app
+            .world_mut()
+            .spawn(combatant(
+                500,
+                0,
+                Vec3::new(0.0, 1.6, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::Commander,
+            ))
+            .id();
+        let target = app
+            .world_mut()
+            .spawn(combatant(
+                501,
+                1,
+                Vec3::new(30.0, 0.8, 0.0),
+                UnitOrder::Idle,
+                UnitKind::Tank,
+            ))
+            .id();
+        app.world_mut()
+            .entity_mut(commander)
+            .insert(secondary_bundle(500, UnitKind::Commander).unwrap())
+            .insert((Commander, crate::units::builder_bundle(UnitKind::Commander).unwrap()))
+            .insert(AttackTarget(target));
+        // Cooldown azzerati + turret allineate: isola il gating di range.
+        // (Il bundle desynca il primo colpo fino a 2.5s, il test gira 0.5s.)
+        app.world_mut()
+            .entity_mut(commander)
+            .insert(SecondaryWeaponState { remaining: 0.0 })
+            .insert(WeaponState { remaining: 99.0 });
+        // Aim yaw verso +X: yaw_toward((30,0,0)) ≈ -PI/2? Allinea entrambe.
+        app.world_mut()
+            .entity_mut(commander)
+            .insert(TurretYaw(0.0))
+            .insert(SecondaryTurretYaw(0.0));
+        // Aim yaw verso +X: yaw_toward((30,0,0)) ≈ -PI/2? Allinea entrambe.
+        let aim = crate::movement::yaw_toward(Vec3::X * 30.0);
+        app.world_mut()
+            .entity_mut(commander)
+            .insert(TurretYaw(aim))
+            .insert(SecondaryTurretYaw(aim));
+        for _ in 0..30 {
+            app.update();
+        }
+        let missiles: Vec<_> = app
+            .world_mut()
+            .query::<&Projectile>()
+            .iter(app.world())
+            .map(|p| (p.damage, p.speed))
+            .collect();
+        // Solo proiettili da 40 danni (missili), mai da 7 (mitra).
+        assert!(!missiles.is_empty());
+        assert!(missiles.iter().all(|(d, _)| (*d - 40.0).abs() < 0.001));
+    }
+
+    #[test]
+    fn builder_assists_builder_by_guarding_and_closing_in() {
+        use crate::orders::queue_guard;
+        // Assist = Guard su builder alleato (right-click): il follower sta
+        // nel raggio del sito quando il ward costruisce, e site_power somma
+        // entrambi. Qui si prova la marcia di avvicinamento.
+        let mut app = combat_app();
+        let ward = crate::units::spawn_combat_unit(
+            &mut app.world_mut().commands(),
+            600,
+            Team(0),
+            UnitKind::Engineer,
+            Vec3::ZERO,
+        );
+        let follower = crate::units::spawn_combat_unit(
+            &mut app.world_mut().commands(),
+            601,
+            Team(0),
+            UnitKind::Engineer,
+            Vec3::X * 20.0,
+        );
+        app.world_mut().flush();
+        // Disarmati ma costruibili: niente Weapon, con Builder.
+        for e in [ward, follower] {
+            assert!(app.world().get::<Weapon>(e).is_none());
+            assert!(app.world().get::<crate::units::Builder>(e).is_some());
+        }
+        queue_guard(&mut app.world_mut().commands().entity(follower), ward);
+        app.world_mut().flush();
+        for _ in 0..600 {
+            app.update();
+        }
+        let w = app.world().get::<Transform>(ward).unwrap().translation;
+        let f = app.world().get::<Transform>(follower).unwrap().translation;
+        assert!(
+            w.distance(f) <= super::GUARD_RADIUS + 1.0,
+            "follower must close in on the ward, dist={}",
+            w.distance(f)
+        );
+        assert!(matches!(
+            app.world().get::<UnitOrder>(follower),
+            Some(UnitOrder::Guard { .. })
+        ));
     }
 
     #[test]

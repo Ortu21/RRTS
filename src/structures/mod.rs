@@ -1,0 +1,281 @@
+//! MVP base construction: one site/team, fixed team work rate, factory radius.
+mod visuals;
+pub use visuals::draw_rallies;
+#[cfg(test)]
+mod tests;
+use crate::{
+    combat::{DeathSystems, Health, ResolveBehaviour},
+    economy::{EconomyTick, Project, balance::*},
+    movement::MovementSystems,
+    navigation::{NavGrid, Obstacle, PlanPaths, Route, UNIT_CLEARANCE},
+    production::Factory,
+    scenario::Scenario,
+    spatial::{SpatialSystems, apply_avoidance},
+    units::{CollisionRadius, Selectable, Team, Unit},
+};
+use bevy::prelude::*;
+
+#[derive(Component)]
+pub struct Building;
+#[derive(Component)]
+pub struct Construction(pub Project);
+#[derive(Component, Clone, Copy)]
+pub struct Footprint(pub Vec3);
+#[derive(Resource, Default)]
+pub struct Placement {
+    pub kind: Option<BuildingKind>,
+    /// Builders tasked at Build-button press (frozen selection). Only these
+    /// march on confirm — never a random nearest one. Cleared on confirm or
+    /// cancel together with `kind`.
+    pub builders: Vec<Entity>,
+    pub message: String,
+}
+#[derive(Resource, Default)]
+struct Occupancy {
+    entries: Vec<(Entity, Obstacle)>,
+}
+#[derive(Component)]
+struct BeforeMotion(Vec3);
+
+pub struct StructuresPlugin {
+    pub visuals: bool,
+}
+impl Plugin for StructuresPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Placement>()
+            .init_resource::<Occupancy>()
+            .add_systems(Startup, setup_base.after(crate::units::spawn_units))
+            .add_systems(FixedUpdate, finish_sites.after(EconomyTick))
+            .add_systems(
+                Update,
+                (sync_occupancy, remember_motion)
+                    .chain()
+                    .before(SpatialSystems)
+                    .before(ResolveBehaviour)
+                    .before(PlanPaths),
+            )
+            .add_systems(
+                Update,
+                constrain_motion
+                    .after(apply_avoidance)
+                    .after(MovementSystems),
+            )
+            .add_systems(PostUpdate, sync_occupancy.after(DeathSystems));
+        if self.visuals {
+            app.add_plugins(visuals::BuildingVisualsPlugin);
+        }
+    }
+}
+pub fn spawn_building(
+    commands: &mut Commands,
+    team: Team,
+    kind: BuildingKind,
+    position: Vec3,
+    complete: bool,
+) -> Entity {
+    let stats = kind.stats();
+    let mut entity = commands.spawn((
+        Building,
+        kind,
+        team,
+        Selectable,
+        Footprint(Vec3::new(stats.half.x, stats.height * 0.5, stats.half.y)),
+        Health {
+            current: stats.health,
+            max: stats.health,
+        },
+        Transform::from_translation(position.with_y(stats.height * 0.5)),
+    ));
+    if !complete {
+        entity.insert(Construction(Project::new(stats.cost)));
+    }
+    if kind == BuildingKind::Factory {
+        entity.insert(Factory::default());
+    }
+    entity.id()
+}
+
+/// Grid-based construction: every site snaps its center to this step so
+/// buildings line up and micro-overlaps from free-float clicks disappear.
+/// 2m squares keep small (2.5) and large (5x4) footprints placeable without
+/// forcing the nav cell size (2.5m) onto the base layout.
+pub const BUILD_GRID: f32 = 2.0;
+
+/// Snap a ground point onto the build grid (XZ only, Y untouched — spawn
+/// sets height from the footprint). Non-finite input passes through so
+/// validation still rejects it downstream instead of NaN-poisoning gizmos.
+pub fn snap_to_grid(point: Vec3) -> Vec3 {
+    if !point.is_finite() {
+        return point;
+    }
+    Vec3::new(
+        (point.x / BUILD_GRID).round() * BUILD_GRID,
+        point.y,
+        (point.z / BUILD_GRID).round() * BUILD_GRID,
+    )
+}
+/// March destination for a tasked builder: a stand-off at the footprint
+/// edge, repaired into walkable hull-clear ground. Never the site center:
+/// the center sits inside the site's own nav obstacle, so the planner
+/// strips the MoveTarget and the builder stands still forever. Edge points
+/// stay inside every build radius while remaining plannable.
+pub fn site_approach(
+    grid: &NavGrid,
+    site: Vec3,
+    from: Vec3,
+    half: Vec2,
+    body_radius: f32,
+) -> Vec3 {
+    let away = from.xz() - site.xz();
+    let dir = if away.length_squared() > 1e-6 {
+        away.normalize()
+    } else {
+        Vec2::X
+    };
+    let edge = site.xz() + dir * (half.length() + body_radius + 1.5);
+    grid.clear_point_for(Vec3::new(edge.x, site.y, edge.y), body_radius)
+}
+pub fn valid_ground(
+    grid: &NavGrid,
+    kind: BuildingKind,
+    position: Vec3,
+    units: &[(Vec3, f32)],
+) -> Result<(), &'static str> {
+    let half = kind.stats().half;
+    let center = position.xz();
+    if !position.is_finite()
+        || (center.abs() + half + Vec2::splat(UNIT_CLEARANCE)).max_element()
+            > crate::navigation::HALF_SIZE
+    {
+        return Err("Outside map");
+    }
+    if grid.obstacles.iter().any(|o| {
+        let delta = (center - o.center).abs();
+        delta.x < half.x + o.half_size.x + 1.6 && delta.y < half.y + o.half_size.y + 1.6
+    }) {
+        return Err("Overlaps obstacle / building");
+    }
+    if units.iter().any(|(p, radius)| {
+        let delta = (p.xz() - center).abs();
+        delta.x < half.x + radius + 2.0 && delta.y < half.y + radius + 2.0
+    }) {
+        return Err("Unit inside footprint / clearance");
+    }
+    Ok(())
+}
+/// Builders build anywhere with valid ground: the laboratory only makes
+/// units. Placement needs one live builder of the team (anywhere); the
+/// economy trickles work only from builders within their own radius of the
+/// site, so an out-of-range placement means someone has to walk over.
+/// One active site per team keeps the streaming economy readable.
+pub fn placement_rule(
+    team: Team,
+    _position: Vec3,
+    buildings: &[(Team, BuildingKind, Vec3, bool)],
+    builders: &[(Team, Vec3, f32)],
+) -> Result<(), &'static str> {
+    if buildings.iter().any(|(t, _, _, site)| *t == team && *site) {
+        return Err("One active construction site per team");
+    }
+    if !builders.iter().any(|(t, _, _)| *t == team) {
+        return Err("No builders alive: build an Engineer first");
+    }
+    Ok(())
+}
+fn setup_base(
+    mut commands: Commands,
+    scenario: Res<Scenario>,
+    mut grid: ResMut<NavGrid>,
+    units: Query<(&Transform, Option<&CollisionRadius>), With<Unit>>,
+) {
+    // Commander-only start: nessuna base precostruita in Playground.
+    // I builder costruiscono ovunque su terreno valido; il lavoro avanza
+    // solo dai builder nel loro raggio dal cantiere (vedi economy::site_power).
+    // La firma resta per futuri setup scenario; per ora no-op intenzionale.
+    let _ = (&mut commands, &scenario, &mut grid, &units);
+}
+fn finish_sites(mut commands: Commands, sites: Query<(Entity, &Construction, &Health)>) {
+    for (entity, site, health) in &sites {
+        if health.current > 0.0 && site.0.complete() {
+            commands.entity(entity).remove::<Construction>();
+        }
+    }
+}
+fn sync_occupancy(
+    mut commands: Commands,
+    mut occupancy: ResMut<Occupancy>,
+    mut grid: ResMut<NavGrid>,
+    buildings: Query<(Entity, &Transform, &BuildingKind), With<Building>>,
+    routes: Query<(Entity, &Transform, &Route)>,
+) {
+    let mut current: Vec<_> = buildings
+        .iter()
+        .map(|(e, t, k)| {
+            (
+                e,
+                Obstacle {
+                    center: t.translation.xz(),
+                    half_size: k.stats().half,
+                },
+            )
+        })
+        .collect();
+    current.sort_by_key(|(e, _)| e.to_bits());
+    if current.len() == occupancy.entries.len()
+        && current
+            .iter()
+            .zip(&occupancy.entries)
+            .all(|(a, b)| a.0 == b.0 && a.1.center == b.1.center && a.1.half_size == b.1.half_size)
+    {
+        return;
+    }
+    let previous_count = occupancy.entries.len();
+    grid.replace_dynamic(
+        previous_count,
+        &current.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+    );
+    occupancy.entries = current;
+    // Only routes intersecting changed occupancy are discarded; the existing
+    // planner still caps work per frame. No permanent global revision replan.
+    for (entity, transform, route) in &routes {
+        let mut previous = transform.translation;
+        if route.points.iter().skip(route.next).any(|point| {
+            let blocked = !grid.segment_clear(previous, *point);
+            previous = *point;
+            blocked
+        }) {
+            commands.entity(entity).remove::<Route>();
+        }
+    }
+}
+fn remember_motion(mut commands: Commands, units: Query<(Entity, &Transform), With<Unit>>) {
+    for (entity, transform) in &units {
+        commands
+            .entity(entity)
+            .insert(BeforeMotion(transform.translation));
+    }
+}
+/// Swept collision stops route fallback, chase and avoidance from tunnelling
+/// through buildings, including at low FPS. This plugin is absent in benchmarks.
+fn constrain_motion(
+    grid: Res<NavGrid>,
+    mut units: Query<(&BeforeMotion, &mut Transform, &CollisionRadius), With<Unit>>,
+) {
+    for (previous, mut transform, radius) in &mut units {
+        let next = transform.translation;
+        if grid.segment_clear_for(previous.0, next, radius.0) {
+            continue;
+        }
+        // Try sliding along a free axis before stopping. Never repair through
+        // an obstacle or teleport to its other side.
+        let x = Vec3::new(next.x, next.y, previous.0.z);
+        let z = Vec3::new(previous.0.x, next.y, next.z);
+        transform.translation = if grid.segment_clear_for(previous.0, x, radius.0) {
+            x
+        } else if grid.segment_clear_for(previous.0, z, radius.0) {
+            z
+        } else {
+            previous.0
+        };
+    }
+}

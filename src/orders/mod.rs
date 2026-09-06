@@ -9,7 +9,7 @@ use crate::{
     navigation::{NavGrid, Route},
     picking::{ground_position, ray_box_distance},
     selection::{Selected, SelectionSystems},
-    units::{PLAYER_TEAM, Team, UNIT_HALF_SIZE, Unit},
+    units::{Builder, PLAYER_TEAM, Team, UNIT_HALF_SIZE, Unit},
 };
 
 pub struct OrderPlugin;
@@ -18,6 +18,7 @@ impl Plugin for OrderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(FormationSettings { spacing: 2.5 })
             .init_resource::<PendingOrder>()
+            .init_resource::<crate::ui::industry::MapInput>()
             .add_plugins(lines::LinesPlugin)
             .add_systems(
                 PostUpdate,
@@ -26,7 +27,9 @@ impl Plugin for OrderPlugin {
                     issue_pending_patrol,
                     issue_pending_guard,
                 )
-                    .before(SelectionSystems),
+                    .before(SelectionSystems)
+                    .after(crate::ui::industry::MapInputSystems)
+                    .run_if(crate::ui::industry::map_input_allowed),
             )
             .add_systems(
                 PostUpdate,
@@ -37,7 +40,8 @@ impl Plugin for OrderPlugin {
                     enter_guard_targeting,
                     issue_hold_stop_keys,
                 )
-                    .after(SelectionSystems),
+                    .after(SelectionSystems)
+                    .run_if(crate::ui::industry::map_input_allowed),
             );
     }
 }
@@ -76,6 +80,12 @@ pub enum UnitOrder {
     HoldPosition,
     Patrol { points: Vec<Vec3>, next: usize },
     Guard { target: Entity },
+    /// Build a construction site: march to a stand-off at the footprint
+    /// edge, hold and trickle work while the site is incomplete. Only
+    /// builders carrying this order (or guarding one that does) contribute
+    /// power — standing in range is not enough. Any other order replaces it,
+    /// so moving the builder away pauses the site.
+    Build { site: Entity },
 }
 
 /// Behaviour rule: which orders may acquire enemies on their own.
@@ -91,11 +101,13 @@ pub fn allows_auto_targeting(order: &UnitOrder) -> bool {
             | UnitOrder::Idle
             | UnitOrder::Patrol { .. }
             | UnitOrder::Guard { .. }
+            | UnitOrder::Build { .. }
     )
 }
 
 /// Behaviour rule: only orders that close distance may steer toward their
-/// target. Holders acquire and fire in place instead of chasing.
+/// target. Holders acquire and fire in place instead of chasing. Builders
+/// never chase: they hold the site and fire from there.
 pub fn allows_chase(order: &UnitOrder) -> bool {
     matches!(
         order,
@@ -117,10 +129,11 @@ pub fn order_color(order: &UnitOrder) -> Color {
         UnitOrder::Idle => Color::srgb(0.7, 0.7, 0.25),
         UnitOrder::Patrol { .. } => Color::srgb(0.75, 0.4, 1.0),
         UnitOrder::Guard { .. } => Color::srgb(1.0, 0.85, 0.2),
+        UnitOrder::Build { .. } => Color::srgb(1.0, 0.55, 0.1),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn issue_move_order(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -128,7 +141,18 @@ fn issue_move_order(
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
     selected: Query<(Entity, &Unit, &UnitOrder), With<Selected>>,
-    enemies: Query<(Entity, &GlobalTransform, &Team), With<Unit>>,
+    enemies: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &Team,
+            Option<&crate::structures::Footprint>,
+            Option<&Visibility>,
+        ),
+        With<crate::units::Selectable>,
+    >,
+    builder_units: Query<Entity, (With<Unit>, With<Builder>)>,
+    build_sites: Query<Entity, (With<crate::structures::Building>, With<crate::structures::Construction>)>,
     settings: Res<FormationSettings>,
     grid: Res<NavGrid>,
     mut pending: ResMut<PendingOrder>,
@@ -156,10 +180,19 @@ fn issue_move_order(
     if let Ok(ray) = camera.viewport_to_world(transform, cursor) {
         let candidates: Vec<_> = enemies
             .iter()
-            .filter(|(_, _, team)| team.0 != PLAYER_TEAM.0)
-            .map(|(entity, transform, _)| (entity, transform.translation()))
+            // Fog: concealed enemies cannot be focus-fired.
+            .filter(|(_, _, _, _, vis)| vis.is_none_or(|v| *v != Visibility::Hidden))
+            .filter(|(_, _, team, _, _)| team.0 != PLAYER_TEAM.0)
+            .filter_map(|(entity, transform, _, footprint, _)| {
+                ray_box_distance(
+                    &ray,
+                    transform.translation(),
+                    footprint.map_or(UNIT_HALF_SIZE, |f| f.0),
+                )
+                .map(|distance| (entity, distance))
+            })
             .collect();
-        if let Some(target) = pick_enemy_target(&ray, &candidates) {
+        if let Some((target, _)) = candidates.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)) {
             let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
             for (entity, _, order) in &selected {
                 if additive && is_busy(order, &mut queues, entity) {
@@ -181,8 +214,8 @@ fn issue_move_order(
         // so the click still marches instead of being swallowed.
         let wards: Vec<_> = enemies
             .iter()
-            .filter(|(_, _, team)| team.0 == PLAYER_TEAM.0)
-            .map(|(entity, transform, _)| (entity, transform.translation()))
+            .filter(|(_, _, team, footprint, _)| team.0 == PLAYER_TEAM.0 && footprint.is_none())
+            .map(|(entity, transform, _, _, _)| (entity, transform.translation()))
             .collect();
         if let Some(ward) = pick_enemy_target(&ray, &wards) {
             let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
@@ -204,6 +237,46 @@ fn issue_move_order(
                 }
             }
             if issued {
+                return;
+            }
+        }
+        // Allied construction site under cursor: selected builders take a
+        // Build order (Shift queues). Anything else falls through to the
+        // ground move so the click still marches instead of being swallowed.
+        let site_hits: Vec<_> = enemies
+            .iter()
+            .filter(|(_, _, team, footprint, _)| team.0 == PLAYER_TEAM.0 && footprint.is_some())
+            .filter_map(|(entity, transform, _, footprint, _)| {
+                ray_box_distance(
+                    &ray,
+                    transform.translation(),
+                    footprint.map_or(UNIT_HALF_SIZE, |f| f.0),
+                )
+                .map(|distance| (entity, distance))
+            })
+            .collect();
+        if let Some((site, _)) = site_hits.into_iter().min_by(|a, b| a.1.total_cmp(&b.1))
+            && build_sites.get(site).is_ok()
+        {
+            let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+            let builders: Vec<_> = builder_units.iter().collect();
+            let tasked: Vec<_> = selected
+                .iter()
+                .filter(|(entity, _, _)| builders.contains(entity))
+                .collect();
+            if !tasked.is_empty() {
+                for (entity, _, order) in tasked {
+                    if additive && is_busy(order, &mut queues, entity) {
+                        enqueue_order(
+                            &mut commands,
+                            &mut queues,
+                            entity,
+                            UnitOrder::Build { site },
+                        );
+                    } else {
+                        queue_build(&mut commands.entity(entity), site);
+                    }
+                }
                 return;
             }
         }
@@ -233,7 +306,7 @@ fn issue_move_order(
 fn enter_attack_move_targeting(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    selected: Query<Entity, With<Selected>>,
+    selected: Query<Entity, (With<Selected>, With<Unit>)>,
     mut pending: ResMut<PendingOrder>,
 ) {
     if !window.focused || !keys.just_pressed(KeyCode::KeyG) {
@@ -253,7 +326,7 @@ fn enter_attack_move_targeting(
 fn enter_patrol_targeting(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    selected: Query<Entity, With<Selected>>,
+    selected: Query<Entity, (With<Selected>, With<Unit>)>,
     mut pending: ResMut<PendingOrder>,
 ) {
     if !window.focused || !keys.just_pressed(KeyCode::KeyP) {
@@ -271,7 +344,7 @@ fn enter_patrol_targeting(
 fn enter_guard_targeting(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    selected: Query<Entity, With<Selected>>,
+    selected: Query<Entity, (With<Selected>, With<Unit>)>,
     mut pending: ResMut<PendingOrder>,
 ) {
     if !window.focused || !keys.just_pressed(KeyCode::KeyT) {
@@ -294,7 +367,7 @@ fn issue_pending_guard(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
-    selected: Query<Entity, With<Selected>>,
+    selected: Query<Entity, (With<Selected>, With<Unit>)>,
     friendlies: Query<(Entity, &GlobalTransform, &Team), With<Unit>>,
     mut pending: ResMut<PendingOrder>,
 ) {
@@ -341,7 +414,7 @@ fn issue_pending_patrol(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
-    selected: Query<Entity, With<Selected>>,
+    selected: Query<Entity, (With<Selected>, With<Unit>)>,
     orders: Query<&UnitOrder>,
     mut pending: ResMut<PendingOrder>,
 ) {
@@ -461,7 +534,7 @@ fn issue_hold_stop_keys(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    selected: Query<Entity, With<Selected>>,
+    selected: Query<Entity, (With<Selected>, With<Unit>)>,
     mut pending: ResMut<PendingOrder>,
 ) {
     if !window.focused || selected.is_empty() {
@@ -534,6 +607,13 @@ fn apply_order(entity: &mut EntityCommands, order: UnitOrder) {
             // Follow target is dynamic: resolve_behaviour seeds and refreshes
             // the MoveTarget from the ward's live position each frame, so
             // the budgeted planner routes around obstacles automatically.
+            entity
+                .insert(order)
+                .remove::<(MoveTarget, Route, AttackTarget, Chasing, HoldFire)>();
+        }
+        UnitOrder::Build { .. } => {
+            // Destination is dynamic (site stand-off): resolve_behaviour
+            // seeds the MoveTarget from the site's live footprint each frame.
             entity
                 .insert(order)
                 .remove::<(MoveTarget, Route, AttackTarget, Chasing, HoldFire)>();
@@ -624,6 +704,14 @@ pub fn queue_guard(entity: &mut EntityCommands, target: Entity) {
     entity.remove::<UnitOrderQueue>();
 }
 
+/// Build a construction site: march to the footprint edge and trickle work
+/// until it completes. Replaces any other intent; any later order (e.g. a
+/// manual move away) pauses the site by dropping this task.
+pub fn queue_build(entity: &mut EntityCommands, site: Entity) {
+    apply_order(entity, UnitOrder::Build { site });
+    entity.remove::<UnitOrderQueue>();
+}
+
 /// Hold in place: keep any temporary target cleared and never take a route.
 /// The unit acquires enemies and fires from its position without chasing.
 pub fn queue_hold(entity: &mut EntityCommands) {
@@ -667,6 +755,9 @@ mod tests {
             UnitOrder::Guard {
                 target: Entity::from_bits(9),
             },
+            UnitOrder::Build {
+                site: Entity::from_bits(9),
+            },
         ] {
             assert!(allows_auto_targeting(&order), "{order:?} must acquire");
         }
@@ -688,6 +779,9 @@ mod tests {
             target: Entity::from_bits(9)
         }));
         assert!(!allows_chase(&UnitOrder::HoldPosition));
+        assert!(!allows_chase(&UnitOrder::Build {
+            site: Entity::from_bits(9)
+        }));
         assert!(!allows_chase(&UnitOrder::Move {
             destination: Vec3::ZERO
         }));

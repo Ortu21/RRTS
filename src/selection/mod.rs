@@ -54,19 +54,34 @@ fn setup_rectangle(mut commands: Commands) {
     ));
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn select_units(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
-    units: Query<(Entity, &GlobalTransform, &Team, Has<Selected>), With<Selectable>>,
+    units: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &Team,
+            Has<Selected>,
+            Option<&crate::structures::Footprint>,
+            Option<&Visibility>,
+        ),
+        With<Selectable>,
+    >,
     mut drag: ResMut<DragSelection>,
     pending: Res<PendingOrder>,
+    input: Res<crate::ui::industry::MapInput>,
 ) {
+    if input.blocked {
+        drag.start = None;
+        return;
+    }
     if keys.just_pressed(KeyCode::Escape) {
-        for (entity, _, _, selected) in &units {
+        for (entity, _, _, selected, _, _) in &units {
             if selected {
                 commands.entity(entity).remove::<Selected>();
             }
@@ -112,24 +127,35 @@ fn select_units(
             .and_then(|ray| {
                 units
                     .iter()
-                    .filter(|(_, _, team, _)| **team == PLAYER_TEAM)
-                    .filter_map(|(entity, transform, _, _)| {
-                        ray_box_distance(&ray, transform.translation(), UNIT_HALF_SIZE)
-                            .map(|distance| (entity, distance))
+                    // Fog: concealed enemies are not clickable.
+                    .filter(|(_, _, _, _, _, vis)| {
+                        vis.is_none_or(|v| *v != Visibility::Hidden)
+                    })
+                    .filter(|(_, _, team, _, footprint, _)| {
+                        **team == PLAYER_TEAM || footprint.is_some()
+                    })
+                    .filter_map(|(entity, transform, _, _, footprint, _)| {
+                        ray_box_distance(
+                            &ray,
+                            transform.translation(),
+                            footprint.map_or(UNIT_HALF_SIZE, |f| f.0),
+                        )
+                        .map(|distance| (entity, distance))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(entity, _)| entity)
             })
     };
-    for (entity, transform, team, selected) in &units {
-        let hit = *team == PLAYER_TEAM
-            && if drag.dragging {
-                camera
+    for (entity, transform, team, selected, footprint, _) in &units {
+        let hit = if drag.dragging {
+            *team == PLAYER_TEAM
+                && footprint.is_none()
+                && camera
                     .world_to_viewport(camera_transform, transform.translation())
                     .is_ok_and(|point| bounds.contains(point))
-            } else {
-                clicked == Some(entity)
-            };
+        } else {
+            clicked == Some(entity)
+        };
         if hit && !selected {
             commands.entity(entity).insert(Selected);
         } else if !hit && selected && !additive {

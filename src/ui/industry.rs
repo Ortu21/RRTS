@@ -1,0 +1,621 @@
+//! Persistent native Bevy controls. Pointer capture spans press through release.
+use crate::{
+    camera::RtsCamera,
+    combat::Health,
+    economy::{Economy, balance::*},
+    orders::{PendingOrder, UnitOrder},
+    picking::ground_position,
+    production::Factory,
+    selection::{Selected, SelectionSystems},
+    structures::{self, Building, Construction, Placement},
+    units::{
+        Builder, CollisionRadius, PLAYER_TEAM, Team, Unit, UnitKind, archetype,
+    },
+};
+use bevy::{prelude::*, transform::TransformSystems, window::PrimaryWindow};
+
+#[derive(Resource, Default)]
+pub struct MapInput {
+    pub blocked: bool,
+    captured: bool,
+}
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MapInputSystems;
+#[derive(Component)]
+pub struct BlocksMap;
+pub fn map_input_allowed(input: Res<MapInput>) -> bool {
+    !input.blocked
+}
+#[derive(Component, Clone, Copy)]
+enum Action {
+    Build(BuildingKind),
+    Produce(UnitKind),
+    Cancel(usize),
+    CancelSite,
+}
+/// Marker on the three BASE CONSTRUCTION buttons: shown only while a player
+/// builder (Commander/Engineer) is selected — click builder, menu appears.
+#[derive(Component)]
+struct BuildButton;
+#[derive(Component)]
+struct ResourceText;
+#[derive(Component)]
+struct BaseText;
+#[derive(Component)]
+struct ContextText;
+#[derive(Component)]
+struct QueueLabel(usize);
+#[derive(Component)]
+struct FactoryPanel;
+#[derive(Component)]
+struct SiteButton;
+pub struct IndustryUiPlugin;
+impl Plugin for IndustryUiPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, setup)
+            .add_systems(
+                PostUpdate,
+                (capture_pointer, actions, placement_and_rally)
+                    .chain()
+                    .in_set(MapInputSystems)
+                    .after(TransformSystems::Propagate)
+                    .before(SelectionSystems),
+            )
+            .add_systems(
+                PostUpdate,
+                (update_text, structures::draw_rallies).after(SelectionSystems),
+            );
+    }
+}
+fn panel() -> Node {
+    Node {
+        flex_direction: FlexDirection::Column,
+        row_gap: px(5),
+        padding: UiRect::all(px(12)),
+        ..default()
+    }
+}
+fn font(size: f32) -> TextFont {
+    TextFont {
+        font_size: FontSize::Px(size),
+        ..default()
+    }
+}
+fn button(parent: &mut ChildSpawnerCommands, action: Action, label: String) {
+    let mut entity = parent.spawn((
+        Button,
+        BlocksMap,
+        action,
+        Node {
+            padding: UiRect::all(px(7)),
+            min_height: px(30),
+            ..default()
+        },
+        BackgroundColor(Color::srgb(0.14, 0.23, 0.29)),
+    ));
+    // Build buttons form the contextual builder menu (see update_text).
+    if matches!(action, Action::Build(_)) {
+        entity.insert(BuildButton);
+    }
+    entity.with_children(|p| {
+        p.spawn((Text::new(label), font(14.0)));
+    });
+}
+fn setup(mut commands: Commands) {
+    commands
+        .spawn((
+            BlocksMap,
+            Interaction::None,
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(0),
+                left: px(0),
+                right: px(0),
+                height: px(62),
+                ..panel()
+            },
+            BackgroundColor(Color::srgb(0.04, 0.07, 0.09)),
+        ))
+        .with_children(|p| {
+            p.spawn((ResourceText, Text::new("Economy starting..."), font(16.0)));
+        });
+    commands.spawn((BlocksMap, Interaction::None, Node { position_type: PositionType::Absolute, top: px(68), right: px(8), width: px(310), ..panel() }, BackgroundColor(Color::srgba(0.04, 0.07, 0.09, 0.96))))
+        .with_children(|p| {
+            p.spawn((Text::new("BASE CONSTRUCTION"), font(18.0)));
+            p.spawn((BaseText, Text::default(), font(13.0)));
+            for kind in BuildingKind::ALL {
+                let s = kind.stats();
+                button(p, Action::Build(kind), format!("{}   {}M {}E / {:.0}s", s.name, s.cost.resources[0], s.cost.resources[1], s.cost.work / BASE_POWER));
+            }
+            p.spawn((ContextText, Text::new("Select a building"), font(14.0)));
+            p.spawn((SiteButton, Node { display: Display::None, ..panel() })).with_children(|p| button(p, Action::CancelSite, "Cancel site (NO REFUND)".into()));
+            p.spawn((FactoryPanel, Node { display: Display::None, ..panel() })).with_children(|p| {
+                for kind in UnitKind::PRODUCIBLE { let c = unit_cost(kind); button(p, Action::Produce(kind), format!("+ {}   {}M {}E / {:.0}s", archetype(kind).name, c.resources[0], c.resources[1], c.work / FACTORY_POWER)); }
+                p.spawn((Text::new("Queue: click row to cancel.\nSpent resources are NOT refunded.\nRight-click ground: rally point"), font(12.0)));
+                for i in 0..MAX_QUEUE {
+                    p.spawn((Button, BlocksMap, Action::Cancel(i), Node { display: Display::None, padding: UiRect::axes(px(6), px(3)), ..default() }, BackgroundColor(Color::srgb(0.18, 0.18, 0.21))))
+                        .with_children(|p| { p.spawn((QueueLabel(i), Text::default(), font(13.0))); });
+                }
+            });
+        });
+}
+fn capture_pointer(
+    mouse: Res<ButtonInput<MouseButton>>,
+    placement: Res<Placement>,
+    interactions: Query<&Interaction, With<BlocksMap>>,
+    mut input: ResMut<MapInput>,
+) {
+    let over = interactions.iter().any(|i| *i != Interaction::None);
+    if over && (mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Right)) {
+        input.captured = true;
+    }
+    input.blocked = over || input.captured || placement.kind.is_some();
+    if !mouse.pressed(MouseButton::Left) && !mouse.pressed(MouseButton::Right) {
+        input.captured = false;
+    }
+}
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn actions(
+    mut commands: Commands,
+    buttons: Query<(&Interaction, &Action), (Changed<Interaction>, With<Button>)>,
+    selected: Query<(Entity, &Team, Has<Construction>), (With<Selected>, With<Building>)>,
+    selected_builders: Query<(Entity, &Team), (With<Selected>, With<Unit>, With<Builder>)>,
+    mut factories: Query<&mut Factory>,
+    mut placement: ResMut<Placement>,
+    mut pending: ResMut<PendingOrder>,
+    mut input: ResMut<MapInput>,
+) {
+    let selected = selected
+        .iter()
+        .filter(|(_, t, _)| **t == PLAYER_TEAM)
+        .min_by_key(|r| r.0.to_bits());
+    // Builders tasked by this placement: frozen at button press, march on
+    // confirm. Deterministic order for multi-selection.
+    let mut tasked: Vec<Entity> = selected_builders
+        .iter()
+        .filter(|(_, t)| **t == PLAYER_TEAM)
+        .map(|(e, _)| e)
+        .collect();
+    tasked.sort_by_key(|e| e.to_bits());
+    for (interaction, action) in &buttons {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        input.blocked = true;
+        match *action {
+            Action::Build(kind) => {
+                if tasked.is_empty() {
+                    placement.kind = None;
+                    placement.builders.clear();
+                    placement.message =
+                        "Select a builder first (Commander / Engineer)".into();
+                    continue;
+                }
+                placement.kind = Some(kind);
+                placement.builders = tasked.clone();
+                placement.message = format!(
+                    "Placing {} with {} builder(s): left-click ground, builders march there. Esc / right-click cancels",
+                    kind.stats().name,
+                    tasked.len()
+                );
+                *pending = PendingOrder::None;
+            }
+            Action::Produce(kind) => {
+                if let Some((e, _, false)) = selected
+                    && let Ok(mut factory) = factories.get_mut(e)
+                {
+                    factory.enqueue(kind);
+                }
+            }
+            Action::Cancel(index) => {
+                if let Some((e, _, false)) = selected
+                    && let Ok(mut factory) = factories.get_mut(e)
+                {
+                    factory.cancel(index);
+                }
+            }
+            Action::CancelSite => {
+                if let Some((e, _, true)) = selected {
+                    commands.entity(e).despawn();
+                    placement.message = "Site cancelled. Spent resources are NOT refunded.".into();
+                }
+            }
+        }
+    }
+}
+/// Build-grid overlay during placement: 2m lines in a patch around the
+/// snapped cursor, brighter every 10m. Visual-only, no sim state.
+fn draw_build_grid(gizmos: &mut Gizmos, center: Vec3) {
+    use structures::BUILD_GRID;
+    let half = 12.0;
+    let y = 0.12;
+    let steps = (half * 2.0 / BUILD_GRID).round() as i32;
+    let start_x = ((center.x - half) / BUILD_GRID).round() * BUILD_GRID;
+    let start_z = ((center.z - half) / BUILD_GRID).round() * BUILD_GRID;
+    for i in 0..=steps {
+        let x = start_x + i as f32 * BUILD_GRID;
+        let z = start_z + i as f32 * BUILD_GRID;
+        let major_x = (x % 10.0).abs() < 0.001;
+        let major_z = (z % 10.0).abs() < 0.001;
+        gizmos.line(
+            Vec3::new(x, y, center.z - half),
+            Vec3::new(x, y, center.z + half),
+            if major_x {
+                Color::srgba(0.6, 0.85, 1.0, 0.55)
+            } else {
+                Color::srgba(0.5, 0.7, 0.9, 0.22)
+            },
+        );
+        gizmos.line(
+            Vec3::new(center.x - half, y, z),
+            Vec3::new(center.x + half, y, z),
+            if major_z {
+                Color::srgba(0.6, 0.85, 1.0, 0.55)
+            } else {
+                Color::srgba(0.5, 0.7, 0.9, 0.22)
+            },
+        );
+    }
+}
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn placement_and_rally(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    mut placement: ResMut<Placement>,
+    input: Res<MapInput>,
+    pending: Res<PendingOrder>,
+    grid: Res<crate::navigation::NavGrid>,
+    buildings: Query<
+        (&Team, &BuildingKind, &Transform, Has<Construction>, &Health),
+        With<Building>,
+    >,
+    builders: Query<(Entity, &Team, &Transform, &Builder, &CollisionRadius, &Health), With<Unit>>,
+    units: Query<(&Transform, &CollisionRadius), With<Unit>>,
+    mut factories: Query<(&Team, &mut Factory), (With<Selected>, Without<Construction>)>,
+    selected_units: Query<(), (With<Unit>, With<Selected>)>,
+    interactions: Query<&Interaction, With<BlocksMap>>,
+    mut gizmos: Gizmos,
+) {
+    if !window.focused {
+        placement.kind = None;
+        placement.builders.clear();
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape)
+        || mouse.just_pressed(MouseButton::Right) && placement.kind.is_some()
+    {
+        placement.kind = None;
+        placement.builders.clear();
+        return;
+    }
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Some(point) = ground_position(camera.0, camera.1, cursor) else {
+        return;
+    };
+    if let Some(kind) = placement.kind {
+        // Grid-based: rule, preview, spawn and march all use the snapped
+        // point so the site lands exactly where the ghost was.
+        let point = structures::snap_to_grid(point);
+        let base: Vec<_> = buildings
+            .iter()
+            .filter(|r| r.4.current > 0.0)
+            .map(|(t, k, p, c, _)| (*t, *k, p.translation, c))
+            .collect();
+        // Live builders only: the dead neither enable placement nor build.
+        let live: Vec<_> = builders
+            .iter()
+            .filter(|(_, _, _, _, _, h)| h.current > 0.0)
+            .map(|(e, t, p, b, r, _)| (e, *t, p.translation, b.radius, b.power, r.0))
+            .collect();
+        let live_builders: Vec<_> =
+            live.iter().map(|(_, t, p, r, _, _)| (*t, *p, *r)).collect();
+        // Tasked builders still alive: only these march on confirm. If they
+        // all died mid-preview the placement is dead too — re-task, no
+        // silent fallback to other builders.
+        let mut tasked: Vec<_> = live
+            .iter()
+            .filter(|(e, t, _, _, _, _)| *t == PLAYER_TEAM && placement.builders.contains(e))
+            .map(|(e, _, p, r, _, body)| (*e, p.xz().distance(point.xz()), *r, *p, *body))
+            .collect();
+        tasked.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.0.to_bits().cmp(&b.0.to_bits()))
+        });
+        let occupied: Vec<_> = units.iter().map(|(p, r)| (p.translation, r.0)).collect();
+        let mut valid = structures::placement_rule(PLAYER_TEAM, point, &base, &live_builders)
+            .and_then(|()| structures::valid_ground(&grid, kind, point, &occupied));
+        if tasked.is_empty() && valid.is_ok() {
+            valid = Err("Tasked builders lost — pick builders and retry");
+        }
+        placement.message = match (&valid, tasked.first()) {
+            (Ok(()), Some((_, dist, radius, _, _))) if *dist <= *radius => {
+                format!("VALID cell ({:.0}, {:.0}): {} tasked builder(s) in range — left-click to place", point.x, point.z, tasked.len())
+            }
+            (Ok(()), Some((_, dist, radius, _, _))) => format!(
+                "VALID cell ({:.0}, {:.0}): {} tasked builder(s), nearest {dist:.0}m away (range {radius:.0}m) — march on confirm",
+                point.x, point.z, tasked.len()
+            ),
+            (Ok(()), None) => "VALID".into(), // unreachable: empty tasked is INVALID
+            (Err(reason), _) => format!("INVALID: {reason}"),
+        };
+        let color = if valid.is_ok() {
+            Color::srgb(0.2, 1.0, 0.4)
+        } else {
+            Color::srgb(1.0, 0.25, 0.15)
+        };
+        let s = kind.stats();
+        draw_build_grid(&mut gizmos, point);
+        gizmos.cube(
+            Transform::from_translation(point.with_y(s.height * 0.5)).with_scale(Vec3::new(
+                s.half.x * 2.0,
+                s.height,
+                s.half.y * 2.0,
+            )),
+            color,
+        );
+        for (team, p, radius) in &live_builders {
+            if *team == PLAYER_TEAM {
+                gizmos.circle(
+                    Isometry3d::new(
+                        p.with_y(0.15),
+                        Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                    ),
+                    *radius,
+                    Color::srgb(0.5, 0.9, 0.4),
+                );
+            }
+        }
+        // NOTE: no factory circle — the lab only makes units, placement is
+        // builder-driven anywhere on valid ground.
+        if mouse.just_pressed(MouseButton::Left)
+            && !input.captured
+            && !interactions.iter().any(|i| *i != Interaction::None)
+            && valid.is_ok()
+        {
+            // Validation is computed here on the confirming click from live entities.
+            let site = structures::spawn_building(&mut commands, PLAYER_TEAM, kind, point, false);
+            // Every tasked builder takes an explicit Build order on the site
+            // (multi-selection): resolve marches the out-of-range ones to a
+            // stand-off and holds them there. Already-in-range ones just hold.
+            // Any later order (manual move away) drops the task and pauses.
+            let en_route = tasked.iter().filter(|(_, d, r, _, _)| *d > *r).count();
+            for (entity, _, _, _, _) in &tasked {
+                crate::orders::queue_build(&mut commands.entity(*entity), site);
+            }
+            placement.message = if en_route > 0 {
+                format!("Construction placed. {en_route} builder(s) en route, work starts on arrival.")
+            } else {
+                "Construction started. Cancellation gives NO REFUND.".into()
+            };
+            placement.kind = None;
+            placement.builders.clear();
+        }
+    } else if !input.blocked
+        && *pending == PendingOrder::None
+        && selected_units.is_empty()
+        && mouse.just_pressed(MouseButton::Right)
+        && grid.has_clearance(point)
+        && grid.is_walkable(point)
+    {
+        for (team, mut factory) in &mut factories {
+            if *team == PLAYER_TEAM {
+                factory.rally = Some(point);
+            }
+        }
+    }
+}
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_text(
+    economy: Res<Economy>,
+    placement: Res<Placement>,
+    selected: Query<
+        (
+            Entity,
+            &Team,
+            &BuildingKind,
+            &Health,
+            Option<&Construction>,
+            Option<&Factory>,
+        ),
+        With<Selected>,
+    >,
+    sites: Query<&Team, With<Construction>>,
+    builders: Query<(Entity, &Team, &Builder, &Health), (With<Unit>, With<Builder>)>,
+    selected_builders: Query<
+        (Entity, &Team, &UnitKind, &Health, &Builder, &UnitOrder),
+        (With<Selected>, With<Unit>, With<Builder>),
+    >,
+    build_targets: Query<&Construction, With<Building>>,
+    mut resources: Single<&mut Text, With<ResourceText>>,
+    mut base: Single<&mut Text, (With<BaseText>, Without<ResourceText>)>,
+    mut context: Single<&mut Text, (With<ContextText>, Without<BaseText>, Without<ResourceText>)>,
+    mut labels: Query<
+        (&QueueLabel, &mut Text),
+        (
+            Without<ContextText>,
+            Without<BaseText>,
+            Without<ResourceText>,
+        ),
+    >,
+    mut factory_panel: Single<&mut Node, With<FactoryPanel>>,
+    mut site_button: Single<&mut Node, (With<SiteButton>, Without<FactoryPanel>)>,
+    mut queue_buttons: Query<
+        (&Action, &mut Node, &Interaction, &mut BackgroundColor),
+        (With<Button>, Without<FactoryPanel>, Without<SiteButton>),
+    >,
+) {
+    if let Some(account) = economy.0.get(&0) {
+        let lines: Vec<_> = ["METAL", "ENERGY"]
+            .iter()
+            .enumerate()
+            .map(|(r, name)| {
+                let state = if account.stock[r] >= account.capacity[r] - 0.01 {
+                    "[STORAGE FULL]"
+                } else if account.demand[r] > account.consumption[r] + 0.01 {
+                    "[SHORTAGE]"
+                } else {
+                    ""
+                };
+                format!(
+                    "{name}  {:.0}/{:.0}     +{:.1}/s   -{:.1}/s   net {:+.1}/s  {state}",
+                    account.stock[r],
+                    account.capacity[r],
+                    account.income[r],
+                    account.consumption[r],
+                    account.income[r] - account.consumption[r]
+                )
+            })
+            .collect();
+        resources.set_if_neq(Text::new(lines.join("\n")));
+    }
+    // Builders work anywhere with valid ground; each trickles power only
+    // within its own radius of the site (see economy::site_power). Here show
+    // live builder count — per-site speed lives in the selection panel.
+    let alive: usize = builders
+        .iter()
+        .filter(|(_, t, _, h)| **t == PLAYER_TEAM && h.current > 0.0)
+        .count();
+    let tasked_selected: usize = selected_builders
+        .iter()
+        .filter(|(_, t, _, _, _, _)| **t == PLAYER_TEAM)
+        .count();
+    let availability = if sites.iter().any(|t| *t == PLAYER_TEAM) {
+        format!("BUSY: one site already active / builders alive: {alive}")
+    } else if alive == 0 {
+        "STALLED: no builders alive — protect Commander / build Engineer".into()
+    } else if tasked_selected == 0 {
+        format!("Builders alive: {alive} — select Commander / Engineer to build")
+    } else {
+        format!("READY: {tasked_selected} builder(s) tasked — pick a structure, click ground")
+    };
+    base.set_if_neq(Text::new(format!("{availability}\n{}", placement.message)));
+    let selected = selected.iter().min_by_key(|row| row.0.to_bits());
+    let mut factory = None;
+    let mut site_selected = false;
+    let description = if let Some((_, team, kind, health, site, industry)) = selected {
+        site_selected = site.is_some() && *team == PLAYER_TEAM;
+        factory = industry.filter(|_| site.is_none() && *team == PLAYER_TEAM);
+        let activity = if let Some(site) = site {
+            format!(
+                "Construction {:.1}% / {:.1} work/s\n{}",
+                site.0.fraction() * 100.0,
+                site.0.speed,
+                site.0.status()
+            )
+        } else if let Some(f) = industry {
+            if f.blocked {
+                "OUTPUT BLOCKED: free exit / rally route".into()
+            } else if let Some(job) = f.queue.front() {
+                format!(
+                    "{} {:.1}% / {:.1} work/s\n{}",
+                    archetype(job.kind).name,
+                    job.project.fraction() * 100.0,
+                    job.project.speed,
+                    job.project.status()
+                )
+            } else {
+                "Factory idle".into()
+            }
+        } else {
+            format!(
+                "Online: +{}M/s +{}E/s",
+                kind.stats().income[0],
+                kind.stats().income[1]
+            )
+        };
+        format!(
+            "\n{} / team {}\nHealth {:.0}/{:.0}\n{activity}",
+            kind.stats().name,
+            team.0,
+            health.current,
+            health.max
+        )
+    } else if let Some((_, team, kind, health, builder, order)) =
+        selected_builders.iter().min_by_key(|row| row.0.to_bits())
+    {
+        // Commander / Engineer selected: guns, build power/radius and the
+        // live build task. Right-click a site to (re)task, any other order
+        // pauses.
+        let guns = if kind.is_commander() {
+            "Guns: mitra 20m + missili 34m"
+        } else {
+            "Unarmed builder"
+        };
+        let task = match order {
+            UnitOrder::Build { site } => match build_targets.get(*site) {
+                Ok(construction) => format!(
+                    "Building: {:.0}% / {:.1} work/s\n{}",
+                    construction.0.fraction() * 100.0,
+                    construction.0.speed,
+                    construction.0.status()
+                ),
+                Err(_) => "Build task done".to_string(),
+            },
+            UnitOrder::Guard { .. } => "Assisting (guarding builder)".to_string(),
+            _ => "No build task — place via BASE CONSTRUCTION or right-click a site".to_string(),
+        };
+        format!(
+            "\n{} / team {}\nHealth {:.0}/{:.0}\n{guns}\nBuild: {:.1} work/s / radius {:.0}\n{task}",
+            archetype(*kind).name,
+            team.0,
+            health.current,
+            health.max,
+            builder.power,
+            builder.radius
+        )
+    } else {
+        "\nSelect a building or builder to inspect it.".into()
+    };
+    context.set_if_neq(Text::new(description));
+    factory_panel.display = if factory.is_some() {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    site_button.display = if site_selected {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for (label, mut text) in &mut labels {
+        let value = factory
+            .and_then(|f| f.queue.get(label.0))
+            .map_or(String::new(), |job| {
+                format!(
+                    "{}: {} {}   [cancel]",
+                    label.0 + 1,
+                    archetype(job.kind).name,
+                    if label.0 == 0 { "ACTIVE" } else { "waiting" }
+                )
+            });
+        text.set_if_neq(Text::new(value));
+    }
+    for (action, mut node, interaction, mut color) in &mut queue_buttons {
+        if let Action::Cancel(index) = action {
+            node.display = if factory.is_some_and(|f| f.queue.len() > *index) {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        // Contextual builder menu: structure buttons appear only while a
+        // player builder is selected — click builder, menu appears.
+        if matches!(action, Action::Build(_)) {
+            node.display = if tasked_selected > 0 {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        color.0 = match interaction {
+            Interaction::Pressed => Color::srgb(0.28, 0.48, 0.52),
+            Interaction::Hovered => Color::srgb(0.21, 0.34, 0.39),
+            Interaction::None => Color::srgb(0.14, 0.23, 0.29),
+        };
+    }
+}

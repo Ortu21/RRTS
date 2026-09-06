@@ -31,10 +31,14 @@ impl RtsCamera {
 
 fn setup_camera(mut commands: Commands, scenario: Res<Scenario>) {
     let controller = RtsCamera {
-        focus: Vec3::ZERO,
+        focus: if matches!(*scenario, Scenario::Playground) {
+            scenario.center(0) + Vec3::new(0.0, 0.0, 12.0)
+        } else {
+            Vec3::ZERO
+        },
         yaw: 0.0,
         distance: if matches!(*scenario, Scenario::Playground) {
-            180.0
+            95.0
         } else {
             440.0
         },

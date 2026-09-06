@@ -57,6 +57,7 @@ impl SuitePreset {
 #[derive(Clone)]
 pub struct Config {
     pub benchmark: bool,
+    pub economy_benchmark: bool,
     pub suite: bool,
     pub preset: SuitePreset,
     pub headless: bool,
@@ -79,6 +80,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             benchmark: false,
+            economy_benchmark: false,
             suite: false,
             preset: SuitePreset::Full,
             headless: false,
@@ -107,6 +109,7 @@ impl Config {
             match arg.as_str() {
                 "--help" | "-h" => return Ok(None),
                 "--benchmark" => config.benchmark = true,
+                "--economy-benchmark" => config.economy_benchmark = true,
                 "--benchmark-suite" => {
                     config.benchmark = true;
                     config.suite = true;
@@ -197,8 +200,8 @@ impl Config {
         Ok(Some(config))
     }
 }
-pub const HELP: &str = "Rust RTS v0.0.10 benchmark and profiler\n\
-  cargo run                                      Playground skirmish\n\
+pub const HELP: &str = "Rust RTS v0.0.11 benchmark and profiler\n\
+  cargo run                                      Economy playground\n\
   cargo run -- --benchmark                        Graphical crossing\n\
   cargo run -- --benchmark --headless --workload skirmish\n\
   cargo run --profile benchmark -- --benchmark-suite quick\n\
@@ -207,6 +210,7 @@ pub const HELP: &str = "Rust RTS v0.0.10 benchmark and profiler\n\
   cargo run --profile benchmark -- --history-report\n\
   ./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600\n\
   ./scripts/profile-visual.sh --units-per-team 2500 --seconds 60\n\
+Separate industry measurement: --economy-benchmark --ticks 1800 --repeats 3\n\
 Options: --workload idle|crossing|crowd|skirmish|guard, --units-per-team 1..10000,\n\
          --ticks 60..36000, --repeats 1..10, --seconds 1..600,\n\
          --output <new-directory>. --skirmish remains an alias.\n\

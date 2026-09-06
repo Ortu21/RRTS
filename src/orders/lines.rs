@@ -45,11 +45,12 @@ impl Plugin for LinesPlugin {
 struct LineAssets {
     segment: Handle<Mesh>,
     marker: Handle<Mesh>,
-    order_material: [Handle<StandardMaterial>; 6],
-    flash_material: [Handle<StandardMaterial>; 6],
+    order_material: [Handle<StandardMaterial>; 7],
+    flash_material: [Handle<StandardMaterial>; 7],
 }
 
-/// Which order colour slot an entity uses: Move, Attack, Hold, Idle, Patrol, Guard.
+/// Which order colour slot an entity uses: Move, Attack, Hold, Idle, Patrol,
+/// Guard, Build.
 pub fn order_slot(order: &UnitOrder) -> usize {
     match order {
         UnitOrder::Move { .. } => 0,
@@ -58,6 +59,7 @@ pub fn order_slot(order: &UnitOrder) -> usize {
         UnitOrder::Idle => 3,
         UnitOrder::Patrol { .. } => 4,
         UnitOrder::Guard { .. } => 5,
+        UnitOrder::Build { .. } => 6,
     }
 }
 
@@ -109,6 +111,9 @@ fn setup_line_assets(
         },
         UnitOrder::Guard {
             target: Entity::from_bits(9),
+        },
+        UnitOrder::Build {
+            site: Entity::from_bits(9),
         },
     ];
     for (slot, order) in orders.into_iter().enumerate() {
@@ -178,7 +183,7 @@ fn flash_planned_routes(
 /// fade-out ticking for flashes. Single writer of viz transforms: the only
 /// mutable `Transform` access over entities that are provably disjoint from
 /// bars, rings and turrets (each carries a marker this query excludes).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn update_order_graphics(
     mut commands: Commands,
     time: Res<Time>,
@@ -186,6 +191,7 @@ fn update_order_graphics(
     mut materials: ResMut<Assets<StandardMaterial>>,
     grid: Res<SpatialGrid>,
     units: Query<(Entity, Option<&MoveTarget>, &UnitOrder), With<Selected>>,
+    sites: Query<(Entity, &Transform), With<crate::structures::Building>>,
     mut viz: Query<
         (
             Entity,
@@ -195,6 +201,7 @@ fn update_order_graphics(
         ),
         (
             Without<Unit>,
+            Without<crate::structures::Building>,
             Without<HealthBarBg>,
             Without<HealthBarFg>,
             Without<Turret>,
@@ -208,9 +215,14 @@ fn update_order_graphics(
             continue;
         };
         // Guards holding near their ward carry no MoveTarget: draw the
-        // ward link instead so the order stays visible.
+        // ward link instead so the order stays visible. Same for builders
+        // holding at their site.
         let goal = target.map(|target| target.0).or_else(|| match order {
             UnitOrder::Guard { target } => grid.position(*target),
+            UnitOrder::Build { site } => sites
+                .get(*site)
+                .ok()
+                .map(|(_, transform)| transform.translation),
             _ => None,
         });
         let Some(goal) = goal else {
@@ -345,6 +357,12 @@ mod tests {
                 target: Entity::from_bits(9)
             }),
             5
+        );
+        assert_eq!(
+            order_slot(&UnitOrder::Build {
+                site: Entity::from_bits(9)
+            }),
+            6
         );
     }
 }

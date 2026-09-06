@@ -29,6 +29,13 @@ pub struct MoveTarget(pub Vec3);
 /// budgeted path planner forever.
 pub const ARRIVE_RADIUS: f32 = 0.5;
 
+/// Ground-plane distance for order arrival: destinations sit at ground height
+/// while hulls float above it (tanks 0.8, commander 1.6), so a 3D check can
+/// never pass and leaves finished orders churning the planner forever.
+pub fn flat_distance(a: Vec3, b: Vec3) -> f32 {
+    a.xz().distance(b.xz())
+}
+
 /// A plain move order: march to the destination, firing at enemies on the
 /// way without ever stopping or chasing. Replaces any other intent and
 /// drops temporary combat state plus the queue (plain click replaces).

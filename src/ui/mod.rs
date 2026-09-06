@@ -1,3 +1,4 @@
+pub mod industry;
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
@@ -27,10 +28,12 @@ struct DebugHud;
 
 type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 
-fn setup_hud(mut commands: Commands) {
+fn setup_hud(mut commands: Commands, scenario: Res<crate::scenario::Scenario>) {
     commands.spawn((
         DebugHud,
-        Text::new("RTS Prototype v0.0.10\n\nFPS: ...\nUnits: 200\nSelected: 0"),
+        industry::BlocksMap,
+        Interaction::None,
+        Text::new("RTS Prototype v0.0.11\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -38,7 +41,13 @@ fn setup_hud(mut commands: Commands) {
         TextColor(Color::WHITE),
         Node {
             position_type: PositionType::Absolute,
-            top: px(16),
+            top: px(
+                if matches!(*scenario, crate::scenario::Scenario::Playground) {
+                    72
+                } else {
+                    16
+                },
+            ),
             left: px(16),
             padding: UiRect::all(px(12)),
             ..default()
@@ -46,6 +55,7 @@ fn setup_hud(mut commands: Commands) {
         BackgroundColor(Color::srgba(0.03, 0.05, 0.07, 0.85)),
     ));
     commands.spawn((
+        industry::BlocksMap, Interaction::None,
         Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add / queue orders   Esc: clear   Right click: move / attack enemy / guard ally   G: attack-move, then left-click   P: patrol   T: guard, then left-click ally   H: hold   S: stop"),
         TextFont { font_size: FontSize::Px(15.0), ..default() },
         Node { position_type: PositionType::Absolute, bottom: px(16), left: px(16), ..default() },
@@ -81,7 +91,7 @@ fn update_hud(
     let selected = units.iter().filter(|(selected, _, _)| *selected).count();
     let blue = teams.iter().filter(|team| team.0 == 0).count();
     let red = teams.iter().filter(|team| team.0 != 0).count();
-    let mut by_kind = [0; 3];
+    let mut by_kind = [0; 5];
     for kind in &kinds {
         by_kind[kind.index()] += 1;
     }
@@ -111,7 +121,13 @@ fn update_hud(
             "\nAWAITING GUARD: left-click a friendly unit (ESC/right-click cancels)".to_string()
         }
     };
+    if benchmark.is_none() {
+        hud.0 = format!(
+            "v0.0.11  |  {fps:.0} FPS\nBlue {blue} / Red {red}  |  Selected {selected}\nOrders queued {queued} / Paths pending {pending}{targeting}"
+        );
+        return;
+    }
     hud.0 = format!(
-        "RTS Prototype v0.0.10\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
+        "RTS Prototype v0.0.11\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
     );
 }

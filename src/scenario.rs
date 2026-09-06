@@ -15,7 +15,8 @@ pub enum Scenario {
 impl Scenario {
     pub fn per_team(self) -> usize {
         match self {
-            Self::Playground => 100,
+            // Playground: solo il comandante per team (base operativa iniziale).
+            Self::Playground => 1,
             Self::Benchmark { per_team } | Self::Skirmish { per_team } => per_team,
         }
     }

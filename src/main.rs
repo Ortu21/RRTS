@@ -1,14 +1,18 @@
 mod benchmark;
 mod camera;
 mod combat;
+mod economy;
+mod fog;
 mod formation;
 mod movement;
 mod navigation;
 mod orders;
 mod picking;
+mod production;
 mod scenario;
 mod selection;
 mod spatial;
+mod structures;
 mod ui;
 mod units;
 mod world;
@@ -49,6 +53,15 @@ fn main() -> std::process::ExitCode {
                 println!("Profile report: {}", directory.display());
                 std::process::ExitCode::SUCCESS
             }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if config.economy_benchmark {
+        return match economy::benchmark::run(&config) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
                 std::process::ExitCode::FAILURE
@@ -111,6 +124,15 @@ fn main() -> std::process::ExitCode {
             movement::MovementPlugin,
             ui::UiPlugin,
         ));
+    if !config.benchmark {
+        app.add_plugins((
+            economy::EconomyPlugin,
+            fog::FogPlugin { render: true },
+            structures::StructuresPlugin { visuals: true },
+            production::ProductionPlugin,
+            ui::industry::IndustryUiPlugin,
+        ));
+    }
     if config.benchmark
         && let Err(error) = benchmark::add_graphical(&mut app, config)
     {

@@ -174,10 +174,11 @@ pub fn separation_push(offset_xz: Vec2, separation_radius: f32, strength: f32) -
     offset_xz / distance * (1.0 - distance / separation_radius) * strength
 }
 
+#[allow(clippy::type_complexity)]
 fn rebuild_spatial(
     mut grid: ResMut<SpatialGrid>,
     config: Res<AvoidanceConfig>,
-    units: Query<(Entity, &Transform), With<Unit>>,
+    units: Query<(Entity, &Transform), Or<(With<Unit>, With<crate::structures::Building>)>>,
     radii: Query<&CollisionRadius>,
 ) {
     if grid.cell_size <= 0.0 {

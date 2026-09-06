@@ -30,7 +30,7 @@ type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 fn setup_hud(mut commands: Commands) {
     commands.spawn((
         DebugHud,
-        Text::new("RTS Prototype v0.0.8\n\nFPS: ...\nUnits: 200\nSelected: 0"),
+        Text::new("RTS Prototype v0.0.9\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -104,8 +104,11 @@ fn update_hud(
         PendingOrder::AttackMove => {
             "\nAWAITING ATTACK-MOVE: left-click destination (ESC/right-click cancels)".to_string()
         }
+        PendingOrder::Patrol => {
+            "\nAWAITING PATROL: left-click adds a loop waypoint (ESC/right-click done)".to_string()
+        }
     };
     hud.0 = format!(
-        "RTS Prototype v0.0.8\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
+        "RTS Prototype v0.0.9\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
     );
 }

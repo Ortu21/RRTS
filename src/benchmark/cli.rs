@@ -194,7 +194,7 @@ impl Config {
         Ok(Some(config))
     }
 }
-pub const HELP: &str = "Rust RTS v0.0.8 benchmark and profiler\n\
+pub const HELP: &str = "Rust RTS v0.0.9 benchmark and profiler\n\
   cargo run                                      Playground skirmish\n\
   cargo run -- --benchmark                        Graphical crossing\n\
   cargo run -- --benchmark --headless --workload skirmish\n\

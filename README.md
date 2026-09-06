@@ -1,4 +1,4 @@
-# Rust RTS — v0.0.8
+# Rust RTS — v0.0.9
 
 A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets. Gameplay depends only on Bevy; benchmark reporting and machine metadata additionally use serde/serde_json and sysinfo (benchmark-only code paths).
 
@@ -21,9 +21,11 @@ The playground contains 100 blue vs 100 red units on a 400 × 400 field with a d
 | SHIFT | Add friendly units to selection |
 | ESC | Clear selection, cancel drag and disarm targeting |
 | Right click | Replace movement orders (plain Move, fires on the march) — or disarm targeting |
+| Right click on enemy | Direct attack with focus fire (Shift queues it) |
 | Shift + right click | Queue a move behind the live order |
 | G | Arm attack-move targeting (toggle), then left-click a destination |
 | Shift + G, Shift + click | Queue an attack-move behind the live order |
+| P | Arm patrol targeting (toggle), then left-click appends loop waypoints |
 | H | Hold selected units in place (acquire and fire, never chase) |
 | S | Stop selected units |
 

@@ -45,17 +45,18 @@ impl Plugin for LinesPlugin {
 struct LineAssets {
     segment: Handle<Mesh>,
     marker: Handle<Mesh>,
-    order_material: [Handle<StandardMaterial>; 4],
-    flash_material: [Handle<StandardMaterial>; 4],
+    order_material: [Handle<StandardMaterial>; 5],
+    flash_material: [Handle<StandardMaterial>; 5],
 }
 
-/// Which order colour slot an entity uses: Move, Attack, Hold, Idle.
+/// Which order colour slot an entity uses: Move, Attack, Hold, Idle, Patrol.
 pub fn order_slot(order: &UnitOrder) -> usize {
     match order {
         UnitOrder::Move { .. } => 0,
         UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. } => 1,
         UnitOrder::HoldPosition => 2,
         UnitOrder::Idle => 3,
+        UnitOrder::Patrol { .. } => 4,
     }
 }
 
@@ -101,6 +102,10 @@ fn setup_line_assets(
         },
         UnitOrder::HoldPosition,
         UnitOrder::Idle,
+        UnitOrder::Patrol {
+            points: Vec::new(),
+            next: 0,
+        },
     ];
     for (slot, order) in orders.into_iter().enumerate() {
         assets.order_material[slot] = materials.add(StandardMaterial {
@@ -211,7 +216,7 @@ fn update_order_graphics(
                 VizKind::Line { order: drawn } => {
                     has_line = true;
                     if *drawn != *order {
-                        *drawn = *order;
+                        *drawn = order.clone();
                         material.0 = assets.order_material[slot].clone();
                     }
                     *viz_transform = segment_transform(origin, target.0, LINE_THICKNESS, LINE_Y);
@@ -219,7 +224,7 @@ fn update_order_graphics(
                 VizKind::Marker { order: drawn } => {
                     has_marker = true;
                     if *drawn != *order {
-                        *drawn = *order;
+                        *drawn = order.clone();
                         material.0 = assets.order_material[slot].clone();
                     }
                     viz_transform.translation = target.0.with_y(MARKER_Y);
@@ -231,7 +236,9 @@ fn update_order_graphics(
             commands.spawn((
                 OrderViz {
                     unit: entity,
-                    kind: VizKind::Line { order: *order },
+                    kind: VizKind::Line {
+                        order: order.clone(),
+                    },
                 },
                 Mesh3d(assets.segment.clone()),
                 MeshMaterial3d(assets.order_material[slot].clone()),
@@ -242,7 +249,9 @@ fn update_order_graphics(
             commands.spawn((
                 OrderViz {
                     unit: entity,
-                    kind: VizKind::Marker { order: *order },
+                    kind: VizKind::Marker {
+                        order: order.clone(),
+                    },
                 },
                 Mesh3d(assets.marker.clone()),
                 MeshMaterial3d(assets.order_material[slot].clone()),
@@ -311,5 +320,12 @@ mod tests {
         );
         assert_eq!(order_slot(&UnitOrder::HoldPosition), 2);
         assert_eq!(order_slot(&UnitOrder::Idle), 3);
+        assert_eq!(
+            order_slot(&UnitOrder::Patrol {
+                points: Vec::new(),
+                next: 0
+            }),
+            4
+        );
     }
 }

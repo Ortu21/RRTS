@@ -7,9 +7,9 @@ use crate::{
     combat::{AttackTarget, Chasing, HoldFire},
     movement::{MoveTarget, queue_move},
     navigation::{NavGrid, Route},
-    picking::ground_position,
+    picking::{ground_position, ray_box_distance},
     selection::{Selected, SelectionSystems},
-    units::Unit,
+    units::{PLAYER_TEAM, Team, UNIT_HALF_SIZE, Unit},
 };
 
 pub struct OrderPlugin;
@@ -21,13 +21,14 @@ impl Plugin for OrderPlugin {
             .add_plugins(lines::LinesPlugin)
             .add_systems(
                 PostUpdate,
-                issue_pending_attack_move.before(SelectionSystems),
+                (issue_pending_attack_move, issue_pending_patrol).before(SelectionSystems),
             )
             .add_systems(
                 PostUpdate,
                 (
                     issue_move_order,
                     enter_attack_move_targeting,
+                    enter_patrol_targeting,
                     issue_hold_stop_keys,
                 )
                     .after(SelectionSystems),
@@ -50,18 +51,23 @@ pub enum PendingOrder {
     #[default]
     None,
     AttackMove,
+    Patrol,
 }
+
+/// Cap waypoint count per patrol loop: bounds memory and keeps loops readable.
+pub const MAX_PATROL_POINTS: usize = 16;
 
 /// Current unit intent. A single enum avoids contradictory flag sets like
 /// `is_moving` + `is_attacking`. Capabilities (Weapon, Health, ...) never
 /// imply intent: only the order decides whether combat is allowed.
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component, Debug, Clone, PartialEq)]
 pub enum UnitOrder {
     Idle,
     Move { destination: Vec3 },
     Attack { target: Entity },
     AttackMove { destination: Vec3 },
     HoldPosition,
+    Patrol { points: Vec<Vec3>, next: usize },
 }
 
 /// Behaviour rule: which orders may acquire enemies on their own.
@@ -75,6 +81,7 @@ pub fn allows_auto_targeting(order: &UnitOrder) -> bool {
             | UnitOrder::Move { .. }
             | UnitOrder::HoldPosition
             | UnitOrder::Idle
+            | UnitOrder::Patrol { .. }
     )
 }
 
@@ -83,18 +90,20 @@ pub fn allows_auto_targeting(order: &UnitOrder) -> bool {
 pub fn allows_chase(order: &UnitOrder) -> bool {
     matches!(
         order,
-        UnitOrder::Attack { .. } | UnitOrder::AttackMove { .. }
+        UnitOrder::Attack { .. } | UnitOrder::AttackMove { .. } | UnitOrder::Patrol { .. }
     )
 }
 
 /// Display colour per order: Move green, Attack red, Hold blue, Idle dim
-/// yellow. Shared by order lines, destination markers and route flashes.
+/// yellow, Patrol violet. Shared by order lines, destination markers and
+/// route flashes.
 pub fn order_color(order: &UnitOrder) -> Color {
     match order {
         UnitOrder::Move { .. } => Color::srgb(0.3, 1.0, 0.4),
         UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. } => Color::srgb(1.0, 0.35, 0.15),
         UnitOrder::HoldPosition => Color::srgb(0.35, 0.6, 1.0),
         UnitOrder::Idle => Color::srgb(0.7, 0.7, 0.25),
+        UnitOrder::Patrol { .. } => Color::srgb(0.75, 0.4, 1.0),
     }
 }
 
@@ -106,6 +115,7 @@ fn issue_move_order(
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
     selected: Query<(Entity, &Unit, &UnitOrder), With<Selected>>,
+    enemies: Query<(Entity, &GlobalTransform, &Team), With<Unit>>,
     settings: Res<FormationSettings>,
     grid: Res<NavGrid>,
     mut pending: ResMut<PendingOrder>,
@@ -125,10 +135,35 @@ fn issue_move_order(
         return;
     }
     let (camera, transform) = *camera;
-    let Some(center) = window
-        .cursor_position()
-        .and_then(|cursor| ground_position(camera, transform, cursor))
-    else {
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    // Enemy under cursor: direct attack with focus fire (Shift queues it
+    // behind the live order). Otherwise fall through to the ground move.
+    if let Ok(ray) = camera.viewport_to_world(transform, cursor) {
+        let candidates: Vec<_> = enemies
+            .iter()
+            .filter(|(_, _, team)| team.0 != PLAYER_TEAM.0)
+            .map(|(entity, transform, _)| (entity, transform.translation()))
+            .collect();
+        if let Some(target) = pick_enemy_target(&ray, &candidates) {
+            let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+            for (entity, _, order) in &selected {
+                if additive && is_busy(order, &mut queues, entity) {
+                    enqueue_order(
+                        &mut commands,
+                        &mut queues,
+                        entity,
+                        UnitOrder::Attack { target },
+                    );
+                } else {
+                    queue_attack(&mut commands.entity(entity), target);
+                }
+            }
+            return;
+        }
+    }
+    let Some(center) = ground_position(camera, transform, cursor) else {
         return;
     };
     let mut units: Vec<_> = selected.iter().collect();
@@ -164,6 +199,93 @@ fn enter_attack_move_targeting(
     } else if !selected.is_empty() {
         *pending = PendingOrder::AttackMove;
     }
+}
+
+/// P arms patrol targeting (toggle): each left click appends a loop
+/// waypoint to the selected units' patrol instead of changing selection.
+/// Targeting stays armed across clicks so multi-point loops need no
+/// re-press; ESC, right click or another order key disarms.
+fn enter_patrol_targeting(
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    selected: Query<Entity, With<Selected>>,
+    mut pending: ResMut<PendingOrder>,
+) {
+    if !window.focused || !keys.just_pressed(KeyCode::KeyP) {
+        return;
+    }
+    if *pending == PendingOrder::Patrol {
+        *pending = PendingOrder::None;
+    } else if !selected.is_empty() {
+        *pending = PendingOrder::Patrol;
+    }
+}
+
+/// Left click while patrol-targeting appends the clicked point to every
+/// selected unit's own patrol loop (capped). Units without a patrol start
+/// one; targeting stays armed for the next point.
+#[allow(clippy::too_many_arguments)]
+fn issue_pending_patrol(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    selected: Query<Entity, With<Selected>>,
+    orders: Query<&UnitOrder>,
+    mut pending: ResMut<PendingOrder>,
+) {
+    if *pending != PendingOrder::Patrol {
+        return;
+    }
+    if !window.focused || keys.just_pressed(KeyCode::Escape) {
+        *pending = PendingOrder::None;
+        return;
+    }
+    if !mouse.just_released(MouseButton::Left) || selected.is_empty() {
+        return;
+    }
+    let (camera, transform) = *camera;
+    let Some(point) = window
+        .cursor_position()
+        .and_then(|cursor| ground_position(camera, transform, cursor))
+    else {
+        return;
+    };
+    for entity in &selected {
+        let mut entity_commands = commands.entity(entity);
+        match orders.get(entity) {
+            Ok(UnitOrder::Patrol { points, next }) => {
+                let mut points = points.clone();
+                if points.len() < MAX_PATROL_POINTS {
+                    points.push(point);
+                }
+                let leg = points[*next % points.len()];
+                entity_commands.insert((
+                    UnitOrder::Patrol {
+                        points,
+                        next: *next,
+                    },
+                    MoveTarget(leg),
+                ));
+            }
+            _ => {
+                queue_patrol(&mut entity_commands, vec![point]);
+            }
+        }
+    }
+}
+
+/// Fresh patrol loop through `points`: head for the first leg immediately.
+/// Empty input stops the unit instead of panicking.
+pub fn queue_patrol(entity: &mut EntityCommands, points: Vec<Vec3>) {
+    let Some(leg) = points.first().copied() else {
+        queue_stop(entity);
+        return;
+    };
+    entity
+        .insert((UnitOrder::Patrol { points, next: 0 }, MoveTarget(leg)))
+        .remove::<(Route, AttackTarget, Chasing, HoldFire, UnitOrderQueue)>();
 }
 
 /// Left click while targeting issues the armed order in formation around
@@ -262,6 +384,33 @@ fn apply_order(entity: &mut EntityCommands, order: UnitOrder) {
                 .insert((order, MoveTarget(destination)))
                 .remove::<(Route, AttackTarget, Chasing, HoldFire)>();
         }
+        UnitOrder::Patrol { .. } => {
+            let leg = match &order {
+                UnitOrder::Patrol { points, next } if !points.is_empty() => {
+                    Some(points[*next % points.len()])
+                }
+                _ => None,
+            };
+            match leg {
+                Some(destination) => {
+                    entity.insert((order, MoveTarget(destination))).remove::<(
+                        Route,
+                        AttackTarget,
+                        Chasing,
+                        HoldFire,
+                    )>();
+                }
+                None => {
+                    entity.insert(UnitOrder::Idle).remove::<(
+                        MoveTarget,
+                        Route,
+                        AttackTarget,
+                        Chasing,
+                        HoldFire,
+                    )>();
+                }
+            }
+        }
         UnitOrder::Attack { .. } | UnitOrder::HoldPosition | UnitOrder::Idle => {
             entity
                 .insert(order)
@@ -318,10 +467,20 @@ pub fn is_busy(order: &UnitOrder, queues: &mut Query<&mut UnitOrderQueue>, entit
             .unwrap_or(false)
 }
 
+/// Nearest enemy unit under a pick ray, if any. Pure over snapshots so the
+/// focus-fire rule is unit-testable without a window or camera.
+pub fn pick_enemy_target(ray: &Ray3d, enemies: &[(Entity, Vec3)]) -> Option<Entity> {
+    enemies
+        .iter()
+        .filter_map(|(entity, position)| {
+            ray_box_distance(ray, *position, UNIT_HALF_SIZE).map(|distance| (*entity, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(entity, _)| entity)
+}
+
 /// Explicit attack foundation: chase the given target and fire.
 /// When the target dies the order completes instead of roaming.
-/// Reserved for future direct-attack input.
-#[allow(dead_code)]
 pub fn queue_attack(entity: &mut EntityCommands, target: Entity) {
     apply_order(entity, UnitOrder::Attack { target });
     entity.remove::<UnitOrderQueue>();
@@ -370,6 +529,10 @@ mod tests {
             },
             UnitOrder::HoldPosition,
             UnitOrder::Idle,
+            UnitOrder::Patrol {
+                points: vec![Vec3::ZERO],
+                next: 0,
+            },
         ] {
             assert!(allows_auto_targeting(&order), "{order:?} must acquire");
         }
@@ -383,11 +546,36 @@ mod tests {
         assert!(allows_chase(&UnitOrder::AttackMove {
             destination: Vec3::ZERO
         }));
+        assert!(allows_chase(&UnitOrder::Patrol {
+            points: vec![Vec3::ZERO],
+            next: 0,
+        }));
         assert!(!allows_chase(&UnitOrder::HoldPosition));
         assert!(!allows_chase(&UnitOrder::Move {
             destination: Vec3::ZERO
         }));
         assert!(!allows_chase(&UnitOrder::Idle));
+    }
+
+    #[test]
+    fn pick_enemy_returns_nearest_hit_and_ignores_misses() {
+        use bevy::math::{Dir3, Ray3d};
+        let ray = Ray3d::new(Vec3::new(0.0, 0.0, 5.0), Dir3::NEG_Z);
+        let far = Entity::from_bits(1);
+        let near = Entity::from_bits(2);
+        let off = Entity::from_bits(3);
+        let enemies = vec![
+            (far, Vec3::new(0.0, 0.0, -10.0)),
+            (near, Vec3::ZERO),
+            (off, Vec3::new(50.0, 0.0, 0.0)),
+        ];
+        assert_eq!(pick_enemy_target(&ray, &enemies), Some(near));
+        assert_eq!(pick_enemy_target(&ray, &[]), None);
+    }
+
+    #[test]
+    fn patrol_cap_bounds_loop_memory() {
+        const { assert!(MAX_PATROL_POINTS >= 2) }
     }
 
     #[test]

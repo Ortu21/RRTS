@@ -192,9 +192,12 @@ fn validate_targets(
             Some(target_team) => {
                 let own_team = teams.get(entity).ok();
                 match (own_team, order) {
-                    (Some(own), UnitOrder::AttackMove { .. } | UnitOrder::Move { .. })
-                        if own.is_enemy(*target_team) =>
-                    {
+                    (
+                        Some(own),
+                        UnitOrder::AttackMove { .. }
+                        | UnitOrder::Move { .. }
+                        | UnitOrder::Patrol { .. },
+                    ) if own.is_enemy(*target_team) => {
                         // Leash: drop targets left far behind (marching past)
                         // or chased far outside acquisition.
                         match (ranges.get(entity).ok(), target_position(&grid, target.0)) {
@@ -308,7 +311,10 @@ fn acquire_targets(
                 // above); invalid locks remain owned by validation.
                 if !matches!(
                     order,
-                    UnitOrder::AttackMove { .. } | UnitOrder::Move { .. } | UnitOrder::HoldPosition
+                    UnitOrder::AttackMove { .. }
+                        | UnitOrder::Move { .. }
+                        | UnitOrder::HoldPosition
+                        | UnitOrder::Patrol { .. }
                 ) {
                     continue;
                 }
@@ -446,6 +452,34 @@ fn resolve_behaviour(
                         .remove::<Route>();
                 }
             }
+            (UnitOrder::Patrol { points, next }, None) => {
+                if points.is_empty() {
+                    commands.entity(entity).insert(UnitOrder::Idle);
+                } else {
+                    let leg = points[*next % points.len()];
+                    if move_target.is_none() && !has_route {
+                        if transform.translation.distance(leg) <= ARRIVE_RADIUS {
+                            // Waypoint reached: advance the loop, never complete.
+                            let advanced = (*next + 1) % points.len();
+                            commands.entity(entity).insert((
+                                UnitOrder::Patrol {
+                                    points: points.clone(),
+                                    next: advanced,
+                                },
+                                MoveTarget(points[advanced]),
+                            ));
+                            commands.entity(entity).remove::<Route>();
+                        } else {
+                            commands.entity(entity).insert(MoveTarget(leg));
+                        }
+                    } else if move_target.is_none_or(|current| current.0 != leg) {
+                        commands
+                            .entity(entity)
+                            .insert(MoveTarget(leg))
+                            .remove::<Route>();
+                    }
+                }
+            }
             // Marching or holding with a lock: no markers, the unit follows
             // its route (or holds) and fires whenever the target is in range.
             (UnitOrder::Move { .. } | UnitOrder::HoldPosition | UnitOrder::Idle, Some(_)) => {
@@ -481,7 +515,10 @@ fn resolve_behaviour(
             }
             // Unreachable: the guard above covers every chase order, but the
             // compiler cannot prove it.
-            (UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. }, Some(_)) => {}
+            (
+                UnitOrder::AttackMove { .. } | UnitOrder::Attack { .. } | UnitOrder::Patrol { .. },
+                Some(_),
+            ) => {}
             (UnitOrder::HoldPosition, _) => {
                 if move_target.is_some() || has_route {
                     commands.entity(entity).remove::<(MoveTarget, Route)>();
@@ -1136,6 +1173,44 @@ mod tests {
         );
         let position = world.entity(unit).get::<Transform>().unwrap().translation;
         assert!(position.distance(Vec3::new(30.0, 0.8, 60.0)) < 1.0);
+    }
+
+    #[test]
+    fn patrol_advances_waypoints_and_loops_forever() {
+        let mut app = combat_app();
+        let a = Vec3::new(-30.0, 0.8, 60.0);
+        let b = Vec3::new(30.0, 0.8, 60.0);
+        let unit = app
+            .world_mut()
+            .spawn(combatant(
+                140,
+                0,
+                a,
+                UnitOrder::Patrol {
+                    points: vec![a, b],
+                    next: 0,
+                },
+                UnitKind::Tank,
+            ))
+            .id();
+        for _ in 0..200 {
+            app.update();
+        }
+        // Spawned on waypoint A: advanced to leg B without completing.
+        assert!(matches!(
+            app.world().entity(unit).get::<UnitOrder>(),
+            Some(UnitOrder::Patrol { next: 1, .. })
+        ));
+        for _ in 0..700 {
+            app.update();
+        }
+        // Reached B and looped back to leg A: patrols never complete.
+        let world = app.world();
+        assert!(matches!(
+            world.entity(unit).get::<UnitOrder>(),
+            Some(UnitOrder::Patrol { next: 0, .. })
+        ));
+        assert!(world.entities().contains(unit));
     }
 
     #[test]

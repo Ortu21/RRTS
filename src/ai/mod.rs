@@ -7,7 +7,7 @@
 //! - Headless test: `--benchmark --headless --workload ai-test`
 //!   (Playground reale con Commander, mappa seedata, fog attivo).
 //! - Grafico 1v1 AI-vs-AI: `cargo run -- --ai both`
-//!   (blu=turtle vs rosso=rusher di default, overlay per entrambi).
+//!   (blu=rusher vs rosso=turtle di default, overlay per entrambi).
 //! - Grafico vs AI: `cargo run -- --ai skirmish` (AI sul team 1, tu giochi il blu).
 //! - Personalità: `--ai-personality turtle --ai-personality2 rusher`.
 

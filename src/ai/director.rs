@@ -91,13 +91,29 @@ pub fn evaluate_functional(world: &mut World, team: u8, ticks: usize) -> Vec<Che
         detail: format!("factory complete={factory_done}"),
     });
 
-    let tanks = count_units(world, team, Some(UnitKind::Tank));
+    let combat_units = world
+        .query_filtered::<(&Team, &UnitKind, &Health), With<Unit>>()
+        .iter(world)
+        .filter(|(t, k, h)| t.0 == team && h.current > 0.0 && crate::units::archetype(**k).armed)
+        .count();
     let engineers = count_units(world, team, Some(UnitKind::Engineer));
-    let produced = tanks + engineers;
+    let produced = combat_units + engineers;
     checks.push(CheckResult {
         name: "factory-produced-unit",
         pass: produced >= 1,
-        detail: format!("tanks={tanks} engineers={engineers}"),
+        detail: format!("combat={combat_units} engineers={engineers}"),
+    });
+
+    // Anti-bypass tier: mai unità T2 senza LabT2 completo.
+    let labt2_done = count_buildings(world, team, BuildingKind::LabT2, true);
+    let t2_units = [UnitKind::HeavyTank2, UnitKind::Artillery2]
+        .into_iter()
+        .map(|k| count_units(world, team, Some(k)))
+        .sum::<usize>();
+    checks.push(CheckResult {
+        name: "no-t2-without-labt2",
+        pass: labt2_done > 0 || t2_units == 0,
+        detail: format!("labt2 complete={labt2_done} t2 units={t2_units}"),
     });
 
     // Economia: un Metal completo deve alzare l'income oltre lo zero.
@@ -179,6 +195,31 @@ pub fn evaluate_balance(world: &mut World, team: u8) -> Vec<CheckResult> {
         pass: sane,
         detail: format!("stocks=[{:.0},{:.0}]", stocks[0], stocks[1]),
     });
+    // 0.0.16 — threat shadow sana: costruita dallo snapshot onesto, deve
+    // essere finita e >= 0. Solo osservazione: mai fail su valori alti
+    // (un threat alto è informazione, non errore).
+    let (threat_mean, threat_max, explored) = world
+        .get_resource::<super::AiSnapshots>()
+        .and_then(|s| s.0.get(&team))
+        .map(|snap| {
+            let map = super::threat::build_threat(snap);
+            (map.mean(), map.max(), snap.explored_pct)
+        })
+        .unwrap_or((0.0, 0.0, 0.0));
+    let threat_sane = threat_mean.is_finite()
+        && threat_max.is_finite()
+        && threat_mean >= 0.0
+        && threat_max >= 0.0
+        && explored.is_finite()
+        && (0.0..=1.0).contains(&explored);
+    checks.push(CheckResult {
+        name: "threat-sane",
+        pass: threat_sane,
+        detail: format!(
+            "threat mean={threat_mean:.1} max={threat_max:.1} explored={:.1}%",
+            explored * 100.0
+        ),
+    });
     checks
 }
 
@@ -209,15 +250,21 @@ pub fn state_checksum(world: &mut World) -> u64 {
     checksum
 }
 
-/// Query factory con coda per la strategia (entity + len + blocked), ordinate.
+/// Query factory con coda per la strategia (vista completa), ordinate.
 #[allow(dead_code)]
-pub fn factory_queues(world: &mut World, team: u8) -> Vec<(Entity, usize, bool)> {
+pub fn factory_queues(world: &mut World, team: u8) -> Vec<crate::ai::strategy::FactoryView> {
     let mut out: Vec<_> = world
         .query_filtered::<(Entity, &Team, &Factory), (With<Building>, Without<Construction>)>()
         .iter(world)
         .filter(|(_, t, _)| t.0 == team)
-        .map(|(e, _, f)| (e, f.queue.len(), f.blocked))
+        .map(|(e, _, f)| crate::ai::strategy::FactoryView {
+            entity: e,
+            queue_len: f.queue.len(),
+            blocked: f.blocked,
+            tier: f.tier,
+            queued: f.queue.iter().map(|job| job.kind).collect(),
+        })
         .collect();
-    out.sort_by_key(|(e, _, _)| e.to_bits());
+    out.sort_by_key(|v| v.entity.to_bits());
     out
 }

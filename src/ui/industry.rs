@@ -477,6 +477,21 @@ fn placement_and_rally(
             && valid.is_ok()
         {
             // Validation is computed here on the confirming click from live entities.
+            // Reachable builder approach on the post-placement grid (not just
+            // valid ground): the new footprint itself can seal its stand-off,
+            // which would loop MoveTarget/fail forever, so it is rejected
+            // with the preview kept armed.
+            let approach_ok = tasked.first().is_some_and(|(_, _, _, pos, body)| {
+                let probe = grid.cloned_with_obstacle(structures::building_obstacle(kind, point));
+                let approach =
+                    structures::site_approach(&probe, point, *pos, kind.stats().half, *body);
+                probe.find_path(*pos, approach).is_some()
+            });
+            if !approach_ok {
+                placement.message =
+                    "INVALID: no reachable builder approach — pick a clearer spot".into();
+                return;
+            }
             let site =
                 structures::spawn_building(&mut commands, Team(view.team), kind, point, false);
             // Every tasked builder takes an explicit Build order on the site
@@ -742,6 +757,15 @@ fn update_text(
     for (action, mut node, interaction, mut color) in &mut queue_buttons {
         if let Action::Cancel(index) = action {
             node.display = if factory.is_some_and(|f| f.queue.len() > *index) {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        // Tier gate: T2 units show only on a selected LabT2 (the enqueue
+        // itself also refuses, this just keeps the menu honest).
+        if let Action::Produce(kind) = action {
+            node.display = if factory.is_some_and(|f| archetype(*kind).tier <= f.tier) {
                 Display::Flex
             } else {
                 Display::None

@@ -148,7 +148,7 @@ fn simultaneous_consumers_share_resources_regardless_of_archetype_migration() {
         app.world_mut()
             .get_mut::<Factory>(e)
             .unwrap()
-            .enqueue(UnitKind::Tank);
+            .enqueue(UnitKind::HeavyTank);
     }
     // Force different ECS chunk order while retaining stable identities.
     app.world_mut()
@@ -156,15 +156,19 @@ fn simultaneous_consumers_share_resources_regardless_of_archetype_migration() {
         .insert(crate::selection::Selected);
     stock(&mut app, 0, [0.45, 1.1]);
     app.update();
+    // HeavyTank [110,260] work 120 at factory power 10: 0.5 work per 0.05s
+    // tick, and metal binds the fair split: f = 0.45 / (2 * 110*0.5/120).
+    let work = 10.0 * 0.05;
+    let fraction = 0.45 / (2.0 * (110.0 * work / 120.0));
     for e in [a, b] {
         close(
             app.world().get::<Factory>(e).unwrap().queue[0].project.done,
-            0.25,
+            work * fraction,
         );
     }
     let a = &app.world().resource::<Economy>().0[&0];
     close(a.stock[0], 0.0);
-    close(a.stock[1], 0.0);
+    close(a.stock[1], 1.1 - 2.0 * (260.0 * work / 120.0) * fraction);
 }
 #[test]
 fn fractional_final_tick_charges_only_remaining_work() {

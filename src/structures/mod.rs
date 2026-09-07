@@ -4,10 +4,13 @@ pub use visuals::draw_rallies;
 #[cfg(test)]
 mod tests;
 use crate::{
-    combat::{DeathSystems, Health, ResolveBehaviour},
+    combat::{
+        AcquisitionRange, DeathSystems, Health, ResolveBehaviour, TurretYaw, Weapon, WeaponState,
+    },
     economy::{EconomyTick, Project, balance::*},
     movement::MovementSystems,
     navigation::{NavGrid, Obstacle, PlanPaths, Route, UNIT_CLEARANCE},
+    orders::UnitOrder,
     production::Factory,
     scenario::Scenario,
     spatial::{SpatialSystems, apply_avoidance},
@@ -17,6 +20,12 @@ use bevy::prelude::*;
 
 #[derive(Component)]
 pub struct Building;
+/// Combat-capable static defense marker (future hook: overheat, targeting
+/// priorities, AA — query `With<Turret>` without touching shared combat).
+/// Behavior (acquire/validate/fire) is reused from units via the Weapon
+/// bundle below, so no duplicated targeting logic.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turret;
 #[derive(Component)]
 pub struct Construction(pub Project);
 #[derive(Component, Clone, Copy)]
@@ -92,7 +101,40 @@ pub fn spawn_building(
     if kind == BuildingKind::Factory {
         entity.insert(Factory::default());
     }
+    if kind == BuildingKind::LabT2 {
+        entity.insert(Factory {
+            tier: 2,
+            ..Default::default()
+        });
+    }
+    // Static defense gun: reuses the whole unit combat pipeline
+    // (acquire/validate/hold/fire/fog) via HoldPosition — never chases,
+    // never receives move orders (no Unit component, see orders). Armed only
+    // when complete: construction sites hold fire (see finish_sites).
+    if complete {
+        arm_turret(&mut entity, kind);
+    }
     entity.id()
+}
+
+/// Insert the Weapon bundle for a completed turret. Pure helper so both
+/// `spawn_building(complete=true)` and `finish_sites` arm identically.
+fn arm_turret(entity: &mut EntityCommands, kind: BuildingKind) {
+    if let Some(gun) = turret_stats(kind) {
+        entity.insert((
+            Turret,
+            Weapon {
+                range: gun.range,
+                cooldown: gun.cooldown,
+                damage: gun.damage,
+                projectile_speed: gun.projectile_speed,
+            },
+            WeaponState { remaining: 0.0 },
+            AcquisitionRange(gun.acquisition),
+            TurretYaw::default(),
+            UnitOrder::HoldPosition,
+        ));
+    }
 }
 
 /// Grid-based construction: every site snaps its center to this step so
@@ -145,7 +187,14 @@ pub fn valid_ground(
     }
     if grid.obstacles.iter().any(|o| {
         let delta = (center - o.center).abs();
-        delta.x < half.x + o.half_size.x + 1.6 && delta.y < half.y + o.half_size.y + 1.6
+        if kind == BuildingKind::Wall {
+            // Walls tile flush on the 2m grid: strict footprint overlap only,
+            // so snapped neighbors touch (delta == sum) without triggering.
+            // Rocks (half >= 4) and buildings still block as before.
+            delta.x < half.x + o.half_size.x && delta.y < half.y + o.half_size.y
+        } else {
+            delta.x < half.x + o.half_size.x + 1.6 && delta.y < half.y + o.half_size.y + 1.6
+        }
     }) {
         return Err("Overlaps obstacle / building");
     }
@@ -156,6 +205,15 @@ pub fn valid_ground(
         return Err("Unit inside footprint / clearance");
     }
     Ok(())
+}
+/// Nav obstacle a building would add at `position` (same shape as
+/// `sync_occupancy`). Placement probes clone the grid with it to validate
+/// paths against the post-placement world.
+pub fn building_obstacle(kind: BuildingKind, position: Vec3) -> Obstacle {
+    Obstacle {
+        center: position.xz(),
+        half_size: kind.stats().half,
+    }
 }
 /// Factory placement sanity: a lab whose doors all open into rock (or off
 /// map) would queue troops that never spawn — `release_products` retains the
@@ -169,7 +227,7 @@ pub fn factory_spawn_ok(
     kind: BuildingKind,
     position: Vec3,
 ) -> Result<(), &'static str> {
-    if kind != BuildingKind::Factory {
+    if !kind.is_factory() {
         return Ok(());
     }
     let half = kind.stats().half;
@@ -213,10 +271,15 @@ fn setup_base(
     // La firma resta per futuri setup scenario; per ora no-op intenzionale.
     let _ = (&mut commands, &scenario, &mut grid, &units);
 }
-fn finish_sites(mut commands: Commands, sites: Query<(Entity, &Construction, &Health)>) {
-    for (entity, site, health) in &sites {
+fn finish_sites(
+    mut commands: Commands,
+    sites: Query<(Entity, &BuildingKind, &Construction, &Health)>,
+) {
+    for (entity, kind, site, health) in &sites {
         if health.current > 0.0 && site.0.complete() {
             commands.entity(entity).remove::<Construction>();
+            // Turrets arm on completion: construction sites hold fire.
+            arm_turret(&mut commands.entity(entity), *kind);
         }
     }
 }

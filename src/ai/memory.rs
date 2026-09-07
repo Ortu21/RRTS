@@ -62,8 +62,9 @@ pub fn update_memory(
 }
 
 /// Contatti freschi (età <= `max_age` tick), i più recenti prima.
-/// Hook per future stime minaccia pesate per età (oggi coperto da test).
-#[allow(dead_code)]
+/// 0.0.16 — API ufficiale (usata da `threat.rs` per pesatura per età e come
+/// riferimento per `AiSnapshot::fresh_troop_memory`, che opera su `AiMemory`
+/// invece che su `Contact`: le due restano allineate per costruzione).
 pub fn fresh_contacts(memory: &[Contact], tick: u64, max_age: u64) -> Vec<&Contact> {
     let mut fresh: Vec<&Contact> = memory
         .iter()
@@ -78,8 +79,10 @@ pub fn fresh_contacts(memory: &[Contact], tick: u64, max_age: u64) -> Vec<&Conta
 }
 
 /// Baricentro dei contatti freschi (meta attacco / conferma scout).
-/// Hook testato per future euristiche di caccia (oggi lo snapshot espone i
-/// ricordi grezzi e la strategia li pesa da sé).
+/// 0.0.16 — API ufficiale: `AiSnapshot::remembered_centroid` ne replica la
+/// matematica su `AiMemory` (lo snapshot espone ricordi grezzi con età, non
+/// `Contact` con tick assoluto). Test incrociato in `strategy::tests`.
+/// Uso diretto da `threat.rs` in 0.0.17 (ora solo test): allow per clippy `-D warnings`.
 #[allow(dead_code)]
 pub fn remembered_centroid(memory: &[Contact], tick: u64, max_age: u64) -> Option<Vec3> {
     let fresh = fresh_contacts(memory, tick, max_age);
@@ -101,7 +104,7 @@ mod tests {
         (
             bits,
             Vec3::new(x, 0.0, 0.0),
-            Some(UnitKind::Tank),
+            Some(UnitKind::HeavyTank),
             tick_hp,
             false,
         )

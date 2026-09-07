@@ -248,7 +248,7 @@ fn validate_guards(
 
 /// Targeting is a service, not a behaviour: it only answers requests from
 /// orders that allow automatic acquisition, and only returns live enemies.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn validate_targets(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
@@ -258,7 +258,10 @@ fn validate_targets(
     weapons: Query<&Weapon>,
     secondary: Query<&SecondaryWeapon>,
     map: Option<Res<VisibilityMap>>,
-    units: Query<(Entity, &Transform, &UnitOrder, &AttackTarget), With<Unit>>,
+    units: Query<
+        (Entity, &Transform, &UnitOrder, &AttackTarget),
+        Or<(With<Unit>, With<crate::structures::Building>)>,
+    >,
     mut queues: Query<&mut UnitOrderQueue>,
 ) {
     for (entity, transform, order, target) in &units {
@@ -370,7 +373,10 @@ fn acquire_targets(
             &AcquisitionRange,
             Option<&AttackTarget>,
         ),
-        (With<Unit>, With<Weapon>),
+        (
+            Or<(With<Unit>, With<crate::structures::Building>)>,
+            With<Weapon>,
+        ),
     >,
     candidates: Query<(&Team, &Health)>,
     mut queues: Query<&mut UnitOrderQueue>,
@@ -550,7 +556,7 @@ fn resolve_behaviour(
             Option<&Builder>,
             Option<&CollisionRadius>,
         ),
-        With<Unit>,
+        Or<(With<Unit>, With<crate::structures::Building>)>,
     >,
     sites: Query<
         (
@@ -888,8 +894,17 @@ fn traverse_turrets(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
     mut units: Query<
-        (&Transform, &UnitKind, &mut TurretYaw, Option<&AttackTarget>),
-        (With<Unit>, With<Weapon>),
+        (
+            &Transform,
+            Option<&UnitKind>,
+            Option<&crate::structures::Turret>,
+            &mut TurretYaw,
+            Option<&AttackTarget>,
+        ),
+        (
+            Or<(With<Unit>, With<crate::structures::Building>)>,
+            With<Weapon>,
+        ),
     >,
 ) {
     use crate::movement::{rotate_toward, yaw_toward};
@@ -899,15 +914,24 @@ fn traverse_turrets(
     if dt <= 0.0 {
         return;
     }
-    for (transform, kind, mut turret, target) in &mut units {
-        let stats = archetype(*kind);
+    for (transform, kind, turret, mut yaw, target) in &mut units {
+        // Traverse rate comes from the unit table or the turret table;
+        // every shooter carries exactly one of the two markers.
+        let traverse = match (kind, turret) {
+            (Some(k), _) => archetype(*k).traverse,
+            (None, Some(_)) => {
+                crate::economy::balance::turret_stats(crate::economy::balance::BuildingKind::Turret)
+                    .map_or(0.0, |s| s.traverse)
+            }
+            (None, None) => 0.0,
+        };
         let body_yaw = transform.rotation.to_euler(EulerRot::YXZ).0;
         let aim = target
             .and_then(|target| grid.position(target.0))
             .filter(|aim| aim.xz().distance_squared(transform.translation.xz()) > f32::EPSILON)
             .map(|aim| yaw_toward(aim - transform.translation))
             .unwrap_or(body_yaw);
-        turret.0 = rotate_toward(turret.0, aim, stats.traverse * dt);
+        yaw.0 = rotate_toward(yaw.0, aim, traverse * dt);
     }
 }
 
@@ -985,15 +1009,19 @@ fn fire_weapons(
             &mut WeaponState,
             &AttackTarget,
             &TurretYaw,
-            &UnitKind,
+            Option<&UnitKind>,
+            Option<&crate::structures::Turret>,
         ),
-        With<Unit>,
+        (
+            Or<(With<Unit>, With<crate::structures::Building>)>,
+            With<Weapon>,
+        ),
     >,
 ) {
     let Some(assets) = assets else {
         return;
     };
-    for (transform, team, weapon, mut state, target, turret, kind) in &mut shooters {
+    for (transform, team, weapon, mut state, target, turret, kind, turret_marker) in &mut shooters {
         if state.remaining > 0.0 {
             continue;
         }
@@ -1007,9 +1035,17 @@ fn fire_weapons(
         }
         // Fire only when the barrel has traversed onto the target: slow
         // turrets genuinely shoot later, fast ones snap-shoot on the move.
-        let stats = crate::units::archetype(*kind);
+        // Tolerance comes from the unit table or the turret table.
+        let tolerance = match (kind, turret_marker) {
+            (Some(k), _) => crate::units::archetype(*k).aim_tolerance,
+            (None, Some(_)) => {
+                crate::economy::balance::turret_stats(crate::economy::balance::BuildingKind::Turret)
+                    .map_or(0.12, |s| s.aim_tolerance)
+            }
+            (None, None) => 0.12,
+        };
         let aim = crate::movement::yaw_toward(target_position - transform.translation);
-        if crate::movement::wrap_angle(aim - turret.0).abs() > stats.aim_tolerance {
+        if crate::movement::wrap_angle(aim - turret.0).abs() > tolerance {
             continue;
         }
         state.remaining = weapon.cooldown;
@@ -1272,7 +1308,7 @@ mod tests {
                 0,
                 Vec3::new(-30.0, 0.8, 0.0),
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let red = app
@@ -1282,7 +1318,7 @@ mod tests {
                 1,
                 Vec3::new(-5.0, 0.8, 0.0),
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         // Warmup activates fog (first 0.25s are open), then 1s blind.
@@ -1318,9 +1354,9 @@ mod tests {
 
     #[test]
     fn spotter_shares_vision_for_long_guns() {
-        // Blue tank at 0, red at 20: beyond the tank's own sight (15) but
-        // inside its gun (18) and acquisition (30). A forward engineer at 12
-        // (sight 22) spots red for the team, so the tank locks a target its
+        // Blue heavy at 0, red at 20: beyond the heavy's own sight (15) but
+        // inside its gun (19) and acquisition (30). A forward engineer at 12
+        // (sight 22) spots red for the team, so the heavy locks a target its
         // own eyes cannot see — without firing out of range.
         let mut app = combat_fog_app();
         let gun = app
@@ -1330,7 +1366,7 @@ mod tests {
                 0,
                 Vec3::new(0.0, 0.8, 0.0),
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let red = app
@@ -1340,7 +1376,7 @@ mod tests {
                 1,
                 Vec3::new(20.0, 0.8, 0.0),
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let _spotter = crate::units::spawn_combat_unit(
@@ -1355,10 +1391,48 @@ mod tests {
             app.update();
         }
         assert!(app.world().get::<AttackTarget>(gun).is_some());
-        // Lock holds (20m inside 18m gun + margin) but no shot can land yet:
-        // red stays healthy until the gun closes in.
+        // Lock holds via team vision (acquisition 30) but 20m is outside the
+        // 19m gun: red stays healthy until the gun closes in.
         let hp = app.world().get::<Health>(red).unwrap().current;
-        assert!((hp - 120.0).abs() < 0.001, "spotted but out of range: {hp}");
+        let full = crate::units::archetype(UnitKind::HeavyTank).max_health;
+        assert!((hp - full).abs() < 0.001, "spotted but out of range: {hp}");
+    }
+
+    #[test]
+    fn turret_holds_and_fires_without_chasing() {
+        use crate::{economy::balance::BuildingKind, structures::spawn_building};
+        let mut app = combat_app();
+        let home = Vec3::ZERO;
+        let turret = spawn_building(
+            &mut app.world_mut().commands(),
+            Team(0),
+            BuildingKind::Turret,
+            home,
+            true,
+        );
+        let enemy = app
+            .world_mut()
+            .spawn(combatant(
+                700,
+                1,
+                Vec3::new(15.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                UnitKind::HeavyTank,
+            ))
+            .id();
+        app.world_mut().flush();
+        let full = crate::units::archetype(UnitKind::HeavyTank).max_health;
+        for _ in 0..120 {
+            app.update();
+        }
+        // Locked and damaged the intruder (turret 12dmg/0.8s vs 170 HP).
+        assert!(app.world().get::<AttackTarget>(turret).is_some());
+        assert!(app.world().get::<Health>(enemy).unwrap().current < full);
+        // ...without ever moving or chasing: no MoveTarget, no Chasing.
+        let at = app.world().get::<Transform>(turret).unwrap().translation;
+        assert!((at - home.with_y(at.y)).length() < 0.01);
+        assert!(app.world().get::<Chasing>(turret).is_none());
+        assert!(app.world().get::<MoveTarget>(turret).is_none());
     }
 
     #[test]
@@ -1371,7 +1445,7 @@ mod tests {
                 0,
                 Vec3::new(0.0, 0.8, 0.0),
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let red = app
@@ -1381,7 +1455,7 @@ mod tests {
                 1,
                 Vec3::new(100.0, 0.8, 0.0),
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         crate::orders::queue_attack(&mut app.world_mut().commands().entity(blue), red);
@@ -1419,7 +1493,7 @@ mod tests {
                 1,
                 Vec3::new(30.0, 0.8, 0.0),
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         app.world_mut()
@@ -1521,7 +1595,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(30.0, 0.8, -40.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let red = app
@@ -1533,7 +1607,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(-60.0, 0.8, -40.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let mover = app
@@ -1545,7 +1619,7 @@ mod tests {
                 UnitOrder::Move {
                     destination: Vec3::new(30.0, 0.8, -30.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
 
@@ -1619,7 +1693,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(if team == 0 { 30.0 } else { -60.0 }, 0.8, -40.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ));
         }
 
@@ -1636,9 +1710,11 @@ mod tests {
                 .count();
             (alive, engaging, projectiles)
         };
+        // Heavies (170 HP) take longer to resolve than the old 120 HP tanks:
+        // 1200 ticks keeps the same "packed melee resolves" bar.
         let mut kills_seen = 0;
         let mut max_projectiles = 0;
-        for tick in 0..800 {
+        for tick in 0..1200 {
             app.update();
             let (_, _, projectiles) = snapshot(&mut app);
             max_projectiles = max_projectiles.max(projectiles);
@@ -1688,7 +1764,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(60.0, 0.8, -40.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let victim = app
@@ -1698,7 +1774,7 @@ mod tests {
                 1,
                 Vec3::new(-10.0, 0.8, -40.0),
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let marcher = app
@@ -1710,7 +1786,7 @@ mod tests {
                 UnitOrder::Move {
                     destination: Vec3::new(60.0, 0.8, 40.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let bystander = app
@@ -1720,7 +1796,7 @@ mod tests {
                 1,
                 Vec3::new(30.0, 0.8, 30.0),
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         for target in [victim, bystander] {
@@ -1812,7 +1888,7 @@ mod tests {
                 UnitOrder::Move {
                     destination: Vec3::new(30.0, 0.8, 60.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         app.world_mut()
@@ -1854,7 +1930,7 @@ mod tests {
                     points: vec![a, b],
                     next: 0,
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         for _ in 0..200 {
@@ -1887,7 +1963,7 @@ mod tests {
                 0,
                 Vec3::new(0.0, 0.8, 60.0),
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let guard = app
@@ -1897,7 +1973,7 @@ mod tests {
                 0,
                 Vec3::new(-30.0, 0.8, 60.0),
                 UnitOrder::Guard { target: ward },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         for _ in 0..900 {
@@ -1955,7 +2031,7 @@ mod tests {
                 0,
                 Vec3::ZERO,
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let guard = app
@@ -1965,7 +2041,7 @@ mod tests {
                 0,
                 Vec3::X * 20.0,
                 UnitOrder::Guard { target: ward },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let threat = app
@@ -1975,7 +2051,7 @@ mod tests {
                 1,
                 Vec3::X * 30.0,
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let decoy = app
@@ -1985,7 +2061,7 @@ mod tests {
                 1,
                 Vec3::X * 100.0,
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         app.world_mut()
@@ -2090,7 +2166,7 @@ mod tests {
                 1,
                 Vec3::new(0.0, 0.8, -20.0),
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         let hunter = app
@@ -2100,7 +2176,7 @@ mod tests {
                 0,
                 Vec3::new(-25.0, 0.8, -20.0),
                 UnitOrder::Attack { target: quarry },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         for _ in 0..30 {
@@ -2129,7 +2205,7 @@ mod tests {
                 0,
                 post,
                 UnitOrder::HoldPosition,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         // Unarmed: marches into holder range and stops 5 units past it.
@@ -2143,7 +2219,7 @@ mod tests {
                 UnitOrder::AttackMove {
                     destination: Vec3::new(-25.0, 0.8, -40.0),
                 },
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         app.world_mut()
@@ -2158,11 +2234,13 @@ mod tests {
                 1,
                 bystander_spot,
                 UnitOrder::Idle,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
 
-        for _ in 0..900 {
+        // Heavies bring 170 HP (was 120) at ~11.5 dps: the unarmed passer
+        // needs a longer exposure to die without any chase.
+        for _ in 0..1200 {
             app.update();
         }
         let world = app.world();
@@ -2185,7 +2263,7 @@ mod tests {
         assert!(idle.distance(bystander_spot) < 0.5);
         assert_eq!(
             world.entity(bystander).get::<Health>().unwrap().current,
-            crate::units::archetype(UnitKind::Tank).max_health
+            crate::units::archetype(UnitKind::HeavyTank).max_health
         );
     }
 

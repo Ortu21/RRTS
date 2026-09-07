@@ -8,7 +8,7 @@
 use crate::{
     combat::Health,
     economy::Economy,
-    fog::VisibilityMap,
+    fog::{FOG_COUNT, VisibilityMap},
     orders::UnitOrder,
     structures::{Building, Construction},
     units::{Team, Unit, UnitKind},
@@ -63,12 +63,15 @@ pub struct AiSnapshot {
     pub tick: u64,
     pub my_units: Vec<AiUnit>,
     pub visible_enemies: Vec<AiEnemy>,
-    #[allow(dead_code)]
+    /// Edifici nemici visibili ora (0.0.16: riesumato, letto da threat map).
     pub visible_enemy_buildings: Vec<AiBuilding>,
     pub my_buildings: Vec<AiBuilding>,
     pub active_site: Option<Entity>,
     /// Ricordi nemici (anche non più visibili), freschi prima.
     pub memory: Vec<AiMemory>,
+    /// 0.0.16 — frazione mappa esplorata dal team (0..1), da `VisibilityMap`.
+    /// Solo osservazione in shadow: `decide()` non la legge ancora.
+    pub explored_pct: f32,
     #[allow(dead_code)]
     pub stock: [f64; 2],
     #[allow(dead_code)]
@@ -110,6 +113,33 @@ impl AiSnapshot {
             .iter()
             .filter(|b| b.kind == kind && !b.under_construction)
             .count()
+    }
+
+    /// 0.0.16 — ricordi freschi non-edifici (stesso filtro di `has_fresh_eyes`).
+    /// L'ordine resta quello dello snapshot (freschi prima): `first()` = il
+    /// più fresco. Puro, Nessuna allocazione oltre il Vec di ref.
+    pub fn fresh_troop_memory(&self, max_age: u64) -> Vec<&AiMemory> {
+        self.memory
+            .iter()
+            .filter(|m| !m.building && m.age_ticks <= max_age)
+            .collect()
+    }
+
+    /// 0.0.16 — baricentro dei ricordi freschi non-edifici (meta attacco /
+    /// conferma scout). Stessa matematica di `memory::remembered_centroid`
+    /// ma su `AiMemory` (snapshot) invece che su `Contact`: i due restano
+    /// allineati per costruzione, test incrociato in `strategy::tests`.
+    /// `None` se nessun ricordo fresco.
+    pub fn remembered_centroid(&self, max_age: u64) -> Option<Vec3> {
+        let fresh = self.fresh_troop_memory(max_age);
+        if fresh.is_empty() {
+            return None;
+        }
+        let mut sum = Vec3::ZERO;
+        for m in &fresh {
+            sum += m.pos;
+        }
+        Some(sum / fresh.len() as f32)
     }
 }
 
@@ -257,6 +287,11 @@ pub fn build_snapshot(
             .cloned()
             .unwrap_or(([0.0, 0.0], [0.0, 0.0], [0.0, 0.0]));
 
+    let explored_pct = map
+        .and_then(|m| m.0.get(&team))
+        .map(|f| f.explored.iter().filter(|c| **c).count() as f32 / FOG_COUNT as f32)
+        .unwrap_or(0.0);
+
     AiSnapshot {
         team,
         tick,
@@ -266,6 +301,7 @@ pub fn build_snapshot(
         my_buildings,
         active_site,
         memory: to_ai_memory(memory),
+        explored_pct,
         stock,
         income,
         demand,
@@ -441,7 +477,13 @@ mod tests {
             100.0,
             100.0,
         )];
-        let enemies = vec![(foe, Vec3::new(150.0, 0.0, 0.0), 0u8, UnitKind::Tank, 100.0)];
+        let enemies = vec![(
+            foe,
+            Vec3::new(150.0, 0.0, 0.0),
+            0u8,
+            UnitKind::HeavyTank,
+            100.0,
+        )];
         let buildings: Vec<(Entity, u8, BuildingKind, Vec3, bool, f32)> = vec![];
         let eco = BTreeMap::new();
         let snap = build_snapshot(1, 1, &units, &enemies, &buildings, &eco, Some(&map), &[]);
@@ -462,7 +504,7 @@ mod tests {
                 a,
                 Vec3::X,
                 1u8,
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
                 UnitOrder::Idle,
                 100.0,
                 100.0,
@@ -480,5 +522,59 @@ mod tests {
         let snap = build_snapshot(1, 5, &units, &[], &[], &BTreeMap::new(), None, &[]);
         assert_eq!(snap.my_units[0].entity, b);
         assert_eq!(snap.my_units[1].entity, a);
+    }
+
+    #[test]
+    fn explored_pct_defaults_zero_without_fog_and_helpers_match_memory() {
+        use super::AiMemory;
+        // Senza fog: 0% esplorato, niente panico.
+        let snap = build_snapshot(1, 5, &[], &[], &[], &BTreeMap::new(), None, &[]);
+        assert!((snap.explored_pct - 0.0).abs() < 1e-6);
+        // Helper freschi/centroide allineati a `memory::remembered_centroid`.
+        let mut snap = AiSnapshot {
+            team: 1,
+            ..Default::default()
+        };
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            age_ticks: 5,
+            kind: Some(UnitKind::HeavyTank),
+            hp: 100.0,
+            building: false,
+        });
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            age_ticks: 10,
+            kind: Some(UnitKind::HeavyTank),
+            hp: 100.0,
+            building: false,
+        });
+        // Edifici esclusi dai freschi-truppa.
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(99.0, 0.0, 99.0),
+            age_ticks: 1,
+            kind: None,
+            hp: 450.0,
+            building: true,
+        });
+        let fresh = snap.fresh_troop_memory(120);
+        assert_eq!(fresh.len(), 2);
+        let centroid = snap.remembered_centroid(120).expect("centroide");
+        assert!((centroid.x - 5.0).abs() < 0.001);
+        assert!(snap.remembered_centroid(0).is_none() || snap.tick == 0);
+        // Solo edifici freschi ma niente truppe → nessun centroide truppe.
+        let mut only_buildings = AiSnapshot {
+            team: 1,
+            ..Default::default()
+        };
+        only_buildings.memory.push(AiMemory {
+            pos: Vec3::ZERO,
+            age_ticks: 1,
+            kind: None,
+            hp: 450.0,
+            building: true,
+        });
+        assert!(only_buildings.fresh_troop_memory(120).is_empty());
+        assert_eq!(only_buildings.remembered_centroid(120), None);
     }
 }

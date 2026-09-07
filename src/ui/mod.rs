@@ -91,7 +91,7 @@ fn update_hud(
     let selected = units.iter().filter(|(selected, _, _)| *selected).count();
     let blue = teams.iter().filter(|team| team.0 == 0).count();
     let red = teams.iter().filter(|team| team.0 != 0).count();
-    let mut by_kind = [0; 5];
+    let mut by_kind = [0; 8];
     for kind in &kinds {
         by_kind[kind.index()] += 1;
     }

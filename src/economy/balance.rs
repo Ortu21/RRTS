@@ -19,7 +19,6 @@ pub const ENGINEER_BUILD_RADIUS: f32 = 16.0;
 /// troops, buildings watch their surroundings. Troops see as far as they
 /// acquire (see sight_range).
 pub const ENGINEER_SIGHT: f32 = 22.0;
-pub const BUILDING_SIGHT: f32 = 26.0;
 pub const STORAGE: [f64; 2] = [1000.0, 1500.0];
 pub const INITIAL_STOCK: [f64; 2] = [400.0, 220.0];
 pub const MAX_QUEUE: usize = 12;
@@ -34,11 +33,31 @@ pub enum BuildingKind {
     Metal,
     Solar,
     Factory,
+    Turret,
+    Wall,
+    LabT2,
 }
 impl BuildingKind {
-    pub const ALL: [Self; 3] = [Self::Metal, Self::Solar, Self::Factory];
+    pub const ALL: [Self; 6] = [
+        Self::Metal,
+        Self::Solar,
+        Self::Factory,
+        Self::Turret,
+        Self::Wall,
+        Self::LabT2,
+    ];
     pub fn stats(self) -> &'static BuildingStats {
         &BUILDINGS[self as usize]
+    }
+    /// Static defenses never act as builders or factories.
+    /// Phase-4 hook: the AI counts these to plan base defense.
+    #[allow(dead_code)]
+    pub fn is_defense(self) -> bool {
+        matches!(self, Self::Turret | Self::Wall)
+    }
+    /// Produces units (tier-gated): the T1 lab and the T2 lab.
+    pub fn is_factory(self) -> bool {
+        matches!(self, Self::Factory | Self::LabT2)
     }
 }
 pub struct BuildingStats {
@@ -48,8 +67,10 @@ pub struct BuildingStats {
     pub health: f32,
     pub half: Vec2,
     pub height: f32,
+    /// Fog sight contributed while alive. Walls are blind (0.0).
+    pub sight: f32,
 }
-pub const BUILDINGS: [BuildingStats; 3] = [
+pub const BUILDINGS: [BuildingStats; 6] = [
     BuildingStats {
         name: "Metal generator",
         cost: Cost {
@@ -60,6 +81,7 @@ pub const BUILDINGS: [BuildingStats; 3] = [
         health: 350.0,
         half: Vec2::new(2.5, 2.5),
         height: 3.0,
+        sight: 26.0,
     },
     BuildingStats {
         name: "Solar panel",
@@ -71,6 +93,7 @@ pub const BUILDINGS: [BuildingStats; 3] = [
         health: 250.0,
         half: Vec2::new(3.0, 2.0),
         height: 1.8,
+        sight: 26.0,
     },
     BuildingStats {
         name: "Vehicle factory",
@@ -82,16 +105,53 @@ pub const BUILDINGS: [BuildingStats; 3] = [
         health: 800.0,
         half: Vec2::new(5.0, 4.0),
         height: 4.0,
+        sight: 26.0,
+    },
+    BuildingStats {
+        name: "Laser turret",
+        cost: Cost {
+            resources: [150.0, 150.0],
+            work: 120.0,
+        },
+        income: [0.0, 0.0],
+        health: 450.0,
+        half: Vec2::new(2.0, 2.0),
+        height: 2.5,
+        sight: 24.0,
+    },
+    BuildingStats {
+        name: "Wall",
+        cost: Cost {
+            resources: [20.0, 0.0],
+            work: 20.0,
+        },
+        income: [0.0, 0.0],
+        health: 700.0,
+        half: Vec2::new(1.0, 1.0),
+        height: 1.5,
+        sight: 0.0,
+    },
+    BuildingStats {
+        name: "Tier-2 laboratory",
+        cost: Cost {
+            resources: [300.0, 300.0],
+            work: 250.0,
+        },
+        income: [0.0, 0.0],
+        health: 900.0,
+        half: Vec2::new(6.0, 5.0),
+        height: 4.5,
+        sight: 26.0,
     },
 ];
-pub const UNIT_COSTS: [Cost; 5] = [
+pub const UNIT_COSTS: [Cost; 8] = [
     Cost {
         resources: [45.0, 100.0],
         work: 60.0,
     },
     Cost {
-        resources: [90.0, 220.0],
-        work: 100.0,
+        resources: [110.0, 260.0],
+        work: 120.0,
     },
     Cost {
         resources: [140.0, 360.0],
@@ -108,7 +168,52 @@ pub const UNIT_COSTS: [Cost; 5] = [
         resources: [70.0, 50.0],
         work: 80.0,
     },
+    // Light tank: cheap MG screening unit.
+    Cost {
+        resources: [60.0, 140.0],
+        work: 80.0,
+    },
+    // Tier-2 heavies: same roles, bigger hulls. Need a LabT2 (see Factory.tier).
+    Cost {
+        resources: [220.0, 520.0],
+        work: 240.0,
+    },
+    Cost {
+        resources: [280.0, 720.0],
+        work: 300.0,
+    },
 ];
 pub fn unit_cost(kind: UnitKind) -> Cost {
     UNIT_COSTS[kind.index()]
+}
+
+/// Static defense gun table (base decente per future torrette: nuovi tipi =
+/// nuove righe + match in `turret_stats`, mai branch nei sistemi combat).
+/// Oggi esiste solo il laser; contraerea/surriscaldamento/upgrade agganciano qui.
+#[derive(Debug, Clone, Copy)]
+pub struct TurretStats {
+    pub range: f32,
+    pub cooldown: f32,
+    pub damage: f32,
+    pub projectile_speed: f32,
+    pub acquisition: f32,
+    pub traverse: f32,
+    pub aim_tolerance: f32,
+}
+
+pub const LASER_TURRET: TurretStats = TurretStats {
+    range: 24.0,
+    cooldown: 0.8,
+    damage: 12.0,
+    projectile_speed: 40.0,
+    acquisition: 30.0,
+    traverse: 3.5,
+    aim_tolerance: 0.12,
+};
+
+pub fn turret_stats(kind: BuildingKind) -> Option<&'static TurretStats> {
+    match kind {
+        BuildingKind::Turret => Some(&LASER_TURRET),
+        _ => None,
+    }
 }

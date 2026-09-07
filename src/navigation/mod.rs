@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-pub const HALF_SIZE: f32 = 200.0;
+pub const HALF_SIZE: f32 = 300.0;
 pub const CELL_SIZE: f32 = 2.5;
 pub const UNIT_CLEARANCE: f32 = 0.8;
 pub const PATHS_PER_FRAME: usize = 128;
@@ -24,10 +24,11 @@ pub const CONGESTION_WEIGHT: f32 = 0.5;
 /// Fixed map seed: obstacle layout is identical every run, on every
 /// platform, so benchmark checksums stay comparable.
 pub const MAP_SEED: u64 = 20260907;
-/// Target obstacle count for the default map.
-pub const MAP_OBSTACLES: usize = 44;
+/// Target obstacle count for the default map. Scales with area to keep
+/// gameplay density constant (44 on 400m -> 100 on 600m).
+pub const MAP_OBSTACLES: usize = 100;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Obstacle {
     pub center: Vec2,
     pub half_size: Vec2,
@@ -66,29 +67,41 @@ fn build_walkable(
     cell_size: f32,
     width: usize,
 ) -> Vec<bool> {
-    let margin = UNIT_CLEARANCE + cell_size * 0.5;
     (0..width * width)
-        .map(|index| {
-            let center = Vec3::new(
-                (index % width) as f32 * cell_size - half_size + cell_size * 0.5,
-                0.0,
-                (index / width) as f32 * cell_size - half_size + cell_size * 0.5,
-            )
-            .xz();
-            obstacles.iter().all(|obstacle| {
-                let delta = (center - obstacle.center).abs();
-                delta.x > obstacle.half_size.x + margin || delta.y > obstacle.half_size.y + margin
-            })
-        })
+        .map(|index| cell_walkable(obstacles, half_size, cell_size, width, index))
         .collect()
+}
+
+/// Single-cell version of [`build_walkable`]: pure over the obstacle set, so
+/// placement probes can recompute just the neighborhood of one extra
+/// obstacle instead of rebuilding the whole grid.
+fn cell_walkable(
+    obstacles: &[Obstacle],
+    half_size: f32,
+    cell_size: f32,
+    width: usize,
+    index: usize,
+) -> bool {
+    let margin = UNIT_CLEARANCE + cell_size * 0.5;
+    let center = Vec3::new(
+        (index % width) as f32 * cell_size - half_size + cell_size * 0.5,
+        0.0,
+        (index / width) as f32 * cell_size - half_size + cell_size * 0.5,
+    )
+    .xz();
+    obstacles.iter().all(|obstacle| {
+        let delta = (center - obstacle.center).abs();
+        delta.x > obstacle.half_size.x + margin || delta.y > obstacle.half_size.y + margin
+    })
 }
 
 /// Key gameplay points (fractions of half size) that must stay walkable and
 /// mutually reachable: team spawns, attack targets, map arteries. Adding a
 /// rect that breaks any of them discards the rect, so generation always
 /// terminates with a connected map.
-fn key_points(half_size: f32) -> [Vec2; 6] {
+fn key_points(half_size: f32) -> [Vec2; 8] {
     let (a, b, c) = (half_size * 0.55, half_size * 0.35, half_size - 10.0);
+    let d = half_size - 40.0;
     [
         Vec2::new(-a, 0.0),
         Vec2::new(a, 0.0),
@@ -96,6 +109,9 @@ fn key_points(half_size: f32) -> [Vec2; 6] {
         Vec2::new(b, 0.0),
         Vec2::new(0.0, -c),
         Vec2::new(0.0, c),
+        // Playground corner spawns (blu SW, rosso NE): protetti come gli altri.
+        Vec2::new(-d, -d),
+        Vec2::new(d, d),
     ]
 }
 
@@ -177,7 +193,7 @@ pub fn generate_obstacles(seed: u64, half_size: f32, target_count: usize) -> Vec
     obstacles
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct NavGrid {
     pub obstacles: Vec<Obstacle>,
     half_size: f32,
@@ -232,13 +248,48 @@ impl NavGrid {
     }
 
     pub fn new(half_size: f32, cell_size: f32, obstacles: Vec<Obstacle>) -> Self {
-        let width = (half_size * 2.0 / cell_size).round() as usize;
-        let walkable = build_walkable(&obstacles, half_size, cell_size, width);
+        let width = (half_size * 2.0 / CELL_SIZE).round() as usize;
+        let walkable = build_walkable(&obstacles, half_size, CELL_SIZE, width);
         Self {
             obstacles,
             half_size,
             cell_size,
             width,
+            walkable,
+        }
+    }
+
+    /// Throwaway clone with one extra obstacle, recomputing walkability only
+    /// in its neighborhood (identical result to a full rebuild, see test).
+    /// Placement validation uses it to path against the grid *as it will
+    /// look once the building exists* — validating on the live grid gives
+    /// false positives when the new footprint seals its own approach.
+    pub fn cloned_with_obstacle(&self, obstacle: Obstacle) -> Self {
+        let mut obstacles = self.obstacles.clone();
+        obstacles.push(obstacle);
+        let mut walkable = self.walkable.clone();
+        let margin = obstacle.half_size
+            + Vec2::splat(UNIT_CLEARANCE + self.cell_size * 0.5 + self.cell_size);
+        let lo = (obstacle.center - margin + Vec2::splat(self.half_size)) / self.cell_size;
+        let hi = (obstacle.center + margin + Vec2::splat(self.half_size)) / self.cell_size;
+        let width = self.width as isize;
+        for row in (lo.y.floor() as isize).max(0)..=(hi.y.ceil() as isize).min(width - 1) {
+            for col in (lo.x.floor() as isize).max(0)..=(hi.x.ceil() as isize).min(width - 1) {
+                let index = row as usize * self.width + col as usize;
+                walkable[index] = cell_walkable(
+                    &obstacles,
+                    self.half_size,
+                    self.cell_size,
+                    self.width,
+                    index,
+                );
+            }
+        }
+        Self {
+            obstacles,
+            half_size: self.half_size,
+            cell_size: self.cell_size,
+            width: self.width,
             walkable,
         }
     }
@@ -826,6 +877,28 @@ fn plan_paths(
 mod tests {
     use super::*;
     #[test]
+    fn cloned_probe_matches_full_rebuild() {
+        let grid = NavGrid::default();
+        // Big building-like obstacle plus a rock-sized one, on and off map.
+        for extra in [
+            Obstacle {
+                center: Vec2::new(20.0, -30.0),
+                half_size: Vec2::new(6.0, 5.0),
+            },
+            Obstacle {
+                center: Vec2::new(-150.0, 120.0),
+                half_size: Vec2::new(1.0, 1.0),
+            },
+        ] {
+            let probe = grid.cloned_with_obstacle(extra);
+            let mut full = grid.obstacles.clone();
+            full.push(extra);
+            let rebuilt = NavGrid::new(grid.half_size, grid.cell_size, full);
+            assert_eq!(probe.walkable, rebuilt.walkable);
+            assert_eq!(probe.obstacles, rebuilt.obstacles);
+        }
+    }
+    #[test]
     fn paths_are_deterministic_and_clear_obstacles() {
         let grid = NavGrid::default();
         // Guaranteed-connected key points (see key_points).
@@ -1016,7 +1089,8 @@ mod tests {
     #[test]
     fn formations_near_edges_and_obstacles_have_unique_free_slots() {
         let grid = NavGrid::default();
-        for center in [Vec3::ZERO, Vec3::new(195.0, 0.0, 195.0)] {
+        let edge = HALF_SIZE - 5.0;
+        for center in [Vec3::ZERO, Vec3::new(edge, 0.0, edge)] {
             let slots = grid.formation(1000, center, 2.5).unwrap();
             assert_eq!(slots.len(), 1000);
             let cells: HashSet<_> = slots.iter().map(|slot| grid.cell(*slot).unwrap()).collect();

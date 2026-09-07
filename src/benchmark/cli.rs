@@ -84,6 +84,12 @@ pub struct Config {
     pub ai_personality: String,
     /// Personalità team blu quando `ai_team == 2` / `ai == both`.
     pub ai_personality2: String,
+    /// AI suite headless (league AI-vs-AI); preset con valore opzionale.
+    pub ai_suite: Option<SuitePreset>,
+    /// Registra la league in benchmarks/history/ai (esplicito, come i benchmark).
+    pub ai_record: bool,
+    /// Batteria scenari L1 (entra in test-suite.sh).
+    pub ai_scenarios: bool,
 }
 
 impl Default for Config {
@@ -111,6 +117,9 @@ impl Default for Config {
             ai_team: 1,
             ai_personality: "turtle".to_owned(),
             ai_personality2: "rusher".to_owned(),
+            ai_suite: None,
+            ai_record: false,
+            ai_scenarios: false,
         }
     }
 }
@@ -143,6 +152,30 @@ impl Config {
                 }
                 "--headless" => config.headless = true,
                 "--skirmish" => config.workload = Workload::Skirmish,
+                "--ai-record" => config.ai_record = true,
+                "--ai-scenarios" => {
+                    config.ai_scenarios = true;
+                    config.benchmark = true;
+                    config.headless = true;
+                }
+                "--ai-suite" => {
+                    config.benchmark = true;
+                    config.headless = true;
+                    if args.peek().is_some_and(|value| !value.starts_with('-')) {
+                        config.ai_suite = Some(match args.next().as_deref() {
+                            Some("quick") => SuitePreset::Quick,
+                            Some("full") => SuitePreset::Full,
+                            Some(value) => {
+                                return Err(format!(
+                                    "Unknown AI suite preset '{value}'; use quick or full"
+                                ));
+                            }
+                            None => unreachable!(),
+                        });
+                    } else {
+                        config.ai_suite = Some(SuitePreset::Quick);
+                    }
+                }
                 "--record-history" => config.record_history = true,
                 "--history-report" => config.history_report = true,
                 "--profile-capture" => config.profile_capture = true,
@@ -218,6 +251,9 @@ impl Config {
         if config.record_history && !config.suite {
             return Err("Benchmark history can only record a complete suite".into());
         }
+        if config.ai_record && config.ai_suite.is_none() {
+            return Err("AI record needs --ai-suite".into());
+        }
         if !["off", "test", "skirmish", "both"].contains(&config.ai.as_str()) {
             return Err("AI mode must be off|test|skirmish|both".into());
         }
@@ -249,6 +285,8 @@ pub const HELP: &str = "Rust RTS v0.0.14 benchmark and profiler\n\
   cargo run --profile benchmark -- --history-report\n\
   ./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600\n\
   ./scripts/profile-visual.sh --units-per-team 2500 --seconds 60\n\
+  cargo run -- --benchmark --headless --ai-suite [quick|full] [--ai-record]\n\
+  cargo run -- --benchmark --headless --ai-scenarios [--output <dir>]\n\
 Separate industry measurement: --economy-benchmark --ticks 1800 --repeats 3\n\
 Options: --workload idle|crossing|crowd|skirmish|guard|ai-test, --units-per-team 1..10000,\n\
          --ticks 60..36000, --repeats 1..10, --seconds 1..600,\n\
@@ -358,5 +396,20 @@ mod tests {
         ] {
             assert!(parse(args).is_err(), "{args:?} should fail");
         }
+    }
+
+    #[test]
+    fn parses_ai_suite_options() {
+        let suite = parse(&["--ai-suite"]).unwrap();
+        assert_eq!(suite.ai_suite, Some(SuitePreset::Quick));
+        assert!(suite.benchmark && suite.headless);
+        assert!(!suite.ai_record && !suite.ai_scenarios);
+        let full = parse(&["--ai-suite", "full", "--ai-record"]).unwrap();
+        assert_eq!(full.ai_suite, Some(SuitePreset::Full));
+        assert!(full.ai_record);
+        let scenarios = parse(&["--ai-scenarios"]).unwrap();
+        assert!(scenarios.ai_scenarios);
+        assert!(parse(&["--ai-suite", "huge"]).is_err());
+        assert!(parse(&["--ai-record"]).is_err());
     }
 }

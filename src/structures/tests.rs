@@ -14,7 +14,15 @@ fn placement_rejects_bounds_obstacles_units_and_invalid_base_rules() {
     let mut grid = NavGrid::new(crate::navigation::HALF_SIZE, 2.5, vec![]);
     let kind = BuildingKind::Solar;
     assert!(valid_ground(&grid, kind, Vec3::ZERO, &[]).is_ok());
-    assert!(valid_ground(&grid, kind, Vec3::X * 199.0, &[]).is_err());
+    assert!(
+        valid_ground(
+            &grid,
+            kind,
+            Vec3::X * (crate::navigation::HALF_SIZE - 1.0),
+            &[]
+        )
+        .is_err()
+    );
     assert!(valid_ground(&grid, kind, Vec3::ZERO, &[(Vec3::X, 0.55)]).is_err());
     grid.replace_dynamic(
         0,
@@ -75,6 +83,71 @@ fn walled_factory_site_is_rejected_but_other_buildings_pass() {
     assert!(factory_spawn_ok(&grid, BuildingKind::Metal, Vec3::ZERO).is_ok());
 }
 #[test]
+fn walls_tile_flush_but_not_into_rock_or_buildings() {
+    let mut grid = NavGrid::new(crate::navigation::HALF_SIZE, 2.5, vec![]);
+    // A standing wall is a nav obstacle like any building...
+    grid.replace_dynamic(
+        0,
+        &[Obstacle {
+            center: Vec2::ZERO,
+            half_size: Vec2::splat(1.0),
+        }],
+    );
+    // ...yet a flush 2m-grid neighbor touches exactly (delta == sum) and
+    // passes for walls only.
+    assert!(valid_ground(&grid, BuildingKind::Wall, Vec3::X * 2.0, &[]).is_ok());
+    // Overlapping, other kinds, and rocks still blocked.
+    assert!(valid_ground(&grid, BuildingKind::Wall, Vec3::X * 1.0, &[]).is_err());
+    assert!(valid_ground(&grid, BuildingKind::Solar, Vec3::X * 2.0, &[]).is_err());
+    let mut rocky = NavGrid::new(crate::navigation::HALF_SIZE, 2.5, vec![]);
+    rocky.replace_dynamic(
+        0,
+        &[Obstacle {
+            center: Vec2::ZERO,
+            half_size: Vec2::new(6.0, 6.0),
+        }],
+    );
+    assert!(valid_ground(&rocky, BuildingKind::Wall, Vec3::X * 2.0, &[]).is_err());
+}
+#[test]
+fn turret_table_and_sights_are_sane() {
+    let gun = turret_stats(BuildingKind::Turret).unwrap();
+    assert!(gun.range > 0.0 && gun.acquisition >= gun.range);
+    assert!(gun.cooldown > 0.0 && gun.damage > 0.0);
+    assert!(turret_stats(BuildingKind::Wall).is_none());
+    assert!(turret_stats(BuildingKind::Factory).is_none());
+    // Turret sees its own gun range; walls are blind.
+    assert_eq!(BuildingKind::Turret.stats().sight, gun.range);
+    assert_eq!(BuildingKind::Wall.stats().sight, 0.0);
+    assert!(BuildingKind::Turret.is_defense() && BuildingKind::Wall.is_defense());
+    assert!(!BuildingKind::Factory.is_defense());
+    assert!(!BuildingKind::Metal.is_defense());
+}
+#[test]
+fn tier_gate_blocks_t2_in_t1_factory() {
+    let mut t1 = Factory::default();
+    assert_eq!(t1.tier, 1);
+    assert!(!t1.enqueue(UnitKind::HeavyTank2));
+    assert!(!t1.enqueue(UnitKind::Artillery2));
+    assert!(t1.enqueue(UnitKind::HeavyTank));
+    let mut t2 = Factory {
+        tier: 2,
+        ..Default::default()
+    };
+    assert!(t2.enqueue(UnitKind::HeavyTank2));
+    assert!(t2.enqueue(UnitKind::Artillery2));
+    // Commander stays out everywhere.
+    assert!(!t2.enqueue(UnitKind::Commander));
+}
+#[test]
+fn labt2_spawns_tier_two_factory() {
+    let mut app = app(0.05);
+    let lab = building(&mut app, 0, BuildingKind::LabT2, Vec3::ZERO, true);
+    assert_eq!(app.world().get::<Factory>(lab).unwrap().tier, 2);
+    let fac = building(&mut app, 0, BuildingKind::Factory, Vec3::X * 40.0, true);
+    assert_eq!(app.world().get::<Factory>(fac).unwrap().tier, 1);
+}
+#[test]
 fn build_grid_snaps_centers_idempotently() {
     // 2m step, XZ only, Y preserved for spawn height.
     assert_eq!(
@@ -132,9 +205,9 @@ fn queues_cancel_without_refund_and_destroyed_factory_stops_spending() {
         .insert(0, Account::default());
     {
         let mut q = app.world_mut().get_mut::<Factory>(f).unwrap();
-        q.enqueue(UnitKind::Tank);
+        q.enqueue(UnitKind::HeavyTank);
         q.enqueue(UnitKind::Scout);
-        q.enqueue(UnitKind::Tank);
+        q.enqueue(UnitKind::HeavyTank);
     }
     app.update();
     let spent = app.world().resource::<Economy>().0[&0].stock;
@@ -159,8 +232,8 @@ fn blocked_product_is_retained_then_spawns_once_with_all_capabilities() {
     let f = building(&mut app, 0, BuildingKind::Factory, Vec3::ZERO, true);
     {
         let mut factory = app.world_mut().get_mut::<Factory>(f).unwrap();
-        factory.enqueue(UnitKind::Tank);
-        factory.queue[0].project.done = unit_cost(UnitKind::Tank).work;
+        factory.enqueue(UnitKind::HeavyTank);
+        factory.queue[0].project.done = unit_cost(UnitKind::HeavyTank).work;
         factory.rally = Some(Vec3::X * 500.0);
     }
     for _ in 0..4 {
@@ -227,7 +300,7 @@ fn produced_unit_attacks_and_destroys_building_without_mobile_components() {
         &mut app.world_mut().commands(),
         id,
         Team(0),
-        UnitKind::Tank,
+        UnitKind::HeavyTank,
         Vec3::X * 12.0,
     );
     app.world_mut().flush();

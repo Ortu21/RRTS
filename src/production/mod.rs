@@ -15,16 +15,32 @@ pub struct Job {
     pub kind: UnitKind,
     pub project: Project,
 }
-#[derive(Component, Default)]
+#[derive(Component)]
 pub struct Factory {
     pub queue: VecDeque<Job>,
     pub rally: Option<Vec3>,
     pub blocked: bool,
+    /// Production tier: 1 = Factory, 2 = LabT2. Queues reject units above it.
+    pub tier: u8,
+}
+impl Default for Factory {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            rally: None,
+            blocked: false,
+            tier: 1,
+        }
+    }
 }
 impl Factory {
     pub fn enqueue(&mut self, kind: UnitKind) -> bool {
         // Il Comandante è unico per team: mai in coda factory.
         if kind.is_commander() {
+            return false;
+        }
+        // Tier gate: le unità T2 escono solo dal LabT2.
+        if units::archetype(kind).tier > self.tier {
             return false;
         }
         if self.queue.len() >= MAX_QUEUE {

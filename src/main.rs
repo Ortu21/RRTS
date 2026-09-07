@@ -72,6 +72,24 @@ fn main() -> std::process::ExitCode {
         };
     }
     if config.headless {
+        if config.ai_suite.is_some() {
+            return match ai::league::run_suite(&config) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
+        if config.ai_scenarios {
+            return match ai::scenarios::run_battery(&config) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
         if config.workload == Workload::AiTest {
             return match ai::harness::run(&config) {
                 Ok(()) => std::process::ExitCode::SUCCESS,

@@ -15,9 +15,12 @@ pub mod debug;
 pub mod director;
 pub mod executor;
 pub mod harness;
+pub mod league;
 pub mod memory;
+pub mod scenarios;
 pub mod snapshot;
 pub mod strategy;
+pub mod threat;
 
 use crate::{
     combat::Health,
@@ -266,24 +269,34 @@ fn ai_tick(
         }
 
         // Rally default per factory complete senza rally (rinforzi autonomi).
+        // Sempre validato+riparato: un rally murato bloccherebbe la factory
+        // per sempre (vedi default_rally), come visto sul lato blu.
         {
             let target = scenario.attack_target(brain.team as usize);
             for (_, team, transform, mut factory) in factories.iter_mut() {
                 if team.0 != brain.team || factory.rally.is_some() {
                     continue;
                 }
-                let dir = (target - transform.translation).normalize_or_zero();
-                factory.rally = Some(transform.translation + dir * 18.0);
+                if let Some(rally) = strategy::default_rally(&grid, transform.translation, target) {
+                    factory.rally = Some(rally);
+                }
             }
         }
 
-        // Code factory del team (entity + len + blocked), ordinate per determinismo.
-        let mut factory_queues: Vec<(Entity, usize, bool)> = factories
+        // Code factory del team (entity + len + blocked + tier + code),
+        // ordinate per determinismo.
+        let mut factory_queues: Vec<strategy::FactoryView> = factories
             .iter()
             .filter(|(_, team, _, _)| team.0 == brain.team)
-            .map(|(e, _, _, f)| (e, f.queue.len(), f.blocked))
+            .map(|(e, _, _, f)| strategy::FactoryView {
+                entity: e,
+                queue_len: f.queue.len(),
+                blocked: f.blocked,
+                tier: f.tier,
+                queued: f.queue.iter().map(|job| job.kind).collect(),
+            })
             .collect();
-        factory_queues.sort_by_key(|(e, _, _)| e.to_bits());
+        factory_queues.sort_by_key(|v| v.entity.to_bits());
 
         let intents = strategy::decide(snapshot, &brain.personality, *scenario, &factory_queues);
         all_intent_labels.extend(intents.iter().map(|i| format!("t{}:{i:?}", brain.team)));

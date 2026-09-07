@@ -59,7 +59,7 @@ pub fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             for e in &factories {
                 let mut f = world.get_mut::<Factory>(*e).unwrap();
                 while f.queue.len() < MAX_QUEUE {
-                    f.enqueue(UnitKind::Tank);
+                    f.enqueue(UnitKind::HeavyTank);
                 }
             }
         };

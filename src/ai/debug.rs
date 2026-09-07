@@ -1,6 +1,7 @@
 //! Overlay debug AI (solo grafico): gizmos 3D + pannello punteggio live +
 //! controllo velocità demo. Headless non monta il plugin: zero costo di misura.
 
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
@@ -188,9 +189,14 @@ fn draw_base_markers(
 }
 
 /// Tasti velocità demo: +/- step, 0 reset 1x, Space pausa/riprendi.
-/// Ignorato senza finestra o senza focus (come gli ordini player).
+/// Ascolta sia i KeyCode fisici (layout-indipendenti ma in posizioni diverse
+/// per layout: su tastiera italiana '-' è sullo Slash fisico e '+' sul
+/// Backslash fisico) sia i caratteri logici ('+', '-', '0'), così funziona su
+/// qualsiasi layout. Applicato una sola volta per frame anche se scattano
+/// entrambi. Ignorato senza finestra o senza focus (come gli ordini player).
 fn ai_speed_keys(
     keys: Res<ButtonInput<KeyCode>>,
+    mut typed: MessageReader<KeyboardInput>,
     window: Option<Single<&Window, With<PrimaryWindow>>>,
     mut speed: ResMut<AiSpeed>,
     mut time: ResMut<Time<Virtual>>,
@@ -202,16 +208,35 @@ fn ai_speed_keys(
     if window.is_some_and(|w| !w.focused) {
         return;
     }
+    let mut typed_up = false;
+    let mut typed_down = false;
+    let mut typed_reset = false;
+    for event in typed.read() {
+        if event.repeat || !event.state.is_pressed() {
+            continue;
+        }
+        if logical_char_pressed(&event.logical_key, &['+', '=']) {
+            typed_up = true;
+        } else if logical_char_pressed(&event.logical_key, &['-', '_']) {
+            typed_down = true;
+        } else if logical_char_pressed(&event.logical_key, &['0']) {
+            typed_reset = true;
+        }
+    }
     let mut changed = false;
-    if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
+    if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) || typed_up {
         speed.step_up();
         changed = true;
-    } else if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
+    } else if keys.just_pressed(KeyCode::Minus)
+        || keys.just_pressed(KeyCode::NumpadSubtract)
+        || typed_down
+    {
         speed.step_down();
         changed = true;
     } else if keys.just_pressed(KeyCode::Digit0)
         || keys.just_pressed(KeyCode::Numpad0)
         || keys.just_pressed(KeyCode::Backspace)
+        || typed_reset
     {
         speed.reset();
         changed = true;
@@ -221,6 +246,15 @@ fn ai_speed_keys(
     }
     if changed {
         time.set_relative_speed(speed.speed());
+    }
+}
+
+/// Carattere logico appena digitato (puro e testabile): `Key::Character`
+/// segue il layout tastiera, mentre `KeyCode` è la posizione fisica del tasto.
+pub fn logical_char_pressed(logical_key: &Key, expected: &[char]) -> bool {
+    match logical_key {
+        Key::Character(text) => text.chars().any(|c| expected.contains(&c)),
+        _ => false,
     }
 }
 
@@ -450,6 +484,26 @@ mod tests {
         speed.toggle_pause();
         speed.step_up();
         assert!((speed.speed() - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn logical_chars_match_any_layout() {
+        // Tastiera italiana: '+'/'-' arrivano come caratteri logici anche se
+        // i KeyCode fisici sono altrove (Backslash/Slash).
+        assert!(logical_char_pressed(
+            &Key::Character("+".into()),
+            &['+', '=']
+        ));
+        assert!(logical_char_pressed(
+            &Key::Character("-".into()),
+            &['-', '_']
+        ));
+        assert!(logical_char_pressed(&Key::Character("0".into()), &['0']));
+        assert!(!logical_char_pressed(
+            &Key::Character("a".into()),
+            &['+', '=']
+        ));
+        assert!(!logical_char_pressed(&Key::Enter, &['+', '=']));
     }
 
     #[test]

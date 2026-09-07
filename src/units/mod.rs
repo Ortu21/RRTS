@@ -143,7 +143,7 @@ pub(crate) fn spawn_units(
         .enumerate()
         .map(|(i, slot)| {
             let kind = match *scenario {
-                Scenario::Benchmark { .. } => UnitKind::Tank,
+                Scenario::Benchmark { .. } => UnitKind::HeavyTank,
                 _ => kind_for_index(team * count + i),
             };
             grid.clear_point_for(slot, archetype(kind).radius)
@@ -155,7 +155,7 @@ pub(crate) fn spawn_units(
             // benchmarks stay uniform tanks so movement numbers remain
             // comparable across versions.
             let kind = match *scenario {
-                Scenario::Benchmark { .. } => UnitKind::Tank,
+                Scenario::Benchmark { .. } => UnitKind::HeavyTank,
                 _ => kind_for_index(global),
             };
             if combat_demo {
@@ -266,7 +266,7 @@ fn setup_visual_assets(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     // One body mesh per archetype (sizes differ); team colors stay shared.
-    let body_meshes: [Handle<Mesh>; 5] = UnitKind::ALL.map(|kind| {
+    let body_meshes: [Handle<Mesh>; 8] = UnitKind::ALL.map(|kind| {
         let half = archetype(kind).body;
         meshes.add(Cuboid::from_size(half * 2.0))
     });
@@ -335,7 +335,7 @@ fn setup_visual_assets(
 }
 #[derive(Resource)]
 struct UnitVisualAssets {
-    body_meshes: [Handle<Mesh>; 5],
+    body_meshes: [Handle<Mesh>; 8],
     materials_by_team: [Handle<StandardMaterial>; 2],
     ring: Handle<Mesh>,
     ring_material: Handle<StandardMaterial>,
@@ -575,10 +575,10 @@ mod tests {
         use crate::units::archetype::{COMMANDER_MISSILES, secondary_stats};
         // Mitra sul primario, missili sul secondario, mai sulle truppe.
         assert!(secondary_stats(UnitKind::Commander).is_some());
-        assert!(secondary_stats(UnitKind::Tank).is_none());
+        assert!(secondary_stats(UnitKind::HeavyTank).is_none());
         let (_, _, _, weapon, _, acquisition, _) = arm_bundle(7, UnitKind::Commander);
         let (secondary, _, _) = secondary_bundle(7, UnitKind::Commander).unwrap();
-        assert!(secondary_bundle(7, UnitKind::Tank).is_none());
+        assert!(secondary_bundle(7, UnitKind::HeavyTank).is_none());
         // Lock unico sul gun più lungo, fuoco gated per gun.
         assert_eq!(
             acquisition.0,
@@ -589,12 +589,12 @@ mod tests {
         assert!(secondary.damage > weapon.damage);
         // Scafo molto grande, builder con raggio.
         let stats = archetype(UnitKind::Commander);
-        assert!(stats.radius > archetype(UnitKind::Tank).radius * 2.0);
+        assert!(stats.radius > archetype(UnitKind::HeavyTank).radius * 2.0);
         assert!(stats.max_health >= 1000.0);
         let builder = builder_bundle(UnitKind::Commander).unwrap();
         assert!((builder.radius - COMMAND_BUILD_RADIUS).abs() < 0.001);
         assert!((builder.power - COMMANDER_BUILD_POWER).abs() < 0.001);
-        assert!(builder_bundle(UnitKind::Tank).is_none());
+        assert!(builder_bundle(UnitKind::HeavyTank).is_none());
         // Engineer: disarmato, mobile, builder leggero producibile.
         let eng = archetype(UnitKind::Engineer);
         assert!(!eng.armed);

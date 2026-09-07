@@ -1,5 +1,7 @@
 pub mod cli;
 pub mod profile;
+// Riusati dalla AI suite (stesso formato metadata/history dei benchmark).
+pub use report::{HISTORY_ROOT, Metadata};
 mod report;
 
 use crate::{

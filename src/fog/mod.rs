@@ -2,8 +2,8 @@
 //!
 //! One [`VisibilityMap`] holds per-team grids over the whole map. Viewers are
 //! units ([`sight_range`](crate::units::archetype::sight_range), normally
-//! shorter than weapon range) and alive buildings
-//! ([`BUILDING_SIGHT`](crate::economy::balance::BUILDING_SIGHT)).
+//! shorter than weapon range) and alive buildings (per-kind
+//! [`sight`](crate::economy::balance::BuildingStats::sight)).
 //! Recomputed 4x/second; `explored` is sticky memory, `visible` is live.
 //!
 //! Rendering (player team only): a single transparent overlay quad dims the
@@ -39,7 +39,6 @@
 
 use crate::{
     combat::Health,
-    economy::balance::BUILDING_SIGHT,
     movement::MovementSystems,
     navigation::HALF_SIZE,
     structures::Building,
@@ -49,7 +48,7 @@ use crate::{
 use bevy::prelude::*;
 use std::collections::BTreeMap;
 
-/// World size of one fog cell: 4m over a 400m map keeps a 100x100 grid that
+/// World size of one fog cell: 4m over a 600m map keeps a 150x150 grid that
 /// a full army re-rasterizes in microseconds at 4Hz.
 pub const FOG_CELL: f32 = 4.0;
 pub const FOG_WIDTH: usize = (HALF_SIZE * 2.0 / FOG_CELL) as usize;
@@ -201,7 +200,15 @@ fn update_fog(
     time: Res<Time>,
     mut acc: Local<f32>,
     units: Query<(&Transform, &Team, &UnitKind, &Health), With<Unit>>,
-    buildings: Query<(&Transform, &Team, &Health), With<Building>>,
+    buildings: Query<
+        (
+            &Transform,
+            &Team,
+            &crate::economy::balance::BuildingKind,
+            &Health,
+        ),
+        With<Building>,
+    >,
     mut map: ResMut<VisibilityMap>,
 ) {
     *acc += time.delta_secs();
@@ -220,9 +227,11 @@ fn update_fog(
             reveal(&mut map, team.0, transform.translation, sight_range(*kind));
         }
     }
-    for (transform, team, health) in &buildings {
+    for (transform, team, kind, health) in &buildings {
+        // Per-kind sight (see BuildingStats): walls are blind, turrets watch
+        // their own gun range.
         if health.current > 0.0 {
-            reveal(&mut map, team.0, transform.translation, BUILDING_SIGHT);
+            reveal(&mut map, team.0, transform.translation, kind.stats().sight);
         }
     }
     for fog in map.0.values_mut() {
@@ -396,8 +405,8 @@ mod tests {
 
     #[test]
     fn grid_geometry_covers_map() {
-        assert_eq!(FOG_WIDTH, 100);
-        assert_eq!(FOG_COUNT, 10_000);
+        assert_eq!(FOG_WIDTH, 150);
+        assert_eq!(FOG_COUNT, 22_500);
         assert!(cell_index(-HALF_SIZE, -HALF_SIZE).is_some());
         assert!(cell_index(HALF_SIZE - 0.1, HALF_SIZE - 0.1).is_some());
         assert!(cell_index(HALF_SIZE + 1.0, 0.0).is_none());
@@ -447,7 +456,7 @@ mod tests {
     #[test]
     fn sight_ranges_come_from_archetypes() {
         use crate::{economy::balance::ENGINEER_SIGHT, units::UnitKind};
-        assert!(sight_range(UnitKind::Commander) >= sight_range(UnitKind::Tank));
+        assert!(sight_range(UnitKind::Commander) >= sight_range(UnitKind::HeavyTank));
         assert!(sight_range(UnitKind::Engineer) > 0.0);
         assert_eq!(sight_range(UnitKind::Engineer), ENGINEER_SIGHT);
     }
@@ -470,7 +479,7 @@ mod tests {
             .spawn((
                 Unit(1),
                 Team(0),
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
                 Transform::from_translation(Vec3::ZERO),
                 Health {
                     current: 120.0,
@@ -483,7 +492,7 @@ mod tests {
             .spawn((
                 Unit(2),
                 Team(1),
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
                 Transform::from_translation(Vec3::X * 100.0),
                 Health {
                     current: 120.0,

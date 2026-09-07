@@ -236,7 +236,7 @@ mod tests {
                     Transform::from_xyz(-55.0, 0.8, 0.0),
                     Movement { speed: 7.0 },
                     MoveTarget(Vec3::new(55.0, 0.0, 0.0)),
-                    UnitKind::Tank,
+                    UnitKind::HeavyTank,
                 ))
                 .id();
             for _ in 0..(4.0 / dt) as usize {
@@ -277,7 +277,7 @@ mod tests {
                 Transform::from_xyz(-55.0, 0.8, 0.0),
                 Movement { speed: 7.0 },
                 MoveTarget(Vec3::new(55.0, 0.0, 0.0)),
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ))
             .id();
         for _ in 0..(2.0 / dt) as usize {
@@ -321,7 +321,7 @@ mod tests {
                 Transform::from_xyz(-55.0, 0.8, 0.0),
                 Movement { speed: 7.0 },
                 MoveTarget(unreachable),
-                UnitKind::Tank,
+                UnitKind::HeavyTank,
             ));
         }
         app.update();

@@ -8,23 +8,31 @@ use bevy::prelude::*;
 pub struct BuildingVisualsPlugin;
 impl Plugin for BuildingVisualsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_assets)
-            .add_systems(PostUpdate, (add_visuals, show_progress).chain());
+        app.add_systems(Startup, setup_assets).add_systems(
+            PostUpdate,
+            (add_visuals, show_progress, aim_building_barrels).chain(),
+        );
     }
 }
 #[derive(Resource)]
 struct BuildingAssets {
-    bodies: [Handle<Mesh>; 3],
-    accents: [Handle<Mesh>; 3],
+    bodies: [Handle<Mesh>; 6],
+    accents: [Handle<Mesh>; 6],
     team: [Handle<StandardMaterial>; 2],
-    detail: [Handle<StandardMaterial>; 3],
+    detail: [Handle<StandardMaterial>; 6],
     site: Handle<StandardMaterial>,
     ring: Handle<Mesh>,
     selected: Handle<StandardMaterial>,
     bar: Handle<Mesh>,
     dark: Handle<StandardMaterial>,
     green: Handle<StandardMaterial>,
+    barrel: Handle<Mesh>,
+    barrel_material: Handle<StandardMaterial>,
 }
+/// Rotating barrel child of a turret: mirrors the simulation-owned
+/// `TurretYaw` exactly like unit barrels (see units aim_turrets).
+#[derive(Component)]
+struct TurretBarrel;
 #[derive(Component)]
 struct BuildingBody;
 fn setup_assets(
@@ -41,6 +49,11 @@ fn setup_assets(
             meshes.add(Cylinder::new(1.0, 2.5)),
             meshes.add(Cuboid::new(5.6, 0.15, 3.6)),
             meshes.add(Cuboid::new(6.0, 3.2, 0.2)),
+            // Turret crown ring; wall cap slab (walls have no accent detail).
+            meshes.add(Cylinder::new(1.4, 0.4)),
+            meshes.add(Cuboid::new(2.0, 0.15, 2.0)),
+            // LabT2 front door, wider than the T1 one.
+            meshes.add(Cuboid::new(7.0, 3.6, 0.2)),
         ],
         team: [
             materials.add(Color::srgb(0.15, 0.45, 0.7)),
@@ -50,6 +63,11 @@ fn setup_assets(
             materials.add(Color::srgb(0.95, 0.62, 0.15)),
             materials.add(Color::srgb(0.06, 0.12, 0.35)),
             materials.add(Color::srgb(0.06, 0.08, 0.09)),
+            // Hot orange for the laser crown, dark steel for walls,
+            // cold blue for the T2 lab door.
+            materials.add(Color::srgb(1.0, 0.45, 0.1)),
+            materials.add(Color::srgb(0.25, 0.25, 0.28)),
+            materials.add(Color::srgb(0.2, 0.5, 0.9)),
         ],
         site: materials.add(Color::srgb(0.5, 0.4, 0.2)),
         ring: meshes.add(Annulus::new(0.94, 1.0)),
@@ -67,6 +85,17 @@ fn setup_assets(
         green: materials.add(StandardMaterial {
             base_color: Color::srgb(0.25, 0.85, 0.3),
             unlit: true,
+            ..default()
+        }),
+        barrel: meshes.add(
+            Cuboid::new(0.35, 0.3, 1.6)
+                .mesh()
+                .build()
+                .translated_by(Vec3::new(0.0, 0.0, -0.5)),
+        ),
+        barrel_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.12, 0.12, 0.14),
+            unlit: false,
             ..default()
         }),
     });
@@ -89,12 +118,12 @@ fn add_visuals(
                     MeshMaterial3d(assets.team[team.0 as usize % 2].clone()),
                     Transform::default(),
                 ));
-                let accent_y = if *kind == BuildingKind::Factory {
+                let accent_y = if kind.is_factory() {
                     -0.2
                 } else {
                     s.height * 0.5 + 0.5
                 };
-                let accent_z = if *kind == BuildingKind::Factory {
+                let accent_z = if kind.is_factory() {
                     s.half.y + 0.03
                 } else {
                     0.0
@@ -125,7 +154,37 @@ fn add_visuals(
                     MeshMaterial3d(assets.green.clone()),
                     Transform::from_xyz(0.0, s.height * 0.5 + 2.0, 0.011),
                 ));
+                // Laser barrel on turrets only: tracks TurretYaw (see
+                // aim_building_barrels below), like unit barrels do.
+                if *kind == BuildingKind::Turret {
+                    p.spawn((
+                        TurretBarrel,
+                        Mesh3d(assets.barrel.clone()),
+                        MeshMaterial3d(assets.barrel_material.clone()),
+                        Transform::from_xyz(0.0, s.height * 0.5 + 0.4, 0.0),
+                    ));
+                }
             });
+    }
+}
+
+/// Building barrel aim, visual-only: mirrors the simulation-owned
+/// `TurretYaw` onto the turret's barrel child. Simulation never reads it
+/// back, so determinism is untouched. Headless runs spawn no barrels.
+#[allow(clippy::type_complexity)]
+fn aim_building_barrels(
+    turrets: Query<(&Transform, &crate::combat::TurretYaw), With<super::Turret>>,
+    mut barrels: Query<(&ChildOf, &mut Transform), (With<TurretBarrel>, Without<super::Turret>)>,
+) {
+    use crate::movement::wrap_angle;
+    for (parent, mut transform) in &mut barrels {
+        let Ok((body, yaw)) = turrets.get(parent.parent()) else {
+            continue;
+        };
+        let body_yaw = body.rotation.to_euler(EulerRot::YXZ).0;
+        let pos = transform.translation;
+        transform.rotation = Quat::from_rotation_y(wrap_angle(yaw.0 - body_yaw));
+        transform.translation = pos;
     }
 }
 fn show_progress(

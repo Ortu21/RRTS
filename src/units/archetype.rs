@@ -12,25 +12,39 @@ use bevy::prelude::*;
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnitKind {
     Scout,
-    Tank,
+    HeavyTank,
     Artillery,
     Commander,
     Engineer,
+    LightTank,
+    HeavyTank2,
+    Artillery2,
 }
 
 impl UnitKind {
-    pub const ALL: [UnitKind; 5] = [
+    pub const ALL: [UnitKind; 8] = [
         Self::Scout,
-        Self::Tank,
+        Self::HeavyTank,
         Self::Artillery,
         Self::Commander,
         Self::Engineer,
+        Self::LightTank,
+        Self::HeavyTank2,
+        Self::Artillery2,
     ];
     /// Units buildable from factories. The Commander is unique: it spawns
     /// once per team as the initial builder/base and is never queued.
     /// The Engineer is the mobile builder, produced by the laboratory.
-    pub const PRODUCIBLE: [UnitKind; 4] =
-        [Self::Scout, Self::Tank, Self::Artillery, Self::Engineer];
+    /// Tier-2 units need a LabT2 (see `Archetype.tier` + `Factory.tier`).
+    pub const PRODUCIBLE: [UnitKind; 7] = [
+        Self::Scout,
+        Self::HeavyTank,
+        Self::Artillery,
+        Self::Engineer,
+        Self::LightTank,
+        Self::HeavyTank2,
+        Self::Artillery2,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -71,9 +85,11 @@ pub struct Archetype {
     pub build_power: f64,
     /// Radius enabling placement. 0 for troops.
     pub build_radius: f32,
+    /// Production tier: 1 = Factory, 2 = LabT2 (see `Factory.tier`).
+    pub tier: u8,
 }
 
-pub const ARCHETYPES: [Archetype; 5] = [
+pub const ARCHETYPES: [Archetype; 8] = [
     Archetype {
         name: "scout",
         max_health: 60.0,
@@ -92,25 +108,27 @@ pub const ARCHETYPES: [Archetype; 5] = [
         armed: true,
         build_power: 0.0,
         build_radius: 0.0,
+        tier: 1,
     },
     Archetype {
-        name: "tank",
-        max_health: 120.0,
-        speed: 7.0,
-        hull_turn: 2.8,
-        traverse: 3.0,
+        name: "heavy_tank",
+        max_health: 170.0,
+        speed: 5.2,
+        hull_turn: 2.4,
+        traverse: 2.6,
         aim_tolerance: 0.14,
-        range: 18.0,
-        cooldown: 1.0,
-        damage: 10.0,
+        range: 19.0,
+        cooldown: 1.3,
+        damage: 15.0,
         projectile_speed: 30.0,
         acquisition: 30.0,
         sight: 15.0,
-        body: Vec3::new(0.55, 0.8, 0.55),
-        radius: 0.55,
+        body: Vec3::new(0.65, 0.9, 0.65),
+        radius: 0.6,
         armed: true,
         build_power: 0.0,
         build_radius: 0.0,
+        tier: 1,
     },
     Archetype {
         name: "artillery",
@@ -130,6 +148,7 @@ pub const ARCHETYPES: [Archetype; 5] = [
         armed: true,
         build_power: 0.0,
         build_radius: 0.0,
+        tier: 1,
     },
     Archetype {
         name: "commander",
@@ -150,6 +169,7 @@ pub const ARCHETYPES: [Archetype; 5] = [
         armed: true,
         build_power: crate::economy::balance::COMMANDER_BUILD_POWER,
         build_radius: crate::economy::balance::COMMAND_BUILD_RADIUS,
+        tier: 1,
     },
     Archetype {
         name: "engineer",
@@ -169,6 +189,67 @@ pub const ARCHETYPES: [Archetype; 5] = [
         armed: false,
         build_power: crate::economy::balance::ENGINEER_BUILD_POWER,
         build_radius: crate::economy::balance::ENGINEER_BUILD_RADIUS,
+        tier: 1,
+    },
+    Archetype {
+        name: "light_tank",
+        max_health: 70.0,
+        speed: 10.0,
+        hull_turn: 4.0,
+        traverse: 4.5,
+        aim_tolerance: 0.17,
+        range: 13.0,
+        cooldown: 0.45,
+        damage: 4.0,
+        projectile_speed: 34.0,
+        acquisition: 28.0,
+        sight: 12.0,
+        body: Vec3::new(0.45, 0.6, 0.5),
+        radius: 0.45,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "heavy_tank2",
+        max_health: 272.0,
+        speed: 5.2,
+        hull_turn: 2.4,
+        traverse: 2.6,
+        aim_tolerance: 0.14,
+        range: 21.9,
+        cooldown: 1.3,
+        damage: 24.0,
+        projectile_speed: 30.0,
+        acquisition: 32.0,
+        sight: 16.0,
+        body: Vec3::new(0.8, 1.05, 0.8),
+        radius: 0.7,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 2,
+    },
+    Archetype {
+        name: "artillery2",
+        max_health: 128.0,
+        speed: 4.5,
+        hull_turn: 1.6,
+        traverse: 1.8,
+        aim_tolerance: 0.10,
+        range: 34.5,
+        cooldown: 3.0,
+        damage: 40.0,
+        projectile_speed: 26.0,
+        acquisition: 40.0,
+        sight: 26.0,
+        body: Vec3::new(0.85, 1.05, 1.05),
+        radius: 0.75,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 2,
     },
 ];
 
@@ -215,12 +296,13 @@ pub fn archetype(kind: UnitKind) -> &'static Archetype {
     &ARCHETYPES[kind.index()]
 }
 
-/// Deterministic force composition: tank-heavy round robin shared by the
+/// Deterministic force composition: heavy-front round robin shared by the
 /// playground demo and the skirmish benchmark, so both fight the same war.
 pub fn kind_for_index(index: usize) -> UnitKind {
     match index % 10 {
-        0..=5 => UnitKind::Tank,
-        6..=8 => UnitKind::Scout,
+        0..=4 => UnitKind::HeavyTank,
+        5..=7 => UnitKind::LightTank,
+        8 => UnitKind::Scout,
         _ => UnitKind::Artillery,
     }
 }
@@ -265,19 +347,29 @@ mod tests {
     }
 
     #[test]
-    fn composition_is_deterministic_and_tank_heavy() {
+    fn composition_is_deterministic_and_heavy_front() {
         let kinds: Vec<_> = (0..100).map(kind_for_index).collect();
         assert_eq!(kinds, (0..100).map(kind_for_index).collect::<Vec<_>>());
         assert_eq!(
-            kinds.iter().filter(|kind| **kind == UnitKind::Tank).count(),
-            60
+            kinds
+                .iter()
+                .filter(|kind| **kind == UnitKind::HeavyTank)
+                .count(),
+            50
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == UnitKind::LightTank)
+                .count(),
+            30
         );
         assert_eq!(
             kinds
                 .iter()
                 .filter(|kind| **kind == UnitKind::Scout)
                 .count(),
-            30
+            10
         );
         assert_eq!(
             kinds
@@ -291,11 +383,13 @@ mod tests {
     #[test]
     fn kinds_handle_differently_by_design() {
         let scout = archetype(UnitKind::Scout);
-        let tank = archetype(UnitKind::Tank);
+        let light = archetype(UnitKind::LightTank);
+        let heavy = archetype(UnitKind::HeavyTank);
         let artillery = archetype(UnitKind::Artillery);
-        assert!(scout.speed > tank.speed && tank.speed > artillery.speed);
-        assert!(artillery.range > tank.range && tank.range > scout.range);
-        assert!(artillery.damage > tank.damage && tank.damage > scout.damage);
-        assert!(scout.traverse > artillery.traverse);
+        assert!(scout.speed > light.speed && light.speed > heavy.speed);
+        assert!(heavy.speed > artillery.speed);
+        assert!(artillery.range > heavy.range && heavy.range > light.range);
+        assert!(artillery.damage > heavy.damage && heavy.damage > light.damage);
+        assert!(light.traverse > artillery.traverse);
     }
 }

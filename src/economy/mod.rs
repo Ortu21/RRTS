@@ -182,7 +182,14 @@ struct Request {
 fn tick(
     mut economy: ResMut<Economy>,
     buildings: Query<
-        (Entity, &Team, &BuildingKind, &Transform, &Health, Has<Construction>),
+        (
+            Entity,
+            &Team,
+            &BuildingKind,
+            &Transform,
+            &Health,
+            Has<Construction>,
+        ),
         With<Building>,
     >,
     mut projects: Query<&mut Construction>,

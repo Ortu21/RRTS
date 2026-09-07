@@ -259,12 +259,9 @@ mod tests {
         }
         // Builders: commander heavy, engineer light and mobile.
         assert!(
-            archetype(UnitKind::Commander).build_power
-                > archetype(UnitKind::Engineer).build_power
+            archetype(UnitKind::Commander).build_power > archetype(UnitKind::Engineer).build_power
         );
-        assert!(
-            archetype(UnitKind::Engineer).speed > archetype(UnitKind::Commander).speed
-        );
+        assert!(archetype(UnitKind::Engineer).speed > archetype(UnitKind::Commander).speed);
     }
 
     #[test]

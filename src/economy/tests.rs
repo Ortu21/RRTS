@@ -182,13 +182,8 @@ fn fractional_final_tick_charges_only_remaining_work() {
 }
 
 fn spawn_unit(app: &mut App, id: u32, team: u8, kind: UnitKind, at: Vec3) -> Entity {
-    let entity = crate::units::spawn_combat_unit(
-        &mut app.world_mut().commands(),
-        id,
-        Team(team),
-        kind,
-        at,
-    );
+    let entity =
+        crate::units::spawn_combat_unit(&mut app.world_mut().commands(), id, Team(team), kind, at);
     app.world_mut().flush();
     entity
 }
@@ -221,7 +216,10 @@ fn build_power_sums_builders_and_stalls_when_they_die() {
     assert!(app.world().get::<crate::combat::Weapon>(cmd).is_some());
     // Kill team 0 builders: construction stalls, team 1 unaffected.
     for e in [cmd, eng] {
-        app.world_mut().get_mut::<crate::combat::Health>(e).unwrap().current = 0.0;
+        app.world_mut()
+            .get_mut::<crate::combat::Health>(e)
+            .unwrap()
+            .current = 0.0;
     }
     for _ in 0..5 {
         app.update();
@@ -257,7 +255,11 @@ fn tasked_builder_marches_to_standoff_then_builds_and_pauses_when_moved() {
     for _ in 0..400 {
         app.update();
     }
-    assert!(app.world().get::<crate::movement::MoveTarget>(eng).is_none());
+    assert!(
+        app.world()
+            .get::<crate::movement::MoveTarget>(eng)
+            .is_none()
+    );
     assert!(matches!(
         app.world().get::<crate::orders::UnitOrder>(eng),
         Some(crate::orders::UnitOrder::Build { .. })
@@ -266,10 +268,7 @@ fn tasked_builder_marches_to_standoff_then_builds_and_pauses_when_moved() {
     assert!(working.done > 0.0);
     close(working.speed, crate::economy::balance::ENGINEER_BUILD_POWER);
     // Manual move away replaces Build: the site pauses.
-    queue_move(
-        &mut app.world_mut().commands().entity(eng),
-        Vec3::X * 100.0,
-    );
+    queue_move(&mut app.world_mut().commands().entity(eng), Vec3::X * 100.0);
     app.world_mut().flush();
     for _ in 0..400 {
         app.update();

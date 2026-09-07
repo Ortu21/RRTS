@@ -36,6 +36,15 @@ pub fn flat_distance(a: Vec3, b: Vec3) -> f32 {
     a.xz().distance(b.xz())
 }
 
+/// Skip radius for stale intermediate waypoints. General for every
+/// locomotion kind (tanks and tank-like bipeds steer identically): a freshly
+/// planned route can still open with a waypoint under the hull (replan
+/// quantization, crowd shove, float rounding). Steering at a point closer
+/// than this reads as a backward step plus a wrong-way hull flip. Waypoints
+/// inside the radius are advanced past before facing/translation; the final
+/// goal is never skipped so arrival still snaps exactly.
+pub const WAYPOINT_SKIP_RADIUS: f32 = 1.0;
+
 /// A plain move order: march to the destination, firing at enemies on the
 /// way without ever stopping or chasing. Replaces any other intent and
 /// drops temporary combat state plus the queue (plain click replaces).
@@ -66,6 +75,12 @@ fn move_units(
         let turn_rate = crate::units::archetype(*kind).hull_turn;
         match route {
             Some(mut route) => {
+                while route.next + 1 < route.points.len()
+                    && flat_distance(transform.translation, route.points[route.next])
+                        < WAYPOINT_SKIP_RADIUS
+                {
+                    route.next += 1;
+                }
                 let mut remaining = movement.speed * dt;
                 while route.next < route.points.len() {
                     let destination = route.points[route.next].with_y(transform.translation.y);
@@ -245,6 +260,56 @@ mod tests {
                     < 0.001
             );
         }
+    }
+    #[test]
+    fn lateral_retarget_never_steps_backwards() {
+        // Regression for the visible "micro passo indietro": a unit marching
+        // east, re-tasked laterally, must monotonically close on the new
+        // goal instead of dipping back to its start-cell center (which also
+        // flips the hull the wrong way for a few frames). General for every
+        // locomotion kind: tanks and bipeds share the same tank-like
+        // steering, so one kinematic rule covers both.
+        let dt = 1.0 / 60.0;
+        let mut app = simulation(dt);
+        let entity = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(-55.0, 0.8, 0.0),
+                Movement { speed: 7.0 },
+                MoveTarget(Vec3::new(55.0, 0.0, 0.0)),
+                UnitKind::Tank,
+            ))
+            .id();
+        for _ in 0..(2.0 / dt) as usize {
+            app.update();
+        }
+        let pos = app.world().get::<Transform>(entity).unwrap().translation;
+        // Lateral goal: clearly ahead-sideways from the march direction.
+        let goal = Vec3::new(pos.x + 10.0, 0.0, 20.0);
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(MoveTarget(goal))
+            .remove::<Route>();
+        let mut previous = f32::MAX;
+        let mut first = true;
+        for _ in 0..(8.0 / dt) as usize {
+            app.update();
+            let current = app.world().get::<Transform>(entity).unwrap().translation;
+            let remaining = super::flat_distance(current, goal);
+            if app.world().get::<MoveTarget>(entity).is_none() {
+                assert!(remaining < 0.001, "arrival must snap exactly");
+                break;
+            }
+            if !first {
+                assert!(
+                    remaining <= previous + 0.01,
+                    "backtrack: distance grew {previous:.3} -> {remaining:.3}"
+                );
+            }
+            first = false;
+            previous = remaining;
+        }
+        assert!(app.world().get::<MoveTarget>(entity).is_none());
     }
     #[test]
     fn planning_is_bounded_and_failures_stop_units() {

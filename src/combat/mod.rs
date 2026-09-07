@@ -273,69 +273,69 @@ fn validate_targets(
         });
         let valid = seen
             && match target_position(&grid, target.0)
-            .and_then(|_| health.get(target.0).ok())
-            .filter(|health| !is_dead(health))
-            .and(teams.get(target.0).ok())
-        {
-            Some(target_team) => {
-                let own_team = teams.get(entity).ok();
-                match (own_team, order) {
-                    (
-                        Some(own),
-                        UnitOrder::AttackMove { .. }
-                        | UnitOrder::Move { .. }
-                        | UnitOrder::Patrol { .. }
-                        | UnitOrder::Guard { .. }
-                        | UnitOrder::Build { .. },
-                    ) if own.is_enemy(*target_team) => {
-                        // Leash: drop targets left far behind (marching past)
-                        // or chased far outside acquisition.
-                        match (ranges.get(entity).ok(), target_position(&grid, target.0)) {
-                            (Some(range), Some(target_position)) => {
-                                let leash = range.0 * LEASH_MULTIPLIER;
-                                transform.translation.distance_squared(target_position)
-                                    <= leash * leash
-                                    && match order {
-                                        UnitOrder::Guard { target: ward } => {
-                                            grid.position(*ward).is_some_and(|ward_position| {
-                                                ward_position.distance_squared(target_position)
-                                                    <= leash * leash
-                                            })
+                .and_then(|_| health.get(target.0).ok())
+                .filter(|health| !is_dead(health))
+                .and(teams.get(target.0).ok())
+            {
+                Some(target_team) => {
+                    let own_team = teams.get(entity).ok();
+                    match (own_team, order) {
+                        (
+                            Some(own),
+                            UnitOrder::AttackMove { .. }
+                            | UnitOrder::Move { .. }
+                            | UnitOrder::Patrol { .. }
+                            | UnitOrder::Guard { .. }
+                            | UnitOrder::Build { .. },
+                        ) if own.is_enemy(*target_team) => {
+                            // Leash: drop targets left far behind (marching past)
+                            // or chased far outside acquisition.
+                            match (ranges.get(entity).ok(), target_position(&grid, target.0)) {
+                                (Some(range), Some(target_position)) => {
+                                    let leash = range.0 * LEASH_MULTIPLIER;
+                                    transform.translation.distance_squared(target_position)
+                                        <= leash * leash
+                                        && match order {
+                                            UnitOrder::Guard { target: ward } => {
+                                                grid.position(*ward).is_some_and(|ward_position| {
+                                                    ward_position.distance_squared(target_position)
+                                                        <= leash * leash
+                                                })
+                                            }
+                                            _ => true,
                                         }
-                                        _ => true,
-                                    }
+                                }
+                                _ => true,
                             }
-                            _ => true,
                         }
-                    }
-                    (Some(own), UnitOrder::Attack { target: ordered })
-                        if own.is_enemy(*target_team) && target.0 == *ordered =>
-                    {
-                        true
-                    }
-                    (Some(own), UnitOrder::HoldPosition | UnitOrder::Idle)
-                        if own.is_enemy(*target_team) =>
-                    {
-                        // Static defenders never close distance: keep the lock
-                        // while ANY gun reaches (plus margin). Dual-gun units
-                        // hold missile locks beyond mitra range.
-                        match (weapons.get(entity).ok(), target_position(&grid, target.0)) {
-                            (Some(weapon), Some(target_position)) => {
-                                let reach = secondary
-                                    .get(entity)
-                                    .ok()
-                                    .map_or(weapon.range, |s| weapon.range.max(s.range));
-                                transform.translation.distance(target_position)
-                                    <= reach * HOLD_MARGIN
+                        (Some(own), UnitOrder::Attack { target: ordered })
+                            if own.is_enemy(*target_team) && target.0 == *ordered =>
+                        {
+                            true
+                        }
+                        (Some(own), UnitOrder::HoldPosition | UnitOrder::Idle)
+                            if own.is_enemy(*target_team) =>
+                        {
+                            // Static defenders never close distance: keep the lock
+                            // while ANY gun reaches (plus margin). Dual-gun units
+                            // hold missile locks beyond mitra range.
+                            match (weapons.get(entity).ok(), target_position(&grid, target.0)) {
+                                (Some(weapon), Some(target_position)) => {
+                                    let reach = secondary
+                                        .get(entity)
+                                        .ok()
+                                        .map_or(weapon.range, |s| weapon.range.max(s.range));
+                                    transform.translation.distance(target_position)
+                                        <= reach * HOLD_MARGIN
+                                }
+                                _ => true,
                             }
-                            _ => true,
                         }
+                        _ => false,
                     }
-                    _ => false,
                 }
-            }
-            None => false,
-        };
+                None => false,
+            };
         if !valid {
             commands.entity(entity).remove::<AttackTarget>();
             if matches!(order, UnitOrder::Attack { .. }) {
@@ -574,7 +574,8 @@ fn resolve_behaviour(
         holding,
         builder,
         body,
-    ) in &units {
+    ) in &units
+    {
         // Stale markers strand units (executors filter on them), so clear
         // them the moment the lock is gone, for every order uniformly.
         if target.is_none() && (chasing || holding) {
@@ -656,8 +657,7 @@ fn resolve_behaviour(
                         commands.entity(entity).remove::<(MoveTarget, Route)>();
                     }
                 } else if move_target.is_none_or(|current| {
-                    crate::movement::flat_distance(current.0, ward_position)
-                        > CHASE_REPLAN_DISTANCE
+                    crate::movement::flat_distance(current.0, ward_position) > CHASE_REPLAN_DISTANCE
                 }) {
                     commands
                         .entity(entity)
@@ -691,21 +691,17 @@ fn resolve_behaviour(
                     }
                 } else {
                     let body_radius = body.map_or(0.5, |r| r.0);
-                    let approach = nav.as_ref().map_or(
-                        site_transform.translation,
-                        |nav| {
-                            crate::structures::site_approach(
-                                nav,
-                                site_transform.translation,
-                                transform.translation,
-                                site_kind.stats().half,
-                                body_radius,
-                            )
-                        },
-                    );
+                    let approach = nav.as_ref().map_or(site_transform.translation, |nav| {
+                        crate::structures::site_approach(
+                            nav,
+                            site_transform.translation,
+                            transform.translation,
+                            site_kind.stats().half,
+                            body_radius,
+                        )
+                    });
                     if move_target.is_none_or(|current| {
-                        crate::movement::flat_distance(current.0, approach)
-                            > CHASE_REPLAN_DISTANCE
+                        crate::movement::flat_distance(current.0, approach) > CHASE_REPLAN_DISTANCE
                     }) {
                         commands
                             .entity(entity)
@@ -1077,8 +1073,7 @@ fn fire_secondary(
         }
         state.remaining = weapon.cooldown;
         // Missiles launch higher off the hull so the two muzzles read apart.
-        let muzzle = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos()) * 2.2
-            + Vec3::Y * 1.6;
+        let muzzle = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos()) * 2.2 + Vec3::Y * 1.6;
         commands.spawn((
             Projectile {
                 target: target.0,
@@ -1430,7 +1425,10 @@ mod tests {
         app.world_mut()
             .entity_mut(commander)
             .insert(secondary_bundle(500, UnitKind::Commander).unwrap())
-            .insert((Commander, crate::units::builder_bundle(UnitKind::Commander).unwrap()))
+            .insert((
+                Commander,
+                crate::units::builder_bundle(UnitKind::Commander).unwrap(),
+            ))
             .insert(AttackTarget(target));
         // Cooldown azzerati + turret allineate: isola il gating di range.
         // (Il bundle desynca il primo colpo fino a 2.5s, il test gira 0.5s.)

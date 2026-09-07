@@ -8,9 +8,8 @@ use crate::{
     production::Factory,
     selection::{Selected, SelectionSystems},
     structures::{self, Building, Construction, Placement},
-    units::{
-        Builder, CollisionRadius, PLAYER_TEAM, Team, Unit, UnitKind, archetype,
-    },
+    units::{Builder, CollisionRadius, Team, Unit, UnitKind, archetype},
+    view::ViewState,
 };
 use bevy::{prelude::*, transform::TransformSystems, window::PrimaryWindow};
 
@@ -32,9 +31,11 @@ enum Action {
     Produce(UnitKind),
     Cancel(usize),
     CancelSite,
+    ViewTeam(u8),
+    ToggleFog,
 }
-/// Marker on the three BASE CONSTRUCTION buttons: shown only while a player
-/// builder (Commander/Engineer) is selected — click builder, menu appears.
+/// Marker on the three BASE CONSTRUCTION buttons: shown only while a builder
+/// of the viewed team (Commander/Engineer) is selected — click builder, menu appears.
 #[derive(Component)]
 struct BuildButton;
 #[derive(Component)]
@@ -49,13 +50,24 @@ struct QueueLabel(usize);
 struct FactoryPanel;
 #[derive(Component)]
 struct SiteButton;
+/// Dynamic labels of the VIEW / FOG buttons (text follows `ViewState`).
+#[derive(Component)]
+struct ViewTeamLabel(u8);
+#[derive(Component)]
+struct FogLabel;
 pub struct IndustryUiPlugin;
 impl Plugin for IndustryUiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup)
+        app.init_resource::<ViewState>()
+            .add_systems(Startup, setup)
             .add_systems(
                 PostUpdate,
-                (capture_pointer, actions, placement_and_rally)
+                (
+                    capture_pointer,
+                    actions,
+                    set_factory_rally,
+                    placement_and_rally,
+                )
                     .chain()
                     .in_set(MapInputSystems)
                     .after(TransformSystems::Propagate)
@@ -137,19 +149,62 @@ fn setup(mut commands: Commands) {
                         .with_children(|p| { p.spawn((QueueLabel(i), Text::default(), font(13.0))); });
                 }
             });
+            // Team impersonation + fog spectator toggle. Builders of the
+            // viewed team task from this same panel (see update_text).
+            p.spawn((Text::new("VIEW & FOG"), font(18.0)));
+            for team in [0u8, 1u8] {
+                p.spawn((
+                    Button,
+                    BlocksMap,
+                    Action::ViewTeam(team),
+                    Node {
+                        padding: UiRect::all(px(7)),
+                        min_height: px(30),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.14, 0.23, 0.29)),
+                ))
+                .with_children(|p| {
+                    p.spawn((ViewTeamLabel(team), Text::default(), font(14.0)));
+                });
+            }
+            p.spawn((
+                Button,
+                BlocksMap,
+                Action::ToggleFog,
+                Node {
+                    padding: UiRect::all(px(7)),
+                    min_height: px(30),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.14, 0.23, 0.29)),
+            ))
+            .with_children(|p| {
+                p.spawn((FogLabel, Text::default(), font(14.0)));
+            });
         });
 }
 fn capture_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
-    placement: Res<Placement>,
+    mut placement: ResMut<Placement>,
     interactions: Query<&Interaction, With<BlocksMap>>,
     mut input: ResMut<MapInput>,
+    match_result: Option<Res<crate::game_over::MatchResult>>,
 ) {
-    let over = interactions.iter().any(|i| *i != Interaction::None);
-    if over && (mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Right)) {
+    // Partita finita: solo R (restart) resta attivo — preview scartato e tutto muto.
+    if match_result.is_some_and(|r| r.over) {
+        placement.kind = None;
+        placement.builders.clear();
+        input.blocked = true;
+        input.captured = false;
+        return;
+    }
+    let pointer = interactions.iter().any(|i| *i != Interaction::None);
+    if pointer && (mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Right))
+    {
         input.captured = true;
     }
-    input.blocked = over || input.captured || placement.kind.is_some();
+    input.blocked = pointer || input.captured || placement.kind.is_some();
     if !mouse.pressed(MouseButton::Left) && !mouse.pressed(MouseButton::Right) {
         input.captured = false;
     }
@@ -160,20 +215,23 @@ fn actions(
     buttons: Query<(&Interaction, &Action), (Changed<Interaction>, With<Button>)>,
     selected: Query<(Entity, &Team, Has<Construction>), (With<Selected>, With<Building>)>,
     selected_builders: Query<(Entity, &Team), (With<Selected>, With<Unit>, With<Builder>)>,
+    all_selected: Query<Entity, With<Selected>>,
     mut factories: Query<&mut Factory>,
     mut placement: ResMut<Placement>,
     mut pending: ResMut<PendingOrder>,
     mut input: ResMut<MapInput>,
+    mut view: ResMut<ViewState>,
 ) {
     let selected = selected
         .iter()
-        .filter(|(_, t, _)| **t == PLAYER_TEAM)
+        .filter(|(_, t, _)| t.0 == view.team)
         .min_by_key(|r| r.0.to_bits());
     // Builders tasked by this placement: frozen at button press, march on
-    // confirm. Deterministic order for multi-selection.
+    // confirm. Deterministic order for multi-selection. Any builder kind
+    // (Commander / Engineer) of the viewed team can construct.
     let mut tasked: Vec<Entity> = selected_builders
         .iter()
-        .filter(|(_, t)| **t == PLAYER_TEAM)
+        .filter(|(_, t)| t.0 == view.team)
         .map(|(e, _)| e)
         .collect();
     tasked.sort_by_key(|e| e.to_bits());
@@ -183,12 +241,38 @@ fn actions(
         }
         input.blocked = true;
         match *action {
+            Action::ViewTeam(team) => {
+                if view.team != team {
+                    view.team = team;
+                    // Stale selection belongs to the other team: clear it so
+                    // orders can never leak across teams on view switch.
+                    for entity in &all_selected {
+                        commands.entity(entity).remove::<Selected>();
+                    }
+                    placement.kind = None;
+                    placement.builders.clear();
+                    placement.message = format!(
+                        "Now playing as {} — select its builders to construct",
+                        ViewState::team_name(team)
+                    );
+                    *pending = PendingOrder::None;
+                }
+                continue;
+            }
+            Action::ToggleFog => {
+                view.fog_on = !view.fog_on;
+                placement.message = if view.fog_on {
+                    "Fog ON — honest view of your team".into()
+                } else {
+                    "Fog OFF — spectator: everything visible".into()
+                };
+                continue;
+            }
             Action::Build(kind) => {
                 if tasked.is_empty() {
                     placement.kind = None;
                     placement.builders.clear();
-                    placement.message =
-                        "Select a builder first (Commander / Engineer)".into();
+                    placement.message = "Select a builder first (Commander / Engineer)".into();
                     continue;
                 }
                 placement.kind = Some(kind);
@@ -266,17 +350,25 @@ fn placement_and_rally(
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
     mut placement: ResMut<Placement>,
     input: Res<MapInput>,
-    pending: Res<PendingOrder>,
     grid: Res<crate::navigation::NavGrid>,
     buildings: Query<
         (&Team, &BuildingKind, &Transform, Has<Construction>, &Health),
         With<Building>,
     >,
-    builders: Query<(Entity, &Team, &Transform, &Builder, &CollisionRadius, &Health), With<Unit>>,
+    builders: Query<
+        (
+            Entity,
+            &Team,
+            &Transform,
+            &Builder,
+            &CollisionRadius,
+            &Health,
+        ),
+        With<Unit>,
+    >,
     units: Query<(&Transform, &CollisionRadius), With<Unit>>,
-    mut factories: Query<(&Team, &mut Factory), (With<Selected>, Without<Construction>)>,
-    selected_units: Query<(), (With<Unit>, With<Selected>)>,
     interactions: Query<&Interaction, With<BlocksMap>>,
+    view: Res<ViewState>,
     mut gizmos: Gizmos,
 ) {
     if !window.focused {
@@ -312,14 +404,13 @@ fn placement_and_rally(
             .filter(|(_, _, _, _, _, h)| h.current > 0.0)
             .map(|(e, t, p, b, r, _)| (e, *t, p.translation, b.radius, b.power, r.0))
             .collect();
-        let live_builders: Vec<_> =
-            live.iter().map(|(_, t, p, r, _, _)| (*t, *p, *r)).collect();
+        let live_builders: Vec<_> = live.iter().map(|(_, t, p, r, _, _)| (*t, *p, *r)).collect();
         // Tasked builders still alive: only these march on confirm. If they
         // all died mid-preview the placement is dead too — re-task, no
         // silent fallback to other builders.
         let mut tasked: Vec<_> = live
             .iter()
-            .filter(|(e, t, _, _, _, _)| *t == PLAYER_TEAM && placement.builders.contains(e))
+            .filter(|(e, t, _, _, _, _)| t.0 == view.team && placement.builders.contains(e))
             .map(|(e, _, p, r, _, body)| (*e, p.xz().distance(point.xz()), *r, *p, *body))
             .collect();
         tasked.sort_by(|a, b| {
@@ -327,18 +418,26 @@ fn placement_and_rally(
                 .then_with(|| a.0.to_bits().cmp(&b.0.to_bits()))
         });
         let occupied: Vec<_> = units.iter().map(|(p, r)| (p.translation, r.0)).collect();
-        let mut valid = structures::placement_rule(PLAYER_TEAM, point, &base, &live_builders)
-            .and_then(|()| structures::valid_ground(&grid, kind, point, &occupied));
+        let mut valid = structures::placement_rule(Team(view.team), point, &base, &live_builders)
+            .and_then(|()| structures::valid_ground(&grid, kind, point, &occupied))
+            .and_then(|()| structures::factory_spawn_ok(&grid, kind, point));
         if tasked.is_empty() && valid.is_ok() {
             valid = Err("Tasked builders lost — pick builders and retry");
         }
         placement.message = match (&valid, tasked.first()) {
             (Ok(()), Some((_, dist, radius, _, _))) if *dist <= *radius => {
-                format!("VALID cell ({:.0}, {:.0}): {} tasked builder(s) in range — left-click to place", point.x, point.z, tasked.len())
+                format!(
+                    "VALID cell ({:.0}, {:.0}): {} tasked builder(s) in range — left-click to place",
+                    point.x,
+                    point.z,
+                    tasked.len()
+                )
             }
             (Ok(()), Some((_, dist, radius, _, _))) => format!(
                 "VALID cell ({:.0}, {:.0}): {} tasked builder(s), nearest {dist:.0}m away (range {radius:.0}m) — march on confirm",
-                point.x, point.z, tasked.len()
+                point.x,
+                point.z,
+                tasked.len()
             ),
             (Ok(()), None) => "VALID".into(), // unreachable: empty tasked is INVALID
             (Err(reason), _) => format!("INVALID: {reason}"),
@@ -359,7 +458,7 @@ fn placement_and_rally(
             color,
         );
         for (team, p, radius) in &live_builders {
-            if *team == PLAYER_TEAM {
+            if team.0 == view.team {
                 gizmos.circle(
                     Isometry3d::new(
                         p.with_y(0.15),
@@ -378,7 +477,8 @@ fn placement_and_rally(
             && valid.is_ok()
         {
             // Validation is computed here on the confirming click from live entities.
-            let site = structures::spawn_building(&mut commands, PLAYER_TEAM, kind, point, false);
+            let site =
+                structures::spawn_building(&mut commands, Team(view.team), kind, point, false);
             // Every tasked builder takes an explicit Build order on the site
             // (multi-selection): resolve marches the out-of-range ones to a
             // stand-off and holds them there. Already-in-range ones just hold.
@@ -388,24 +488,54 @@ fn placement_and_rally(
                 crate::orders::queue_build(&mut commands.entity(*entity), site);
             }
             placement.message = if en_route > 0 {
-                format!("Construction placed. {en_route} builder(s) en route, work starts on arrival.")
+                format!(
+                    "Construction placed. {en_route} builder(s) en route, work starts on arrival."
+                )
             } else {
                 "Construction started. Cancellation gives NO REFUND.".into()
             };
             placement.kind = None;
             placement.builders.clear();
         }
-    } else if !input.blocked
-        && *pending == PendingOrder::None
-        && selected_units.is_empty()
-        && mouse.just_pressed(MouseButton::Right)
-        && grid.has_clearance(point)
-        && grid.is_walkable(point)
+    }
+}
+
+/// Rally factory con right-click sul terreno libero: solo se nessuna unità è
+/// selezionata (click sul vuoto) e una factory del team visto lo è. Sistema
+/// separato da `placement_and_rally`: Bevy accetta max 16 param per sistema.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn set_factory_rally(
+    mouse: Res<ButtonInput<MouseButton>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    grid: Res<crate::navigation::NavGrid>,
+    input: Res<MapInput>,
+    pending: Res<PendingOrder>,
+    view: Res<ViewState>,
+    selected_units: Query<(), (With<Unit>, With<Selected>)>,
+    mut factories: Query<(&Team, &mut Factory), (With<Selected>, Without<Construction>)>,
+) {
+    if !window.focused
+        || input.blocked
+        || *pending != PendingOrder::None
+        || !selected_units.is_empty()
+        || !mouse.just_pressed(MouseButton::Right)
     {
-        for (team, mut factory) in &mut factories {
-            if *team == PLAYER_TEAM {
-                factory.rally = Some(point);
-            }
+        return;
+    }
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let (camera, transform) = *camera;
+    let Some(point) = ground_position(camera, transform, cursor) else {
+        return;
+    };
+    if !grid.has_clearance(point) || !grid.is_walkable(point) {
+        return;
+    }
+    for (team, mut factory) in &mut factories {
+        if team.0 == view.team {
+            factory.rally = Some(point);
         }
     }
 }
@@ -413,6 +543,7 @@ fn placement_and_rally(
 fn update_text(
     economy: Res<Economy>,
     placement: Res<Placement>,
+    view: Res<ViewState>,
     selected: Query<
         (
             Entity,
@@ -448,8 +579,21 @@ fn update_text(
         (&Action, &mut Node, &Interaction, &mut BackgroundColor),
         (With<Button>, Without<FactoryPanel>, Without<SiteButton>),
     >,
+    // VIEW + FOG in un'unica query (Bevy accetta max 16 param per sistema).
+    // I Without escludono gli altri possessori di Text: senza, Bevy va in
+    // panic B0001 (&mut Text ambiguo) al primo frame grafico.
+    mut view_buttons: Query<
+        (&mut Text, Option<&ViewTeamLabel>, Option<&FogLabel>),
+        (
+            Or<(With<ViewTeamLabel>, With<FogLabel>)>,
+            Without<QueueLabel>,
+            Without<ResourceText>,
+            Without<BaseText>,
+            Without<ContextText>,
+        ),
+    >,
 ) {
-    if let Some(account) = economy.0.get(&0) {
+    if let Some(account) = economy.0.get(&view.team) {
         let lines: Vec<_> = ["METAL", "ENERGY"]
             .iter()
             .enumerate()
@@ -478,13 +622,13 @@ fn update_text(
     // live builder count — per-site speed lives in the selection panel.
     let alive: usize = builders
         .iter()
-        .filter(|(_, t, _, h)| **t == PLAYER_TEAM && h.current > 0.0)
+        .filter(|(_, t, _, h)| t.0 == view.team && h.current > 0.0)
         .count();
     let tasked_selected: usize = selected_builders
         .iter()
-        .filter(|(_, t, _, _, _, _)| **t == PLAYER_TEAM)
+        .filter(|(_, t, _, _, _, _)| t.0 == view.team)
         .count();
-    let availability = if sites.iter().any(|t| *t == PLAYER_TEAM) {
+    let availability = if sites.iter().any(|t| t.0 == view.team) {
         format!("BUSY: one site already active / builders alive: {alive}")
     } else if alive == 0 {
         "STALLED: no builders alive — protect Commander / build Engineer".into()
@@ -498,8 +642,8 @@ fn update_text(
     let mut factory = None;
     let mut site_selected = false;
     let description = if let Some((_, team, kind, health, site, industry)) = selected {
-        site_selected = site.is_some() && *team == PLAYER_TEAM;
-        factory = industry.filter(|_| site.is_none() && *team == PLAYER_TEAM);
+        site_selected = site.is_some() && team.0 == view.team;
+        factory = industry.filter(|_| site.is_none() && team.0 == view.team);
         let activity = if let Some(site) = site {
             format!(
                 "Construction {:.1}% / {:.1} work/s\n{}",
@@ -604,7 +748,7 @@ fn update_text(
             };
         }
         // Contextual builder menu: structure buttons appear only while a
-        // player builder is selected — click builder, menu appears.
+        // builder of the viewed team is selected — click builder, menu appears.
         if matches!(action, Action::Build(_)) {
             node.display = if tasked_selected > 0 {
                 Display::Flex
@@ -617,5 +761,79 @@ fn update_text(
             Interaction::Hovered => Color::srgb(0.21, 0.34, 0.39),
             Interaction::None => Color::srgb(0.14, 0.23, 0.29),
         };
+    }
+    // VIEW / FOG buttons follow ViewState: active team highlighted.
+    for (mut text, view_marker, fog_marker) in &mut view_buttons {
+        if let Some(marker) = view_marker {
+            let active = marker.0 == view.team;
+            text.set_if_neq(Text::new(format!(
+                "{} {}{}",
+                if active { ">" } else { " " },
+                ViewState::team_name(marker.0),
+                if active { " (you)" } else { "" }
+            )));
+        } else if fog_marker.is_some() {
+            text.set_if_neq(Text::new(format!(
+                "Fog: {}",
+                if view.fog_on { "ON" } else { "OFF" }
+            )));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        camera::CameraPlugin,
+        economy::Economy,
+        navigation::{NavGrid, NavigationStats},
+        orders::PendingOrder,
+        scenario::Scenario,
+    };
+    use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, window::PrimaryWindow};
+
+    /// Regression test B0001: avvia davvero l'intero plugin grafico UI.
+    /// Query `&mut Text` ambigue fanno panic al primo frame (solo l'app vera
+    /// le eseguiva: `cargo test` da solo non le toccava mai).
+    #[test]
+    fn industry_plugin_boots_and_ticks_without_access_conflicts() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(FrameTimeDiagnosticsPlugin::default())
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .add_plugins(bevy::gizmos::GizmoPlugin)
+            .add_plugins(bevy::input::InputPlugin)
+            .insert_resource(Scenario::Playground)
+            .insert_resource(Economy::default())
+            .insert_resource(Placement::default())
+            .init_resource::<PendingOrder>()
+            .init_resource::<NavigationStats>()
+            .init_resource::<NavGrid>()
+            .init_resource::<MapInput>()
+            .init_asset::<Mesh>()
+            .init_asset::<bevy::render::mesh::skinning::SkinnedMeshInverseBindposes>()
+            .add_plugins((CameraPlugin, IndustryUiPlugin));
+        // Finestra fittizia per i Single<&Window>: basta l'entità.
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app.finish();
+        app.cleanup();
+        // Startup (spawn testi/pulsanti) + frame che eseguono tutti i sistemi:
+        // con un conflitto B0001 questo va in panic qui, non in produzione.
+        for _ in 0..5 {
+            app.update();
+        }
+        // I pulsanti VIEW/FOG esistono con le label iniziali (team blu, fog ON).
+        let view = app.world().resource::<ViewState>();
+        assert_eq!(view.team, 0);
+        assert!(view.fog_on);
+        let labels: Vec<String> = app
+            .world_mut()
+            .query::<&Text>()
+            .iter(app.world())
+            .map(|t| t.0.clone())
+            .collect();
+        assert!(labels.iter().any(|t| t.contains("BLUE")));
+        assert!(labels.iter().any(|t| t.contains("Fog: ON")));
     }
 }

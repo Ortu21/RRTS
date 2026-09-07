@@ -4,7 +4,8 @@ use crate::{
     camera::RtsCamera,
     orders::PendingOrder,
     picking::ray_box_distance,
-    units::{PLAYER_TEAM, Selectable, SelectionRing, Team, UNIT_HALF_SIZE},
+    units::{Selectable, SelectionRing, Team, UNIT_HALF_SIZE},
+    view::ViewState,
 };
 
 pub struct SelectionPlugin;
@@ -12,6 +13,7 @@ pub struct SelectionPlugin;
 impl Plugin for SelectionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DragSelection>()
+            .init_resource::<ViewState>()
             .add_systems(Startup, setup_rectangle)
             .add_systems(
                 PostUpdate,
@@ -75,6 +77,7 @@ fn select_units(
     mut drag: ResMut<DragSelection>,
     pending: Res<PendingOrder>,
     input: Res<crate::ui::industry::MapInput>,
+    view: Res<ViewState>,
 ) {
     if input.blocked {
         drag.start = None;
@@ -128,11 +131,9 @@ fn select_units(
                 units
                     .iter()
                     // Fog: concealed enemies are not clickable.
-                    .filter(|(_, _, _, _, _, vis)| {
-                        vis.is_none_or(|v| *v != Visibility::Hidden)
-                    })
+                    .filter(|(_, _, _, _, _, vis)| vis.is_none_or(|v| *v != Visibility::Hidden))
                     .filter(|(_, _, team, _, footprint, _)| {
-                        **team == PLAYER_TEAM || footprint.is_some()
+                        team.0 == view.team || footprint.is_some()
                     })
                     .filter_map(|(entity, transform, _, _, footprint, _)| {
                         ray_box_distance(
@@ -148,7 +149,7 @@ fn select_units(
     };
     for (entity, transform, team, selected, footprint, _) in &units {
         let hit = if drag.dragging {
-            *team == PLAYER_TEAM
+            team.0 == view.team
                 && footprint.is_none()
                 && camera
                     .world_to_viewport(camera_transform, transform.translation())

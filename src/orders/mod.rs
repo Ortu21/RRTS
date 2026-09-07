@@ -9,7 +9,8 @@ use crate::{
     navigation::{NavGrid, Route},
     picking::{ground_position, ray_box_distance},
     selection::{Selected, SelectionSystems},
-    units::{Builder, PLAYER_TEAM, Team, UNIT_HALF_SIZE, Unit},
+    units::{Builder, Team, UNIT_HALF_SIZE, Unit},
+    view::ViewState,
 };
 
 pub struct OrderPlugin;
@@ -18,6 +19,7 @@ impl Plugin for OrderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(FormationSettings { spacing: 2.5 })
             .init_resource::<PendingOrder>()
+            .init_resource::<ViewState>()
             .init_resource::<crate::ui::industry::MapInput>()
             .add_plugins(lines::LinesPlugin)
             .add_systems(
@@ -74,18 +76,31 @@ pub const MAX_PATROL_POINTS: usize = 16;
 #[derive(Component, Debug, Clone, PartialEq)]
 pub enum UnitOrder {
     Idle,
-    Move { destination: Vec3 },
-    Attack { target: Entity },
-    AttackMove { destination: Vec3 },
+    Move {
+        destination: Vec3,
+    },
+    Attack {
+        target: Entity,
+    },
+    AttackMove {
+        destination: Vec3,
+    },
     HoldPosition,
-    Patrol { points: Vec<Vec3>, next: usize },
-    Guard { target: Entity },
+    Patrol {
+        points: Vec<Vec3>,
+        next: usize,
+    },
+    Guard {
+        target: Entity,
+    },
     /// Build a construction site: march to a stand-off at the footprint
     /// edge, hold and trickle work while the site is incomplete. Only
     /// builders carrying this order (or guarding one that does) contribute
     /// power — standing in range is not enough. Any other order replaces it,
     /// so moving the builder away pauses the site.
-    Build { site: Entity },
+    Build {
+        site: Entity,
+    },
 }
 
 /// Behaviour rule: which orders may acquire enemies on their own.
@@ -152,11 +167,18 @@ fn issue_move_order(
         With<crate::units::Selectable>,
     >,
     builder_units: Query<Entity, (With<Unit>, With<Builder>)>,
-    build_sites: Query<Entity, (With<crate::structures::Building>, With<crate::structures::Construction>)>,
+    build_sites: Query<
+        Entity,
+        (
+            With<crate::structures::Building>,
+            With<crate::structures::Construction>,
+        ),
+    >,
     settings: Res<FormationSettings>,
     grid: Res<NavGrid>,
     mut pending: ResMut<PendingOrder>,
     mut queues: Query<&mut UnitOrderQueue>,
+    view: Res<ViewState>,
 ) {
     if !window.focused || selected.is_empty() {
         return;
@@ -182,7 +204,7 @@ fn issue_move_order(
             .iter()
             // Fog: concealed enemies cannot be focus-fired.
             .filter(|(_, _, _, _, vis)| vis.is_none_or(|v| *v != Visibility::Hidden))
-            .filter(|(_, _, team, _, _)| team.0 != PLAYER_TEAM.0)
+            .filter(|(_, _, team, _, _)| team.0 != view.team)
             .filter_map(|(entity, transform, _, footprint, _)| {
                 ray_box_distance(
                     &ray,
@@ -214,7 +236,7 @@ fn issue_move_order(
         // so the click still marches instead of being swallowed.
         let wards: Vec<_> = enemies
             .iter()
-            .filter(|(_, _, team, footprint, _)| team.0 == PLAYER_TEAM.0 && footprint.is_none())
+            .filter(|(_, _, team, footprint, _)| team.0 == view.team && footprint.is_none())
             .map(|(entity, transform, _, _, _)| (entity, transform.translation()))
             .collect();
         if let Some(ward) = pick_enemy_target(&ray, &wards) {
@@ -245,7 +267,7 @@ fn issue_move_order(
         // ground move so the click still marches instead of being swallowed.
         let site_hits: Vec<_> = enemies
             .iter()
-            .filter(|(_, _, team, footprint, _)| team.0 == PLAYER_TEAM.0 && footprint.is_some())
+            .filter(|(_, _, team, footprint, _)| team.0 == view.team && footprint.is_some())
             .filter_map(|(entity, transform, _, footprint, _)| {
                 ray_box_distance(
                     &ray,
@@ -370,6 +392,7 @@ fn issue_pending_guard(
     selected: Query<Entity, (With<Selected>, With<Unit>)>,
     friendlies: Query<(Entity, &GlobalTransform, &Team), With<Unit>>,
     mut pending: ResMut<PendingOrder>,
+    view: Res<ViewState>,
 ) {
     if *pending != PendingOrder::Guard {
         return;
@@ -390,7 +413,7 @@ fn issue_pending_guard(
     };
     let wards: Vec<_> = friendlies
         .iter()
-        .filter(|(_, _, team)| team.0 == PLAYER_TEAM.0)
+        .filter(|(_, _, team)| team.0 == view.team)
         .map(|(entity, transform, _)| (entity, transform.translation()))
         .collect();
     let Some(ward) = pick_enemy_target(&ray, &wards) else {

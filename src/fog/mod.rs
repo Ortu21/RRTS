@@ -43,7 +43,8 @@ use crate::{
     movement::MovementSystems,
     navigation::HALF_SIZE,
     structures::Building,
-    units::{PLAYER_TEAM, Team, Unit, UnitKind, archetype::sight_range},
+    units::{Team, Unit, UnitKind, archetype::sight_range},
+    view::ViewState,
 };
 use bevy::prelude::*;
 use std::collections::BTreeMap;
@@ -71,6 +72,7 @@ pub struct FogPlugin {
 impl Plugin for FogPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<VisibilityMap>()
+            .init_resource::<ViewState>()
             .add_systems(Update, update_fog.after(MovementSystems));
         if self.render {
             app.add_systems(Startup, setup_overlay)
@@ -133,7 +135,10 @@ impl VisibilityMap {
     /// for unknown teams: false (AI sees nothing there).
     pub fn visible(&self, team: u8, pos: Vec3) -> bool {
         cell_index(pos.x, pos.z)
-            .and_then(|i| self.fog(team).map(|f| f.visible.get(i).copied().unwrap_or(false)))
+            .and_then(|i| {
+                self.fog(team)
+                    .map(|f| f.visible.get(i).copied().unwrap_or(false))
+            })
             .unwrap_or(false)
     }
 
@@ -142,7 +147,10 @@ impl VisibilityMap {
     #[allow(dead_code)]
     pub fn explored(&self, team: u8, pos: Vec3) -> bool {
         cell_index(pos.x, pos.z)
-            .and_then(|i| self.fog(team).map(|f| f.explored.get(i).copied().unwrap_or(false)))
+            .and_then(|i| {
+                self.fog(team)
+                    .map(|f| f.explored.get(i).copied().unwrap_or(false))
+            })
             .unwrap_or(false)
     }
 }
@@ -171,9 +179,11 @@ fn reveal(map: &mut VisibilityMap, team: u8, at: Vec3, range: f32) {
     let fog = map.0.entry(team).or_default();
     fog.ensure();
     let lo_col = (((at.x - range + HALF_SIZE) / FOG_CELL).floor() as isize).max(0);
-    let hi_col = (((at.x + range + HALF_SIZE) / FOG_CELL).ceil() as isize).min(FOG_WIDTH as isize - 1);
+    let hi_col =
+        (((at.x + range + HALF_SIZE) / FOG_CELL).ceil() as isize).min(FOG_WIDTH as isize - 1);
     let lo_row = (((at.z - range + HALF_SIZE) / FOG_CELL).floor() as isize).max(0);
-    let hi_row = (((at.z + range + HALF_SIZE) / FOG_CELL).ceil() as isize).min(FOG_WIDTH as isize - 1);
+    let hi_row =
+        (((at.z + range + HALF_SIZE) / FOG_CELL).ceil() as isize).min(FOG_WIDTH as isize - 1);
     let range_sq = range * range;
     for row in lo_row..=hi_row {
         for col in lo_col..=hi_col {
@@ -222,22 +232,25 @@ fn update_fog(
     }
 }
 
-/// Hide enemy units/buildings the player team cannot currently see. Own team
-/// is always shown. Component churn is minimal: only transitions write.
+/// Hide enemy units/buildings the viewed team cannot currently see. Own team
+/// is always shown. With fog OFF (spectator) everything stays visible:
+/// AI honesty is unaffected (AI reads `VisibilityMap`, never this).
+/// Component churn is minimal: only transitions write.
 #[allow(clippy::type_complexity)]
 fn conceal_unseen(
     mut commands: Commands,
     map: Res<VisibilityMap>,
+    view: Res<ViewState>,
     mut hidden: Query<
         (Entity, &Transform, &Team, Option<&mut Visibility>),
         Or<(With<Unit>, With<Building>)>,
     >,
 ) {
     for (entity, transform, team, visibility) in &mut hidden {
-        if *team == PLAYER_TEAM {
+        if team.0 == view.team {
             continue;
         }
-        let seen = map.visible(PLAYER_TEAM.0, transform.translation);
+        let seen = !view.fog_on || map.visible(view.team, transform.translation);
         let want = if seen {
             Visibility::Inherited
         } else {
@@ -325,16 +338,26 @@ fn setup_overlay(
     commands.insert_resource(FogOverlay { mesh });
 }
 
-/// Recolor overlay vertices from team-0 fog: vertex (col,row) maps cell
-/// (col,row) clamped to the grid, so the mapping is exact by construction.
-fn refresh_overlay(map: Res<VisibilityMap>, overlay: Res<FogOverlay>, mut meshes: ResMut<Assets<Mesh>>) {
-    let Some(fog) = map.0.get(&PLAYER_TEAM.0) else {
-        return;
-    };
+/// Recolor overlay vertices from the viewed team's fog: vertex (col,row)
+/// maps cell (col,row) clamped to the grid, so the mapping is exact by
+/// construction. With fog OFF the overlay goes fully transparent.
+fn refresh_overlay(
+    map: Res<VisibilityMap>,
+    view: Res<ViewState>,
+    overlay: Res<FogOverlay>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     let Some(mut mesh) = meshes.get_mut(&overlay.mesh) else {
         return;
     };
     let n = FOG_WIDTH + 1;
+    let fog = view.fog_on.then(|| map.0.get(&view.team)).flatten();
+    let Some(fog) = fog else {
+        // Spectator without fog, or team with no data yet: clear overlay.
+        let colors = vec![[0.0, 0.0, 0.0, 0.0]; n * n];
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+        return;
+    };
     let mut colors = Vec::with_capacity(n * n * 4);
     for row in 0..n {
         for col in 0..n {

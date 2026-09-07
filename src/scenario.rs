@@ -30,7 +30,10 @@ impl Scenario {
 
     pub fn center(self, team: usize) -> Vec3 {
         match self {
-            Self::Playground => Vec3::new(if team == 0 { -70.0 } else { 70.0 }, 0.0, 0.0),
+            // Playground: commander a ±110 (220m tra loro, come gli spawn
+            // benchmark): punti protetti dal generatore, sempre raggiungibili
+            // e con margine per basi ed espansioni su mappa 400x400.
+            Self::Playground => Vec3::new(if team == 0 { -110.0 } else { 110.0 }, 0.0, 0.0),
             Self::Benchmark { .. } | Self::Skirmish { .. } => {
                 Vec3::new(if team == 0 { -110.0 } else { 110.0 }, 0.0, 0.0)
             }

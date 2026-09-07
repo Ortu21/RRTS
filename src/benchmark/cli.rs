@@ -10,6 +10,7 @@ pub enum Workload {
     Crowd,
     Skirmish,
     Guard,
+    AiTest,
 }
 
 impl Workload {
@@ -20,6 +21,7 @@ impl Workload {
             Self::Crowd => "crowd",
             Self::Skirmish => "skirmish",
             Self::Guard => "guard",
+            Self::AiTest => "ai-test",
         }
     }
 
@@ -30,8 +32,9 @@ impl Workload {
             "crowd" => Ok(Self::Crowd),
             "skirmish" => Ok(Self::Skirmish),
             "guard" => Ok(Self::Guard),
+            "ai-test" => Ok(Self::AiTest),
             _ => Err(format!(
-                "Unknown workload '{value}'; use idle, crossing, crowd, skirmish or guard"
+                "Unknown workload '{value}'; use idle, crossing, crowd, skirmish, guard or ai-test"
             )),
         }
     }
@@ -74,6 +77,13 @@ pub struct Config {
     pub repeats_overridden: bool,
     pub seconds: f64,
     pub output: Option<PathBuf>,
+    pub ai: String,
+    /// 0 = blu, 1 = rosso, 2 = entrambi (demo 1v1 AI-vs-AI).
+    pub ai_team: u8,
+    /// Personalità team rosso (o team singolo). Team blu in demo usa `ai_personality2`.
+    pub ai_personality: String,
+    /// Personalità team blu quando `ai_team == 2` / `ai == both`.
+    pub ai_personality2: String,
 }
 
 impl Default for Config {
@@ -97,6 +107,10 @@ impl Default for Config {
             repeats_overridden: false,
             seconds: 30.0,
             output: None,
+            ai: "off".to_owned(),
+            ai_team: 1,
+            ai_personality: "turtle".to_owned(),
+            ai_personality2: "rusher".to_owned(),
         }
     }
 }
@@ -139,7 +153,8 @@ impl Config {
                     );
                 }
                 "--workload" | "--units-per-team" | "--ticks" | "--repeats" | "--seconds"
-                | "--output" | "--profile-report" | "--profile-run" => {
+                | "--output" | "--profile-report" | "--profile-run" | "--ai" | "--ai-team"
+                | "--ai-personality" | "--ai-personality2" => {
                     let value = args
                         .next()
                         .ok_or_else(|| format!("Missing value for {arg}"))?;
@@ -161,6 +176,12 @@ impl Config {
                         }
                         "--profile-report" => config.profile_report = Some(value.into()),
                         "--profile-run" => config.profile_run = Some(value.into()),
+                        "--ai" => config.ai = value,
+                        "--ai-team" => {
+                            config.ai_team = value.parse().map_err(|_| "Invalid AI team")?
+                        }
+                        "--ai-personality" => config.ai_personality = value,
+                        "--ai-personality2" => config.ai_personality2 = value,
                         _ => config.output = Some(value.into()),
                     }
                 }
@@ -197,13 +218,31 @@ impl Config {
         if config.record_history && !config.suite {
             return Err("Benchmark history can only record a complete suite".into());
         }
+        if !["off", "test", "skirmish", "both"].contains(&config.ai.as_str()) {
+            return Err("AI mode must be off|test|skirmish|both".into());
+        }
+        if config.ai_team > 2 {
+            return Err("AI team must be 0, 1 or 2 (both)".into());
+        }
+        if !["turtle", "rusher"].contains(&config.ai_personality.as_str()) {
+            return Err("AI personality must be turtle|rusher".into());
+        }
+        if !["turtle", "rusher"].contains(&config.ai_personality2.as_str()) {
+            return Err("AI personality2 must be turtle|rusher".into());
+        }
         Ok(Some(config))
     }
 }
-pub const HELP: &str = "Rust RTS v0.0.11 benchmark and profiler\n\
+pub const HELP: &str = "Rust RTS v0.0.14 benchmark and profiler\n\
   cargo run                                      Economy playground\n\
+  cargo run -- --ai skirmish                       You (blue) vs AI (red turtle)\n\
+  cargo run -- --ai both                           Demo 1v1: AI blue (rusher) vs AI red (turtle)\n\
+  cargo run -- --ai both --ai-personality turtle --ai-personality2 rusher\n\
+  Demo keys: +/- speed, 0 reset 1x, Space pause. Score panel top-right.\n\
+  Match: commander down = defeat. R restarts. Panel VIEW & FOG: play as BLUE/RED, toggle fog.\n\
   cargo run -- --benchmark                        Graphical crossing\n\
   cargo run -- --benchmark --headless --workload skirmish\n\
+  cargo run -- --benchmark --headless --workload ai-test --ticks 1800\n\
   cargo run --profile benchmark -- --benchmark-suite quick\n\
   cargo run --profile benchmark -- --benchmark-suite full\n\
   cargo run --profile benchmark -- --benchmark-suite full --record-history\n\
@@ -211,8 +250,10 @@ pub const HELP: &str = "Rust RTS v0.0.11 benchmark and profiler\n\
   ./scripts/profile.sh --workload skirmish --units-per-team 1000 --ticks 600\n\
   ./scripts/profile-visual.sh --units-per-team 2500 --seconds 60\n\
 Separate industry measurement: --economy-benchmark --ticks 1800 --repeats 3\n\
-Options: --workload idle|crossing|crowd|skirmish|guard, --units-per-team 1..10000,\n\
+Options: --workload idle|crossing|crowd|skirmish|guard|ai-test, --units-per-team 1..10000,\n\
          --ticks 60..36000, --repeats 1..10, --seconds 1..600,\n\
+         --ai off|test|skirmish|both, --ai-team 0|1|2 (2=both),\n\
+         --ai-personality turtle|rusher (red), --ai-personality2 turtle|rusher (blue),\n\
          --output <new-directory>. --skirmish remains an alias.\n\
 Performance values are descriptive only; only correctness can fail a run.";
 
@@ -276,5 +317,46 @@ mod tests {
         // Capture works headless and graphical, but never for a suite.
         assert!(parse(&["--benchmark", "--headless", "--profile-capture"]).is_ok());
         assert!(parse(&["--benchmark", "--profile-capture"]).is_ok());
+    }
+
+    #[test]
+    fn parses_ai_workload_and_options() {
+        let ai = parse(&["--benchmark", "--headless", "--workload", "ai-test"]).unwrap();
+        assert_eq!(ai.workload, Workload::AiTest);
+        assert_eq!(ai.ai, "off");
+        let skirmish = parse(&[
+            "--ai",
+            "skirmish",
+            "--ai-team",
+            "1",
+            "--ai-personality",
+            "rusher",
+        ])
+        .unwrap();
+        assert_eq!(skirmish.ai, "skirmish");
+        assert_eq!(skirmish.ai_team, 1);
+        assert_eq!(skirmish.ai_personality, "rusher");
+        // Demo 1v1: both teams AI con personalità distinte.
+        let both = parse(&[
+            "--ai",
+            "both",
+            "--ai-personality",
+            "turtle",
+            "--ai-personality2",
+            "rusher",
+        ])
+        .unwrap();
+        assert_eq!(both.ai, "both");
+        assert_eq!(both.ai_personality2, "rusher");
+        let both_team = parse(&["--ai", "both", "--ai-team", "2"]).unwrap();
+        assert_eq!(both_team.ai_team, 2);
+        for args in [
+            &["--ai", "neural"][..],
+            &["--ai-team", "3"][..],
+            &["--ai-personality", "random"][..],
+            &["--ai-personality2", "random"][..],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} should fail");
+        }
     }
 }

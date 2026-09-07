@@ -33,7 +33,7 @@ fn setup_hud(mut commands: Commands, scenario: Res<crate::scenario::Scenario>) {
         DebugHud,
         industry::BlocksMap,
         Interaction::None,
-        Text::new("RTS Prototype v0.0.11\n\nFPS: ...\nUnits: 200\nSelected: 0"),
+        Text::new("RTS Prototype v0.0.14\n\nFPS: ...\nUnits: 200\nSelected: 0"),
         TextFont {
             font_size: FontSize::Px(18.0),
             ..default()
@@ -56,7 +56,7 @@ fn setup_hud(mut commands: Commands, scenario: Res<crate::scenario::Scenario>) {
     ));
     commands.spawn((
         industry::BlocksMap, Interaction::None,
-        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add / queue orders   Esc: clear   Right click: move / attack enemy / guard ally   G: attack-move, then left-click   P: patrol   T: guard, then left-click ally   H: hold   S: stop"),
+        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add / queue orders   Esc: clear   Right click: move / attack enemy / guard ally   G: attack-move, then left-click   P: patrol   T: guard, then left-click ally   H: hold   S: stop   R: restart when over"),
         TextFont { font_size: FontSize::Px(15.0), ..default() },
         Node { position_type: PositionType::Absolute, bottom: px(16), left: px(16), ..default() },
     ));
@@ -123,11 +123,11 @@ fn update_hud(
     };
     if benchmark.is_none() {
         hud.0 = format!(
-            "v0.0.11  |  {fps:.0} FPS\nBlue {blue} / Red {red}  |  Selected {selected}\nOrders queued {queued} / Paths pending {pending}{targeting}"
+            "v0.0.14  |  {fps:.0} FPS\nBlue {blue} / Red {red}  |  Selected {selected}\nOrders queued {queued} / Paths pending {pending}{targeting}"
         );
         return;
     }
     hud.0 = format!(
-        "RTS Prototype v0.0.11\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
+        "RTS Prototype v0.0.14\n\n{mode}\nFPS: {fps:.0}\nUnits: {count}\nBlue: {blue}\nRed: {red}\n{kinds_line}\nProjectiles: {projectiles}\nEngaging: {engaging}\nSelected: {selected}\nQueued orders: {queued}\nPaths queued: {pending}\nPaths failed: {failed}{targeting}"
     );
 }

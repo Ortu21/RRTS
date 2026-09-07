@@ -12,5 +12,7 @@ cargo test > "$output/tests.log" 2>&1
 cargo clippy --all-targets -- -D warnings > "$output/clippy.log" 2>&1
 RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
     --benchmark-suite quick --output "$output/benchmark" > "$output/benchmark.log" 2>&1
-printf 'PASS: fmt, check, tests, clippy and quick benchmark correctness\n' | tee "$output/status.txt"
+RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
+    --benchmark --headless --workload ai-test --repeats 2 --output "$output/ai-test" > "$output/ai-test.log" 2>&1
+printf 'PASS: fmt, check, tests, clippy, quick benchmark and ai-test correctness\n' | tee "$output/status.txt"
 printf 'Report: %s/benchmark/report.md\n' "$output"

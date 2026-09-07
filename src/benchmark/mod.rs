@@ -344,7 +344,7 @@ fn finish(world: &mut World, expected: &[Vec3], run: &mut Run) {
     run.failed = stats.failed;
     run.checksum = checksum;
     match run.workload {
-        Workload::Skirmish => {
+        Workload::Skirmish | Workload::AiTest => {
             run.arrived = positions.len();
             run.kills = expected.len().saturating_sub(positions.len());
             run.correctness_pass = valid
@@ -477,7 +477,7 @@ pub fn run_headless(config: &Config) -> Result<(), Box<dyn Error>> {
                     run.order_ms = ms;
                     initial
                 }
-                Workload::Skirmish => {
+                Workload::Skirmish | Workload::AiTest => {
                     let (initial, ms) = strategic_order(app.world_mut(), true);
                     run.order_ms = ms;
                     initial
@@ -613,7 +613,7 @@ fn start_graphical(world: &mut World) {
     }
     let workload = world.resource::<VisualRun>().config.workload;
     let result = match workload {
-        Workload::Skirmish => Ok(strategic_order(world, true)),
+        Workload::Skirmish | Workload::AiTest => Ok(strategic_order(world, true)),
         Workload::Crowd => Ok(strategic_order(world, false)),
         Workload::Guard => guard_order(world),
         Workload::Crossing => crossing_order(world),

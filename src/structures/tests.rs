@@ -39,13 +39,58 @@ fn placement_rejects_bounds_obstacles_units_and_invalid_base_rules() {
     assert!(placement_rule(Team(0), Vec3::ZERO, &base, &[]).is_err());
 }
 #[test]
+fn walled_factory_site_is_rejected_but_other_buildings_pass() {
+    // Bug reale: lab su terreno valido ma con tutte le porte contro un muro
+    // → truppe in coda che non spawnano mai. `factory_spawn_ok` lo rifiuta.
+    let mut grid = NavGrid::new(crate::navigation::HALF_SIZE, 2.5, vec![]);
+    // Terreno aperto: Factory ok.
+    assert!(factory_spawn_ok(&grid, BuildingKind::Factory, Vec3::ZERO).is_ok());
+    // Quattro muri (mezzeria 6m) sigillano le 12 porte del lab in (0,0)
+    // senza toccare il footprint 5x4: valid_ground resta ok.
+    grid.replace_dynamic(
+        0,
+        &[
+            Obstacle {
+                center: Vec2::new(14.0, 0.0),
+                half_size: Vec2::splat(6.0),
+            },
+            Obstacle {
+                center: Vec2::new(-14.0, 0.0),
+                half_size: Vec2::splat(6.0),
+            },
+            Obstacle {
+                center: Vec2::new(0.0, 13.0),
+                half_size: Vec2::splat(6.0),
+            },
+            Obstacle {
+                center: Vec2::new(0.0, -13.0),
+                half_size: Vec2::splat(6.0),
+            },
+        ],
+    );
+    assert!(valid_ground(&grid, BuildingKind::Factory, Vec3::ZERO, &[]).is_ok());
+    assert!(factory_spawn_ok(&grid, BuildingKind::Factory, Vec3::ZERO).is_err());
+    // Gli altri edifici non spawnano unità: il check non li tocca.
+    assert!(factory_spawn_ok(&grid, BuildingKind::Solar, Vec3::ZERO).is_ok());
+    assert!(factory_spawn_ok(&grid, BuildingKind::Metal, Vec3::ZERO).is_ok());
+}
+#[test]
 fn build_grid_snaps_centers_idempotently() {
     // 2m step, XZ only, Y preserved for spawn height.
-    assert_eq!(snap_to_grid(Vec3::new(3.4, 0.0, -2.6)), Vec3::new(4.0, 0.0, -2.0));
-    assert_eq!(snap_to_grid(Vec3::new(3.0, 1.2, 2.0)), Vec3::new(4.0, 1.2, 2.0));
+    assert_eq!(
+        snap_to_grid(Vec3::new(3.4, 0.0, -2.6)),
+        Vec3::new(4.0, 0.0, -2.0)
+    );
+    assert_eq!(
+        snap_to_grid(Vec3::new(3.0, 1.2, 2.0)),
+        Vec3::new(4.0, 1.2, 2.0)
+    );
     let p = Vec3::new(-8.0, 0.5, 12.0);
     assert_eq!(snap_to_grid(p), p);
-    assert_eq!(snap_to_grid(snap_to_grid(Vec3::new(1.2, 0.0, 8.8))), Vec3::new(2.0, 0.0, 8.0));
+    assert_eq!(
+        snap_to_grid(snap_to_grid(Vec3::new(1.2, 0.0, 8.8))),
+        Vec3::new(2.0, 0.0, 8.0)
+    );
     // Snapped centers keep every footprint inside the map when the raw
     // click was valid: max rounding shift is half a step (1m).
     for kind in BuildingKind::ALL {

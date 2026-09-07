@@ -11,7 +11,7 @@ use crate::{
     production::Factory,
     scenario::Scenario,
     spatial::{SpatialSystems, apply_avoidance},
-    units::{CollisionRadius, Selectable, Team, Unit},
+    units::{CollisionRadius, Selectable, Team, Unit, UnitKind},
 };
 use bevy::prelude::*;
 
@@ -119,13 +119,7 @@ pub fn snap_to_grid(point: Vec3) -> Vec3 {
 /// the center sits inside the site's own nav obstacle, so the planner
 /// strips the MoveTarget and the builder stands still forever. Edge points
 /// stay inside every build radius while remaining plannable.
-pub fn site_approach(
-    grid: &NavGrid,
-    site: Vec3,
-    from: Vec3,
-    half: Vec2,
-    body_radius: f32,
-) -> Vec3 {
+pub fn site_approach(grid: &NavGrid, site: Vec3, from: Vec3, half: Vec2, body_radius: f32) -> Vec3 {
     let away = from.xz() - site.xz();
     let dir = if away.length_squared() > 1e-6 {
         away.normalize()
@@ -160,6 +154,31 @@ pub fn valid_ground(
         delta.x < half.x + radius + 2.0 && delta.y < half.y + radius + 2.0
     }) {
         return Err("Unit inside footprint / clearance");
+    }
+    Ok(())
+}
+/// Factory placement sanity: a lab whose doors all open into rock (or off
+/// map) would queue troops that never spawn — `release_products` retains the
+/// finished product forever and the queue stalls. Reject the site up front so
+/// builders (player ghost or AI spiral search) pick a spot with a free door.
+/// Checked with empty occupancy (units move away; walls don't) and the
+/// largest producible hull, so anything queued later can exit. Other
+/// buildings don't spawn units and skip the check.
+pub fn factory_spawn_ok(
+    grid: &NavGrid,
+    kind: BuildingKind,
+    position: Vec3,
+) -> Result<(), &'static str> {
+    if kind != BuildingKind::Factory {
+        return Ok(());
+    }
+    let half = kind.stats().half;
+    let radius = UnitKind::PRODUCIBLE
+        .iter()
+        .map(|k| crate::units::archetype(*k).radius)
+        .fold(0.0, f32::max);
+    if crate::production::free_exit(grid, position, half, radius, &[], None).is_none() {
+        return Err("Factory exits blocked — pick a spot with a free door");
     }
     Ok(())
 }

@@ -35,7 +35,10 @@ impl Plugin for UnitPlugin {
             app.add_systems(Startup, setup_visual_assets)
                 .add_systems(PostUpdate, add_visuals);
         }
-        app.add_systems(PostUpdate, (update_health_bars, aim_turrets, aim_secondary_turrets));
+        app.add_systems(
+            PostUpdate,
+            (update_health_bars, aim_turrets, aim_secondary_turrets),
+        );
     }
 }
 #[derive(Component)]
@@ -44,6 +47,9 @@ pub struct Unit(pub u32);
 pub struct Selectable;
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub struct Team(pub u8);
+/// Convenzione storica team 0 = blu (ora il team giocato vive in
+/// `ViewState`; la costante resta come ancora semantica per test e setup).
+#[allow(dead_code)]
 pub const PLAYER_TEAM: Team = Team(0);
 
 impl Team {
@@ -195,10 +201,9 @@ pub fn arm_bundle(
     let stats = archetype(kind);
     // Dual-gun units lock targets once for both guns: acquisition covers the
     // longest gun (missiles), each gun still gates fire on its own range.
-    let acquisition = archetype::secondary_stats(kind).map_or(
-        stats.acquisition,
-        |secondary| stats.acquisition.max(secondary.acquisition),
-    );
+    let acquisition = archetype::secondary_stats(kind).map_or(stats.acquisition, |secondary| {
+        stats.acquisition.max(secondary.acquisition)
+    });
     (
         kind,
         CollisionRadius(stats.radius),
@@ -426,7 +431,11 @@ fn add_visuals(
                             TURRET_Y + if is_commander { 0.9 } else { 0.0 },
                             0.0,
                         )
-                        .with_scale(Vec3::splat(if is_commander { 1.8 } else { 1.0 })),
+                        .with_scale(Vec3::splat(if is_commander {
+                            1.8
+                        } else {
+                            1.0
+                        })),
                     ));
                 }
                 if is_commander {
@@ -534,7 +543,7 @@ fn update_health_bars(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::economy::balance::{COMMANDER_BUILD_POWER, COMMAND_BUILD_RADIUS};
+    use crate::economy::balance::{COMMAND_BUILD_RADIUS, COMMANDER_BUILD_POWER};
 
     #[test]
     fn health_bar_fill_is_left_anchored_and_clamped() {
@@ -571,7 +580,10 @@ mod tests {
         let (secondary, _, _) = secondary_bundle(7, UnitKind::Commander).unwrap();
         assert!(secondary_bundle(7, UnitKind::Tank).is_none());
         // Lock unico sul gun più lungo, fuoco gated per gun.
-        assert_eq!(acquisition.0, COMMANDER_MISSILES.acquisition.max(weapon.range));
+        assert_eq!(
+            acquisition.0,
+            COMMANDER_MISSILES.acquisition.max(weapon.range)
+        );
         assert!(secondary.range > weapon.range);
         assert!(secondary.cooldown > weapon.cooldown);
         assert!(secondary.damage > weapon.damage);

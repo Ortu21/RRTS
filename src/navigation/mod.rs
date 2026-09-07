@@ -1,5 +1,8 @@
 use crate::{formation::formation_slots, movement::MoveTarget};
-use bevy::prelude::*;
+use bevy::{
+    prelude::*,
+    tasks::{ComputeTaskPool, ParallelSlice},
+};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashSet},
@@ -9,7 +12,10 @@ use std::{
 pub const HALF_SIZE: f32 = 200.0;
 pub const CELL_SIZE: f32 = 2.5;
 pub const UNIT_CLEARANCE: f32 = 0.8;
-pub const PATHS_PER_FRAME: usize = 32;
+pub const PATHS_PER_FRAME: usize = 128;
+/// Below this many pending requests the planner stays serial: spawning
+/// tasks costs more than the search itself on tiny batches.
+pub const SERIAL_PATH_THRESHOLD: usize = 16;
 /// Extra route cost per crowded body in the destination cell: routes spread
 /// around live crowds instead of piling through them. Tunable; validated by
 /// keeping zero path failures on the stress workloads.
@@ -252,8 +258,7 @@ impl NavGrid {
             && point.z.abs() <= self.half_size - margin
             && self.obstacles.iter().all(|obstacle| {
                 let delta = (point.xz() - obstacle.center).abs();
-                delta.x >= obstacle.half_size.x + margin
-                    || delta.y >= obstacle.half_size.y + margin
+                delta.x >= obstacle.half_size.x + margin || delta.y >= obstacle.half_size.y + margin
             })
     }
 
@@ -292,8 +297,12 @@ impl NavGrid {
     pub fn clear_point_for(&self, point: Vec3, radius: f32) -> Vec3 {
         let margin = Self::clearance_for(radius);
         let mut point = point;
-        point.x = point.x.clamp(-self.half_size + margin, self.half_size - margin);
-        point.z = point.z.clamp(-self.half_size + margin, self.half_size - margin);
+        point.x = point
+            .x
+            .clamp(-self.half_size + margin, self.half_size - margin);
+        point.z = point
+            .z
+            .clamp(-self.half_size + margin, self.half_size - margin);
         if self.is_walkable(point) && self.has_clearance_for(point, radius) {
             return point;
         }
@@ -304,16 +313,14 @@ impl NavGrid {
         for ring in 1..=16 {
             for dx in -ring..=ring {
                 for dz in [-ring, ring] {
-                    if let Some(found) = self.clear_cell_for(cx + dx, cz + dz, point.y, radius)
-                    {
+                    if let Some(found) = self.clear_cell_for(cx + dx, cz + dz, point.y, radius) {
                         return found;
                     }
                 }
             }
             for dz in -ring + 1..=ring - 1 {
                 for dx in [-ring, ring] {
-                    if let Some(found) = self.clear_cell_for(cx + dx, cz + dz, point.y, radius)
-                    {
+                    if let Some(found) = self.clear_cell_for(cx + dx, cz + dz, point.y, radius) {
                         return found;
                     }
                 }
@@ -532,6 +539,7 @@ impl NavGrid {
                 {
                     path.push(goal);
                 }
+                self.anchor_path_ends(start, goal, &mut path);
                 return Some(path);
             }
             let x = (current % self.width) as isize;
@@ -585,6 +593,52 @@ impl NavGrid {
             }
         }
         None
+    }
+
+    /// Anchor a raw cell-center path to the caller's continuous endpoints.
+    /// General for every locomotion kind (tanks and tank-like bipeds share
+    /// the same steering): Theta* routes cell centers, but a unit re-routed
+    /// mid-march is never exactly on its start-cell center, and the goal is
+    /// rarely exactly on its goal-cell center. Steering to those quantized
+    /// centers first produces the visible "micro passo indietro" on lateral
+    /// re-clicks (plus an overshoot-and-return kink at arrival), with the
+    /// hull flipping the wrong way for a few frames.
+    /// Trims at most the quantization slop at both ends, and only when the
+    /// direct shortcut keeps full static clearance: the leading center goes
+    /// when `start -> path[1]` holds line of sight, the trailing center
+    /// when the approach `-> goal` does. Anything farther than one cell is
+    /// real routing (crowd detours, maze turns) and is always preserved, so
+    /// congestion avoidance and obstacle clearance are untouched.
+    /// Deterministic: pure over grid + endpoints, no frame state.
+    fn anchor_path_ends(&self, start: Vec3, goal: Vec3, path: &mut Vec<Vec3>) {
+        // Leading: drop the start-cell center when the unit can head
+        // directly at the next waypoint from its true position.
+        while path.len() > 1
+            && path[0].xz().distance(start.xz()) <= CELL_SIZE
+            && self.has_line_of_sight(start.xz(), path[1].xz())
+            && self.segment_clear(start, path[1])
+        {
+            path.remove(0);
+        }
+        // Trailing: the goal-cell center sits past/beside most goals by up
+        // to half a diagonal; drop it when the approach runs straight to
+        // the goal instead of visiting the center and doubling back.
+        while path.len() >= 2 && path[path.len() - 1] == goal {
+            let center = path[path.len() - 2];
+            if center.xz().distance(goal.xz()) > CELL_SIZE {
+                break;
+            }
+            let anchor = if path.len() >= 3 {
+                path[path.len() - 3]
+            } else {
+                start
+            };
+            if self.has_line_of_sight(anchor.xz(), goal.xz()) && self.segment_clear(anchor, goal) {
+                path.remove(path.len() - 2);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Line of sight between two ground points as an exact grid traversal
@@ -706,23 +760,54 @@ fn plan_paths(
 ) {
     let start = Instant::now();
     stats.last_planned = 0;
-    for (entity, transform, target) in pending.iter().take(PATHS_PER_FRAME) {
-        stats.last_planned += 1;
+    // Collect up to budget preserving query order. `par_splat_map` below
+    // returns results in input order, so the sequential apply stays
+    // bit-identical to the old serial loop for the same world state.
+    let jobs: Vec<(Entity, Vec3, Vec3)> = pending
+        .iter()
+        .take(PATHS_PER_FRAME)
+        .map(|(entity, transform, target)| (entity, transform.translation.with_y(0.0), target.0))
+        .collect();
+    if jobs.is_empty() {
+        stats.last_ms = start.elapsed().as_secs_f64() * 1000.0;
+        return;
+    }
+    stats.last_planned = jobs.len();
+    // Pure compute: `find_path_inner` only reads `NavGrid` (+ read-only
+    // congestion index), so batch parallelism is embarrassingly parallel.
+    // Small batches stay serial to avoid task-spawn overhead.
+    let computed: Vec<Option<Vec<Vec3>>> = if jobs.len() < SERIAL_PATH_THRESHOLD {
+        jobs.iter()
+            .map(|(_, from, goal)| match spatial.as_deref() {
+                Some(index) => grid.find_path_congested(index, *from, *goal),
+                None => grid.find_path(*from, *goal),
+            })
+            .collect()
+    } else {
+        let pool = ComputeTaskPool::get();
+        let grid_ref: &NavGrid = &grid;
+        let spatial_ref: Option<&crate::spatial::SpatialGrid> = spatial.as_deref();
+        jobs.par_splat_map(pool, None, |_, chunk| {
+            chunk
+                .iter()
+                .map(|(_, from, goal)| match spatial_ref {
+                    Some(index) => grid_ref.find_path_congested(index, *from, *goal),
+                    None => grid_ref.find_path(*from, *goal),
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    for ((entity, from, goal), points) in jobs.into_iter().zip(computed) {
         // Congested planning where the spatial index exists (combat
         // scenes); plain movement benchmarks never load it and keep the
         // exact legacy behaviour through the same code path.
-        let points = match spatial.as_deref() {
-            Some(index) => {
-                grid.find_path_congested(index, transform.translation.with_y(0.0), target.0)
-            }
-            None => grid.find_path(transform.translation.with_y(0.0), target.0),
-        };
         if let Some(points) = points {
             commands.entity(entity).insert(Route { points, next: 0 });
             stats.planned += 1;
-        } else if grid.has_clearance(target.0)
-            && (!grid.has_clearance(transform.translation.with_y(0.0))
-                || !grid.is_walkable(transform.translation.with_y(0.0)))
+        } else if grid.has_clearance(goal) && (!grid.has_clearance(from) || !grid.is_walkable(from))
         {
             // Transient start inside an obstacle margin or on an unwalkable
             // cell edge (crowd shove) with a valid goal: keep the order
@@ -802,6 +887,35 @@ mod tests {
             .collect();
         let walked: f32 = full.windows(2).map(|leg| leg[0].distance(leg[1])).sum();
         assert!(walked <= direct + CELL_SIZE * std::f32::consts::SQRT_2 + 0.01);
+    }
+    #[test]
+    fn retarget_from_off_center_goes_direct_without_backtrack() {
+        use crate::movement::flat_distance;
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new());
+        // Mid-cell start (a unit re-routed while moving is never exactly on
+        // a cell center) with a lateral goal and clear line of sight.
+        let start = Vec3::new(0.6, 0.0, 0.3);
+        let goal = Vec3::new(10.0, 0.0, 20.0);
+        assert!(grid.has_line_of_sight(start.xz(), goal.xz()));
+        let path = grid.find_path(start, goal).unwrap();
+        // No leading waypoint behind the unit: the first leg must shorten
+        // the distance to the goal instead of stepping back to the
+        // start-cell center (the visible "micro passo indietro" on lateral
+        // re-clicks, with the hull flipping the wrong way first).
+        assert!(
+            flat_distance(start, path[0]) <= flat_distance(start, goal),
+            "first waypoint farther than goal: {path:?}"
+        );
+        let to_first = path[0] - start;
+        let to_goal = goal - start;
+        assert!(
+            to_first.xz().dot(to_goal.xz()) > 0.0,
+            "first leg points away from goal: {path:?}"
+        );
+        // Open field with LOS: the quantization artifact must be trimmed so
+        // the route is a single direct leg.
+        assert_eq!(path.len(), 1, "stale start-center waypoint: {path:?}");
+        assert_eq!(path[0], goal);
     }
     #[test]
     fn line_of_sight_respects_clearance_margins() {
@@ -943,5 +1057,66 @@ mod tests {
         let repaired = open.clear_point_for(edge, 1.4);
         assert!(open.has_clearance_for(repaired, 1.4));
         assert!(repaired.x <= 20.0 - 1.7);
+    }
+    #[test]
+    fn parallel_batch_matches_serial_and_preserves_order() {
+        use bevy::tasks::{ParallelSlice, TaskPool};
+        // Batch above SERIAL_PATH_THRESHOLD so production takes the parallel
+        // branch; open field keeps every search successful and comparable.
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new());
+        let jobs: Vec<(u32, Vec3, Vec3)> = (0..40)
+            .map(|i| {
+                let f = i as f32;
+                (
+                    i,
+                    Vec3::new(-90.0 + f, 0.0, -60.0 + (f * 1.7) % 120.0),
+                    Vec3::new(90.0 - f * 0.5, 0.0, 60.0 - (f * 2.3) % 120.0),
+                )
+            })
+            .collect();
+        let serial: Vec<Option<Vec<Vec3>>> = jobs
+            .iter()
+            .map(|(_, from, goal)| grid.find_path(*from, *goal))
+            .collect();
+        assert!(serial.iter().all(|p| p.is_some()));
+        let pool = TaskPool::new();
+        let parallel: Vec<Option<Vec<Vec3>>> = jobs
+            .par_splat_map(&pool, None, |_, chunk| {
+                chunk
+                    .iter()
+                    .map(|(_, from, goal)| grid.find_path(*from, *goal))
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(serial, parallel);
+        // Order preserved: input i maps to output i.
+        assert_eq!(parallel.len(), jobs.len());
+    }
+    #[test]
+    fn planning_budget_covers_parallel_batch_in_one_frame() {
+        use crate::movement::MoveTarget;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new()))
+            .add_plugins(NavigationPlugin);
+        app.update();
+        for i in 0..40 {
+            let f = i as f32;
+            app.world_mut().spawn((
+                Transform::from_xyz(-90.0 + f, 0.0, -60.0 + f),
+                MoveTarget(Vec3::new(90.0 - f * 0.5, 0.0, 60.0 - f)),
+            ));
+        }
+        app.update();
+        let stats = app.world().resource::<NavigationStats>();
+        // Budget is 128: all 40 plan in a single frame, exercising the
+        // parallel branch (>= SERIAL_PATH_THRESHOLD).
+        assert_eq!(stats.last_planned, 40);
+        assert_eq!(stats.planned, 40);
+        assert_eq!(stats.failed, 0);
+        let routed = app.world_mut().query::<&Route>().iter(app.world()).count();
+        assert_eq!(routed, 40);
     }
 }

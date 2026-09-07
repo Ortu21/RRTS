@@ -1,6 +1,7 @@
 use crate::{
     combat::ChaseTargets,
     navigation::PlanPaths,
+    orders::UnitOrder,
     units::{CollisionRadius, Unit},
 };
 use bevy::prelude::*;
@@ -197,40 +198,58 @@ fn rebuild_spatial(
 /// Local separation from spatial-grid neighbors only. Applied as a small
 /// frame-rate independent displacement after movement, so strategic
 /// destinations and formations are preserved.
+/// Units holding position are avoidance anchors: the order promises they
+/// stay, so crowds deflect around them instead of dragging them off post.
+/// General for every locomotion kind (tanks and tank-like bipeds alike);
+/// idle units keep the old soft behaviour and can still be nudged.
 pub fn apply_avoidance(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
     config: Res<AvoidanceConfig>,
-    mut units: Query<(Entity, &mut Transform, &CollisionRadius), With<Unit>>,
+    mut units: Query<(Entity, &mut Transform, &CollisionRadius, Option<&UnitOrder>), With<Unit>>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for (entity, mut transform, own_radius) in &mut units {
-        let mut push = Vec2::ZERO;
-        let position = transform.translation;
-        // Lookup covers the widest possible trigger for standard bodies.
-        let lookup = config.separation_radius + own_radius.0 + config.unit_radius;
-        grid.for_each_nearby(position, lookup, |other| {
-            if other.entity == entity {
+    // Read-only shared state copied out so the parallel closure stays
+    // `Clone + Send + Sync`: each entity only writes its own Transform.
+    let grid_ref: &SpatialGrid = &grid;
+    let separation_radius = config.separation_radius;
+    let unit_radius = config.unit_radius;
+    let separation_strength = config.separation_strength;
+    let max_push = config.max_push;
+    units
+        .par_iter_mut()
+        .for_each(|(entity, mut transform, own_radius, order)| {
+            // Holders stand ground: still solid for everybody else, but the
+            // displacement is never applied to them.
+            if matches!(order, Some(UnitOrder::HoldPosition)) {
                 return;
             }
-            // Bodies separate on contact distance plus a soft skin.
-            let trigger = config.separation_radius + own_radius.0 + other.radius;
-            let offset = (position - other.position).xz();
-            push += separation_push(offset, trigger, config.separation_strength);
+            let mut push = Vec2::ZERO;
+            let position = transform.translation;
+            // Lookup covers the widest possible trigger for standard bodies.
+            let lookup = separation_radius + own_radius.0 + unit_radius;
+            grid_ref.for_each_nearby(position, lookup, |other| {
+                if other.entity == entity {
+                    return;
+                }
+                // Bodies separate on contact distance plus a soft skin.
+                let trigger = separation_radius + own_radius.0 + other.radius;
+                let offset = (position - other.position).xz();
+                push += separation_push(offset, trigger, separation_strength);
+            });
+            if push.length() > max_push {
+                push = push.normalize_or_zero() * max_push;
+            }
+            transform.translation.x += push.x * dt;
+            transform.translation.z += push.y * dt;
+            // Never shove units out of the playable area: out-of-bounds
+            // positions fail pathfinding and strand units without routes.
+            transform.translation.x = transform.translation.x.clamp(-MAP_BOUND, MAP_BOUND);
+            transform.translation.z = transform.translation.z.clamp(-MAP_BOUND, MAP_BOUND);
         });
-        if push.length() > config.max_push {
-            push = push.normalize_or_zero() * config.max_push;
-        }
-        transform.translation.x += push.x * dt;
-        transform.translation.z += push.y * dt;
-        // Never shove units out of the playable area: out-of-bounds
-        // positions fail pathfinding and strand units without routes.
-        transform.translation.x = transform.translation.x.clamp(-MAP_BOUND, MAP_BOUND);
-        transform.translation.z = transform.translation.z.clamp(-MAP_BOUND, MAP_BOUND);
-    }
 }
 
 #[cfg(test)]

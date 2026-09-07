@@ -204,4 +204,17 @@ checksum/winrate.
     armato vivo (ramo morto in Playground). La roccia grossa a est della base
     blu (-238,-262, 24×27m) è reale ma scenografia. Fix in 0.0.19 (scout a
     frontiera + intento svincolato dal conteggio armata).
-- [ ] 0.0.17, 0.0.18, 0.0.19, 0.0.20, 0.0.21 (solo spec finché approvate)
+- [x] 0.0.17 code (courage Lanchester + counter-comp + focus per valore)
+  - `cargo test` 154 verdi (9 nuovi: dps/counter/Lanchester/focus/courage),
+    `clippy -D warnings` verde, `fmt` verde.
+  - `ai-test` PASS con checksum identici a 0.0.16; scenari: unico delta
+    voluto in `hold-the-base` (sempre PASS, base 93%), resto bit-identico;
+    `scout-blitz/nav-clean` resta il rosso pre-esistente noto.
+  - League runner ora parallelo (worker = core, aggregazione in ordine fisso,
+    stessi checksum) + probe `--ticks N` validati e deterministici.
+  - POLICY SUITE (costi misurati: ~1ms/tick early, ~5ms/tick in combattimento;
+    match full-cap 36k tick = minuti l'uno): in sessione SOLO unit + ai-test +
+    scenari + probe ticks-capped (minuti). Quick/full full-cap = nightly/
+    release, mai in analisi interattive. Guardrail winrate-vs-rush-scripted:
+    non misurabile senza match lunghi → pending al primo run nightly.
+- [ ] 0.0.18, 0.0.19, 0.0.20, 0.0.21 (solo spec finché approvate)

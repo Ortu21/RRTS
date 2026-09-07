@@ -525,6 +525,28 @@ pub struct WinRate {
     pub red_wins: usize,
 }
 
+/// Riga di avanzamento per-game (formato stabile: stesso testo del runner
+/// sequenziale, così i log restano confrontabili tra run).
+fn game_line(case: &MatchCase, game: &MatchGame) -> String {
+    format!(
+        "league {} repeat={} winner={} {} ticks={} first_blood={:?} max_army=[{:.0},{:.0}] checksum={:#x} mean={:.2}ms",
+        case.id(),
+        game.repeat,
+        game.winner.map_or("draw".to_owned(), |t| if t == 0 {
+            case.blue.clone()
+        } else {
+            case.red.clone()
+        }),
+        game.reason,
+        game.ticks,
+        game.first_blood_tick,
+        game.max_army[0],
+        game.max_army[1],
+        game.checksum,
+        game.mean_ms,
+    )
+}
+
 fn history_dir(metadata: &Metadata) -> std::path::PathBuf {
     std::path::PathBuf::from(HISTORY_ROOT)
         .join(HISTORY_SUBDIR)
@@ -567,54 +589,98 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = Metadata::collect();
     let mut priors = load_priors(&history_dir(&metadata));
     let priors_snapshot = priors.clone();
-    let mut cases = Vec::new();
-    let mut all_deterministic = true;
-    let mut null_losses: Vec<String> = Vec::new();
+    // Case in ordine deterministico (matrice x seed): l'ordine non cambia
+    // mai, in sequenziale come in parallelo — winrate/Elo/history identici.
+    let mut cases_in = Vec::new();
     for (blue, red) in &pairings {
         for &seed in &seeds {
-            let case = MatchCase {
+            cases_in.push(MatchCase {
                 blue: blue.clone(),
                 red: red.clone(),
                 seed,
-            };
-            let mut games = Vec::new();
-            for repeat in 0..LEAGUE_REPEATS {
-                let game = run_match(&case, repeat + 1, ticks_cap);
-                println!(
-                    "league {} repeat={} winner={} {} ticks={} first_blood={:?} max_army=[{:.0},{:.0}] checksum={:#x} mean={:.2}ms",
-                    case.id(),
-                    game.repeat,
-                    game.winner.map_or("draw".to_owned(), |t| if t == 0 {
-                        blue.clone()
-                    } else {
-                        red.clone()
-                    }),
-                    game.reason,
-                    game.ticks,
-                    game.first_blood_tick,
-                    game.max_army[0],
-                    game.max_army[1],
-                    game.checksum,
-                    game.mean_ms,
-                );
-                if (blue == "null" && game.winner == Some(0))
-                    || (red == "null" && game.winner == Some(1))
-                {
-                    null_losses.push(case.id());
-                }
-                games.push(game);
-            }
-            let deterministic = games.windows(2).all(|w| w[0].checksum == w[1].checksum);
-            all_deterministic &= deterministic;
-            cases.push(MatchCaseResult {
-                case_id: case.id(),
-                blue: blue.clone(),
-                red: red.clone(),
-                seed,
-                games,
-                deterministic,
             });
         }
+    }
+    for case in &cases_in {
+        // Feedback immediato: ogni match dura minuti, le righe per-game
+        // arrivano a fine case (in ordine). Senza `| tail`, lo stream è live.
+        println!(
+            "league {} start ({} games, cap {} ticks)",
+            case.id(),
+            LEAGUE_REPEATS,
+            ticks_cap
+        );
+    }
+    // Match indipendenti su worker thread: stessa simulazione (step fissi
+    // 1/60s, niente wall-clock nel sim) → checksum bit-identici, solo il
+    // wall-clock totale diviso per i core. `mean_ms` resta descrittivo
+    // (rumoroso sotto carico, mai gate). Niente nuove dipendenze: solo
+    // `std::thread::scope`.
+    struct CaseOut {
+        case: MatchCase,
+        games: Vec<MatchGame>,
+        deterministic: bool,
+        lines: Vec<String>,
+        null_loss: bool,
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    let chunk = cases_in.len().div_ceil(workers).max(1);
+    let mut ordered: Vec<CaseOut> = Vec::with_capacity(cases_in.len());
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk_cases in cases_in.chunks(chunk) {
+            handles.push(s.spawn(move || {
+                let mut out = Vec::with_capacity(chunk_cases.len());
+                for case in chunk_cases {
+                    let mut games = Vec::with_capacity(LEAGUE_REPEATS);
+                    let mut lines = Vec::with_capacity(LEAGUE_REPEATS);
+                    for repeat in 0..LEAGUE_REPEATS {
+                        let game = run_match(case, repeat + 1, ticks_cap);
+                        lines.push(game_line(case, &game));
+                        games.push(game);
+                    }
+                    let deterministic = games.windows(2).all(|w| w[0].checksum == w[1].checksum);
+                    let null_loss = games.iter().any(|g| {
+                        (case.blue == "null" && g.winner == Some(0))
+                            || (case.red == "null" && g.winner == Some(1))
+                    });
+                    out.push(CaseOut {
+                        case: case.clone(),
+                        games,
+                        deterministic,
+                        lines,
+                        null_loss,
+                    });
+                }
+                out
+            }));
+        }
+        for h in handles {
+            ordered.extend(h.join().expect("league worker panicked"));
+        }
+    });
+    let mut cases = Vec::with_capacity(ordered.len());
+    let mut all_deterministic = true;
+    let mut null_losses: Vec<String> = Vec::new();
+    for o in ordered {
+        for line in &o.lines {
+            println!("{line}");
+        }
+        all_deterministic &= o.deterministic;
+        if o.null_loss {
+            null_losses.push(o.case.id());
+        }
+        cases.push(MatchCaseResult {
+            case_id: o.case.id(),
+            blue: o.case.blue.clone(),
+            red: o.case.red.clone(),
+            seed: o.case.seed,
+            games: o.games,
+            deterministic: o.deterministic,
+        });
     }
     if !all_deterministic {
         return Err("League repeats diverged (nondeterminism)".into());

@@ -12,7 +12,7 @@ use crate::{
         building_obstacle, factory_spawn_ok, placement_rule, site_approach, snap_to_grid,
         valid_ground,
     },
-    units::{UnitKind, archetype},
+    units::UnitKind,
 };
 use bevy::prelude::*;
 
@@ -24,8 +24,9 @@ pub struct Personality {
     pub name: &'static str,
     /// Quante truppe prima di considerare l'attacco.
     pub army_threshold: usize,
-    /// Moltiplicatore potenza richiesta vs nemico visibile.
-    pub attack_power_mult: f32,
+    /// 0.0.17 — coraggio: attacca se la win_prob predetta (Lanchester,
+    /// vista live + ricordi pesati per età) supera questa soglia.
+    pub courage: f32,
     /// Costruisci Engineer prima del secondo Tank (turtle eco).
     pub engineer_first: bool,
     /// Secondo Solar prima di attaccare.
@@ -42,7 +43,7 @@ pub struct Personality {
     pub max_engineers: usize,
     /// 0.0.13 — ritirata sotto questa frazione HP (0 = mai).
     pub retreat_hp_frac: f32,
-    /// 0.0.13 — focus fire sul nemico più debole quando dominante.
+    /// 0.0.17 — focus fire a priorità minaccia quando dominante.
     pub focus_fire: bool,
     /// Tick snapshot (4Hz) oltre il quale si attacca comunque (scripted
     /// baseline). `u64::MAX` = mai: solo potenza/soglie decidono.
@@ -53,7 +54,7 @@ impl Personality {
     pub const TURTLE: Self = Self {
         name: "turtle",
         army_threshold: 4,
-        attack_power_mult: 1.5,
+        courage: 0.65,
         engineer_first: true,
         second_solar: true,
         mix: [
@@ -73,7 +74,7 @@ impl Personality {
     pub const RUSHER: Self = Self {
         name: "rusher",
         army_threshold: 2,
-        attack_power_mult: 1.0,
+        courage: 0.55,
         engineer_first: false,
         second_solar: false,
         mix: [
@@ -96,7 +97,7 @@ impl Personality {
     pub const ECO_ONLY: Self = Self {
         name: "eco-only",
         army_threshold: usize::MAX,
-        attack_power_mult: 1e9,
+        courage: 1.1,
         engineer_first: false,
         second_solar: true,
         mix: [
@@ -119,7 +120,7 @@ impl Personality {
     pub const RUSH_SCRIPTED: Self = Self {
         name: "rush-scripted",
         army_threshold: 2,
-        attack_power_mult: 1.0,
+        courage: 0.55,
         engineer_first: false,
         second_solar: false,
         mix: [
@@ -148,19 +149,17 @@ impl Personality {
 }
 
 /// Potenza combattimento stile Lanchester: hp * dps. Engineer disarmato = 0.
+/// 0.0.17: singola fonte = `combat::effective_dps` (stessa formula di prima).
 pub fn combat_power(kind: UnitKind, health: f32) -> f32 {
-    let stats = archetype(kind);
-    if !stats.armed || health <= 0.0 {
+    if health <= 0.0 {
         return 0.0;
     }
-    let dps = stats.damage / stats.cooldown.max(0.05);
-    let mut power = health * dps;
-    if let Some(sec) = archetype::secondary_stats(kind) {
-        power += health * (sec.damage / sec.cooldown.max(0.05)) * 0.7;
-    }
-    power
+    health * super::combat::effective_dps(kind)
 }
 
+/// Potenza armata viva (telemetria/debug). 0.0.17: `decide()` usa
+/// `estimate_forces` + `predict_outcome`; resta API per director/league.
+#[allow(dead_code)]
 pub fn army_power(snapshot: &AiSnapshot) -> f32 {
     snapshot
         .my_units
@@ -169,6 +168,8 @@ pub fn army_power(snapshot: &AiSnapshot) -> f32 {
         .sum()
 }
 
+/// Potenza nemica visibile (telemetria/debug). Vedi `army_power`.
+#[allow(dead_code)]
 pub fn visible_enemy_power(snapshot: &AiSnapshot) -> f32 {
     snapshot
         .visible_enemies
@@ -201,13 +202,23 @@ pub enum AiIntent {
     },
 }
 
-/// Ricordi freschi con potenza stimata (scontata: posizioni non verificate).
+/// Ricordi freschi con potenza stimata, pesata per età (stesso decay della
+/// threat map) e scontata (posizioni non verificate). 0.0.17: sostituisce lo
+/// sconto fisso *0.5 — stessa formula di `threat::build_threat`, mai divergono.
+/// 0.0.17: `decide()` usa `estimate_forces` (stessa matematica per-unità);
+/// resta API per test di coerenza e telemetria.
+#[allow(dead_code)]
 pub fn remembered_enemy_power(snapshot: &AiSnapshot) -> f32 {
+    use super::threat::{THREAT_MEMORY_DISCOUNT, age_decay};
     snapshot
         .memory
         .iter()
         .filter(|m| m.age_ticks <= MEMORY_FRESH_TICKS && !m.building)
-        .filter_map(|m| m.kind.map(|kind| combat_power(kind, m.hp) * 0.5))
+        .filter_map(|m| {
+            m.kind.map(|kind| {
+                combat_power(kind, m.hp) * age_decay(m.age_ticks) * THREAT_MEMORY_DISCOUNT
+            })
+        })
         .sum()
 }
 
@@ -273,19 +284,106 @@ fn count_kind(snapshot: &AiSnapshot, queued: &[UnitKind], kind: UnitKind) -> usi
         + queued.iter().filter(|k| **k == kind).count()
 }
 
-/// Kind col rapporto di copertura più basso (conteggio/peso); pari → primo.
+/// 0.0.17 — focus fire solo con vittoria predetta decisiva (dominanza).
+/// Sostituisce la vecchia soglia `my > foe*2` con la stessa semantica sulla
+/// win_prob di Lanchester.
+pub const FOCUS_MIN_WIN_PROB: f32 = 0.8;
+
+/// Kind col rapporto di copertura più basso (conteggio/peso_effettivo);
+/// pari → primo. 0.0.17: il peso è già moltiplicato per l'edge counter vs
+/// comp nemica (1.0 se nemico ignoto = vecchio comportamento).
 /// Deterministico: a parità vince l'ordine di tabella.
-fn pick_deficit(cands: &[(UnitKind, u32)], count: impl Fn(UnitKind) -> usize) -> UnitKind {
+fn pick_deficit(cands: &[(UnitKind, f32)], count: impl Fn(UnitKind) -> usize) -> UnitKind {
     let mut best = cands[0].0;
     let mut best_ratio = f32::MAX;
     for (kind, weight) in cands {
-        let ratio = count(*kind) as f32 / (*weight as f32).max(1.0);
+        let ratio = count(*kind) as f32 / weight.max(0.05);
         if ratio < best_ratio {
             best_ratio = ratio;
             best = *kind;
         }
     }
     best
+}
+
+/// Mix nemico stimato (kind, hp): visibili + ricordi freschi con kind.
+/// Aggregato per kind, ordinato per indice (deterministico). Vuoto = ignoto.
+fn foe_mix(snapshot: &AiSnapshot) -> Vec<(UnitKind, f32)> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<usize, (UnitKind, f32)> = BTreeMap::new();
+    for e in &snapshot.visible_enemies {
+        acc.entry(e.kind.index())
+            .and_modify(|(_, hp)| *hp += e.health)
+            .or_insert((e.kind, e.health));
+    }
+    for m in snapshot.fresh_troop_memory(MEMORY_FRESH_TICKS) {
+        if let Some(kind) = m.kind {
+            acc.entry(kind.index())
+                .and_modify(|(_, hp)| *hp += m.hp)
+                .or_insert((kind, m.hp));
+        }
+    }
+    acc.into_values().collect()
+}
+
+/// Edge counter medio di `kind` contro il mix nemico (hp-share). 1.0 se ignoto.
+fn counter_edge(kind: UnitKind, foe: &[(UnitKind, f32)]) -> f32 {
+    use crate::economy::balance::counter_mult;
+    let total: f32 = foe.iter().map(|(_, hp)| hp).sum();
+    if total <= 0.0 {
+        return 1.0;
+    }
+    foe.iter()
+        .map(|(fk, hp)| counter_mult(kind, *fk) * hp)
+        .sum::<f32>()
+        / total
+}
+
+/// Pesi mix già corretti per counter: (kind, peso*edge). Puro.
+fn weighted_mix(mix: &[(UnitKind, u32)], foe: &[(UnitKind, f32)]) -> Vec<(UnitKind, f32)> {
+    mix.iter()
+        .map(|(kind, w)| (*kind, *w as f32 * counter_edge(*kind, foe)))
+        .collect()
+}
+
+/// Coppia di forze (kind, hp) per il predittore: (mia, nemica).
+type ForcePair = (Vec<(UnitKind, f32)>, Vec<(UnitKind, f32)>);
+
+/// Stima forze per il predittore: armata viva (kind,hp) + nemici visibili +
+/// ricordi freschi con hp scontati per età (come `remembered_enemy_power`).
+fn estimate_forces(snapshot: &AiSnapshot) -> ForcePair {
+    use super::threat::{THREAT_MEMORY_DISCOUNT, age_decay};
+    let my_list: Vec<(UnitKind, f32)> =
+        snapshot.army().iter().map(|u| (u.kind, u.health)).collect();
+    let mut foe_list: Vec<(UnitKind, f32)> = snapshot
+        .visible_enemies
+        .iter()
+        .map(|e| (e.kind, e.health))
+        .collect();
+    for m in snapshot.fresh_troop_memory(MEMORY_FRESH_TICKS) {
+        if let Some(kind) = m.kind {
+            foe_list.push((kind, m.hp * age_decay(m.age_ticks) * THREAT_MEMORY_DISCOUNT));
+        }
+    }
+    (my_list, foe_list)
+}
+
+/// Kind armato proprio più numeroso (primario) per il focus: pareggi → indice
+/// minore. Fallback HeavyTank se nessun armato (deterministico comunque).
+fn my_primary_kind(snapshot: &AiSnapshot) -> UnitKind {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<usize, (UnitKind, usize)> = BTreeMap::new();
+    for u in snapshot.army() {
+        counts
+            .entry(u.kind.index())
+            .and_modify(|(_, n)| *n += 1)
+            .or_insert((u.kind, 1));
+    }
+    counts
+        .into_values()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.index().cmp(&a.0.index())))
+        .map(|(kind, _)| kind)
+        .unwrap_or(UnitKind::HeavyTank)
 }
 
 /// Utility scoring: ritorna intenti ordinati per priorità. Puro e deterministico.
@@ -340,6 +438,10 @@ pub fn decide(
         intents.push(AiIntent::Build(BuildingKind::Turret));
     }
 
+    // 0.0.17 — comp nemica stimata una volta per tick: guida i pesi mix
+    // (counter) e il predittore Lanchester. Vuota = nemico ignoto.
+    let foe = foe_mix(snapshot);
+
     // 2. Produzione: una enqueue per factory libera (N lab = N code in
     // parallelo). Le bloccate si saltano: accodare lì brucia solo eco.
     // I conteggi includono vivi + accodati così le code non si intasano di
@@ -367,12 +469,15 @@ pub fn decide(
             // 0.0.14 — occhi prima di muscoli: uno Scout esploratore.
             UnitKind::Scout
         } else if view.tier >= 2 {
-            // LabT2: mix pesante T2. Il gate di `enqueue` lo ribadisce, ma
-            // qui non si emette mai un T2 verso una T1.
-            pick_deficit(&T2_MIX, |k| count_kind(snapshot, &queued_all, k))
+            // LabT2: mix pesante T2 pesato per counter. Il gate di `enqueue`
+            // lo ribadisce, ma qui non si emette mai un T2 verso una T1.
+            pick_deficit(&weighted_mix(&T2_MIX, &foe), |k| {
+                count_kind(snapshot, &queued_all, k)
+            })
         } else {
-            // Mix T1 per deficit di copertura (vivi + accodati). Pesi 0 =
-            // mai (baseline eco): mix vuoto → nessuna enqueue.
+            // Mix T1 per deficit di copertura pesato per counter (vivi +
+            // accodati). Pesi 0 = mai (baseline eco): mix vuoto → nessuna
+            // enqueue. Nemico ignoto → edge 1.0 = vecchio comportamento.
             let mix: Vec<(UnitKind, u32)> = personality
                 .mix
                 .iter()
@@ -382,7 +487,9 @@ pub fn decide(
             if mix.is_empty() {
                 continue;
             }
-            pick_deficit(&mix, |k| count_kind(snapshot, &queued_all, k))
+            pick_deficit(&weighted_mix(&mix, &foe), |k| {
+                count_kind(snapshot, &queued_all, k)
+            })
         };
         // Accoda solo se producibile (mai Commander).
         if UnitKind::PRODUCIBLE.contains(&kind) {
@@ -394,20 +501,20 @@ pub fn decide(
         }
     }
 
-    // 3. Tattica: attacco quando soglia truppe + potenza stimata, oppure a
-    // tempo fisso per le baseline scripted (comunque vada, se c'è un esercito).
-    // La potenza nemica stimata unisce vista live e ricordi freschi scontati.
+    // 3. Tattica 0.0.17 — courage predittivo (Lanchester): attacco quando la
+    // win_prob stimata supera `courage`, oppure a tempo fisso per le baseline
+    // scripted (comunque vada, se c'è un esercito). La stima unisce vista
+    // live e ricordi freschi pesati per età; alla cieca resta la massa critica.
     let army_count = snapshot.army().len();
-    let my_power = army_power(snapshot);
-    let foe_power = visible_enemy_power(snapshot) + remembered_enemy_power(snapshot);
+    let (my_list, foe_list) = estimate_forces(snapshot);
+    let win_prob = super::combat::predict_outcome(&my_list, &foe_list);
     let power_ok = if snapshot.visible_enemies.is_empty() && !has_fresh_eyes(snapshot) {
         // Nemico mai visto: serve massa critica per marciare alla cieca.
         // Saturating: soglie "mai" (usize::MAX delle baseline) non devono
         // andare in overflow.
         army_count >= personality.army_threshold.saturating_add(2)
     } else {
-        my_power > foe_power * personality.attack_power_mult.max(0.1)
-            && army_count >= personality.army_threshold
+        win_prob > personality.courage && army_count >= personality.army_threshold
     };
     let force_attack = army_count > 0 && snapshot.tick >= personality.attack_at_tick;
     if (power_ok || force_attack) && army_count > 0 {
@@ -444,16 +551,22 @@ pub fn decide(
         }
     }
 
-    // 5. Micro 0.0.13 — focus fire: il nemico visibile più debole (hp, poi
-    // determinismo) solo quando dominante, mai inseguimenti suicidi.
-    if personality.focus_fire && !snapshot.visible_enemies.is_empty() && my_power > foe_power * 2.0
+    // 5. Micro 0.0.17 — focus fire a priorità minaccia (dps × counter contro
+    // il kind primario proprio): prima i gun grossi, poi screen a pari
+    // priorità (hp minori, poi determinismo). Solo quando dominante
+    // (win_prob oltre soglia), mai inseguimenti suicidi.
+    if personality.focus_fire
+        && !snapshot.visible_enemies.is_empty()
+        && win_prob > FOCUS_MIN_WIN_PROB
     {
+        let primary = my_primary_kind(snapshot);
         let target = snapshot
             .visible_enemies
             .iter()
-            .min_by(|a, b| {
-                a.health
-                    .total_cmp(&b.health)
+            .max_by(|a, b| {
+                super::combat::target_priority(a.kind, primary)
+                    .total_cmp(&super::combat::target_priority(b.kind, primary))
+                    .then_with(|| b.health.total_cmp(&a.health))
                     .then_with(|| a.entity.to_bits().cmp(&b.entity.to_bits()))
             })
             .map(|e| e.entity);
@@ -921,6 +1034,139 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, AiIntent::FocusFire { .. }))
         );
+    }
+
+    #[test]
+    fn courage_blocks_suicide_but_allows_dominance() {
+        use crate::units::archetype;
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let enemy = |bits: u64| super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(bits),
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max,
+        };
+        // 1 vs 4 a occhi aperti: win_prob ~0, niente ondata suicida.
+        let mut weak = armed_snapshot(1, &[(UnitKind::HeavyTank, max, UnitOrder::Idle)]);
+        for i in 0..4 {
+            weak.visible_enemies.push(enemy(900 + i));
+        }
+        // Eco completa ma niente torrette: turtle emetterebbe Build(Turret),
+        // il rusher no — l'assert resta solo sull'attacco.
+        let intents = decide(&weak, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+        );
+        // 4 vs 1: win_prob ~1, l'ondata parte.
+        let mut strong = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+            ],
+        );
+        strong.visible_enemies.push(enemy(910));
+        let intents = decide(&strong, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+        );
+    }
+
+    #[test]
+    fn counter_weights_shift_production_to_lights_vs_artillery() {
+        use crate::units::archetype;
+        // 6H/3L/1A vivi: a pesi puri è triplo pareggio (1.0) e vincerebbe il
+        // primo (Heavy); col counter Light-vs-Arty 1.25 tocca ai Light.
+        let max_h = archetype(UnitKind::HeavyTank).max_health;
+        let max_l = archetype(UnitKind::LightTank).max_health;
+        let max_a = archetype(UnitKind::Artillery).max_health;
+        let mut kinds: Vec<(UnitKind, f32, UnitOrder)> = Vec::new();
+        for _ in 0..6 {
+            kinds.push((UnitKind::HeavyTank, max_h, UnitOrder::Idle));
+        }
+        for _ in 0..3 {
+            kinds.push((UnitKind::LightTank, max_l, UnitOrder::Idle));
+        }
+        kinds.push((UnitKind::Artillery, max_a, UnitOrder::Idle));
+        let mut snap = armed_snapshot(1, &kinds);
+        for i in 0..3 {
+            snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+                entity: Entity::from_bits(920 + i),
+                pos: Vec3::new(10.0 + i as f32, 0.0, 0.0),
+                kind: UnitKind::Artillery,
+                health: max_a,
+            });
+        }
+        let intents = decide(
+            &snap,
+            &Personality::RUSHER,
+            Scenario::Playground,
+            &[fac(1, 0, false, 1, &[])],
+        );
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::LightTank));
+    }
+
+    #[test]
+    fn focus_fire_prefers_guns_over_screen() {
+        use crate::units::archetype;
+        // Dominanza + screen di Light davanti all'Arty a pieni hp: la vecchia
+        // logica (hp minori) designerebbe il Light, la priorità minaccia
+        // (dps × counter vs Heavy primario) designa l'Arty.
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+            ],
+        );
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(901),
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            kind: UnitKind::LightTank,
+            health: archetype(UnitKind::LightTank).max_health,
+        });
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(902),
+            pos: Vec3::new(12.0, 0.0, 0.0),
+            kind: UnitKind::Artillery,
+            health: archetype(UnitKind::Artillery).max_health,
+        });
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert_eq!(
+            intents.iter().find_map(|i| match i {
+                AiIntent::FocusFire { target } => Some(*target),
+                _ => None,
+            }),
+            Some(Entity::from_bits(902))
+        );
+    }
+
+    #[test]
+    fn remembered_power_matches_threat_cell_on_fresh_contact() {
+        use super::super::snapshot::AiMemory;
+        // Stessa formula nei due moduli (potenza × decay × sconto): un singolo
+        // ricordo fresco età 0 deve coincidere col max della threat map.
+        let mut snap = empty_snapshot(1);
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(50.0, 0.0, -30.0),
+            age_ticks: 0,
+            kind: Some(UnitKind::HeavyTank),
+            hp: 100.0,
+            building: false,
+        });
+        let power = remembered_enemy_power(&snap);
+        let map = super::super::threat::build_threat(&snap);
+        assert!(power > 0.0);
+        assert!((power - map.max()).abs() < 0.001);
     }
 
     #[test]

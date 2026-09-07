@@ -217,3 +217,27 @@ pub fn turret_stats(kind: BuildingKind) -> Option<&'static TurretStats> {
         _ => None,
     }
 }
+
+/// Counter matrix (0.0.17): moltiplicatore di riga-kind vs colonna-kind.
+/// Dato, non logica: i sistemi leggono tramite `counter_mult`, mai branch.
+/// Ordine righe/colonne = `UnitKind` (Scout, Heavy, Arty, Commander, Engineer,
+/// Light, Heavy2, Arty2). Quasi tutto 1.0; solo celle motivate dalle tabelle:
+/// Heavy vince le risse coi Light (alpha/armatura), i Light chiudono sulle
+/// Arty (10 vs 4.5 speed) che faticano contro bersagli veloci vicini.
+pub const COUNTER_TABLE: [[f32; 8]; 8] = [
+    //                 Scout  Heavy  Arty   Cmdr   Eng    Light  Hvy2   Arty2
+    /* Scout      */
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    /* HeavyTank  */ [1.0, 1.0, 1.0, 1.0, 1.0, 1.15, 1.0, 1.0],
+    /* Artillery  */ [1.0, 1.0, 1.0, 1.0, 1.0, 0.85, 1.0, 1.0],
+    /* Commander  */ [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    /* Engineer   */ [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    /* LightTank  */ [1.0, 0.9, 1.25, 1.0, 1.0, 1.0, 0.9, 1.25],
+    /* HeavyTank2 */ [1.0, 1.0, 1.0, 1.0, 1.0, 1.15, 1.0, 1.0],
+    /* Artillery2 */ [1.0, 1.0, 1.0, 1.0, 1.0, 0.85, 1.0, 1.0],
+];
+
+/// Lookup counter da tabella: mai branch per-kind fuori da qui.
+pub fn counter_mult(atk: UnitKind, def: UnitKind) -> f32 {
+    COUNTER_TABLE[atk.index()][def.index()]
+}

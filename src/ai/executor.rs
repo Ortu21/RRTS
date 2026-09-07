@@ -37,6 +37,10 @@ pub fn execute_movement_and_build(
     let mut builds = 0;
     let mut enqueues: Vec<(Entity, UnitKind)> = Vec::new();
 
+    // Ordine di arbitraggio = ordine del vettore da decide(): Build (una),
+    // Enqueue (solo conteggio qui), AttackMoveAll/Scout, Retreat, FocusFire.
+    // 0.0.17: Retreat prima di FocusFire — i feriti ripiegano invece di
+    // convergere sul designato; il budget APM taglia dalla coda se pieno.
     for intent in intents {
         match intent {
             AiIntent::Build(kind) => {

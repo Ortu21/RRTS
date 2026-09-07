@@ -11,6 +11,7 @@
 //! - Grafico vs AI: `cargo run -- --ai skirmish` (AI sul team 1, tu giochi il blu).
 //! - Personalità: `--ai-personality turtle --ai-personality2 rusher`.
 
+pub mod combat;
 pub mod debug;
 pub mod director;
 pub mod executor;

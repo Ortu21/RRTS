@@ -235,8 +235,9 @@ fn tick(
         } else {
             None
         };
-        let build_power = site_power(entity, transform.translation, team.0, &flat, any_builders);
         let project = if let Some(site) = site {
+            let build_power =
+                site_power(entity, transform.translation, team.0, &flat, any_builders);
             Some((&site.0, build_power, true))
         } else {
             for r in 0..2 {
@@ -274,12 +275,13 @@ fn tick(
             continue;
         };
         let demands: Vec<_> = requests.iter().map(|r| r.demand).collect();
+        // Preserve the stable request order, but sum each resource only once.
+        let total_demand: [f64; 2] = std::array::from_fn(|r| demands.iter().map(|d| d[r]).sum());
         let fractions = allocate(account.stock, &demands);
         let mut spent = [0.0; 2];
         for (request, fraction) in requests.iter().zip(fractions) {
             let shortage = std::array::from_fn(|r| {
-                request.demand[r] > 0.0
-                    && demands.iter().map(|d| d[r]).sum::<f64>() > account.stock[r] + 1e-10
+                request.demand[r] > 0.0 && total_demand[r] > account.stock[r] + 1e-10
             });
             let advance = |project: &mut Project| {
                 project.done = (project.done + request.work * fraction).min(project.cost.work);

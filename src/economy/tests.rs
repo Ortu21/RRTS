@@ -185,6 +185,35 @@ fn fractional_final_tick_charges_only_remaining_work() {
     close(app.world().resource::<Economy>().0[&0].stock[0], 0.9);
 }
 
+#[test]
+fn shortage_flags_follow_each_consumers_resources_and_team() {
+    let mut app = app(0.05);
+    let factory = building(&mut app, 0, BuildingKind::Factory, Vec3::ZERO, true);
+    let solar = building(&mut app, 0, BuildingKind::Solar, Vec3::X * 30.0, false);
+    let other = building(&mut app, 1, BuildingKind::Factory, Vec3::X * 60.0, true);
+    for entity in [factory, other] {
+        app.world_mut()
+            .get_mut::<Factory>(entity)
+            .unwrap()
+            .enqueue(UnitKind::HeavyTank);
+    }
+    stock(&mut app, 0, [0.6, 0.0]);
+    stock(&mut app, 1, [100.0, 100.0]);
+    app.update();
+    let stalled = &app.world().get::<Factory>(factory).unwrap().queue[0].project;
+    close(stalled.done, 0.0);
+    assert_eq!(stalled.shortage, [true, true]);
+    // Energy shortage freezes the tank, leaving enough metal to fully
+    // satisfy the solar project even though total metal demand exceeds stock.
+    let recovery = &app.world().get::<Construction>(solar).unwrap().0;
+    close(recovery.done, BASE_POWER * TICK_SECONDS);
+    assert_eq!(recovery.shortage, [false, false]);
+    close(app.world().resource::<Economy>().0[&0].stock[0], 0.1);
+    let independent = &app.world().get::<Factory>(other).unwrap().queue[0].project;
+    close(independent.done, FACTORY_POWER * TICK_SECONDS);
+    assert_eq!(independent.shortage, [false, false]);
+}
+
 fn spawn_unit(app: &mut App, id: u32, team: u8, kind: UnitKind, at: Vec3) -> Entity {
     let entity =
         crate::units::spawn_combat_unit(&mut app.world_mut().commands(), id, Team(team), kind, at);

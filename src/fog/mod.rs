@@ -256,10 +256,8 @@ fn conceal_unseen(
     >,
 ) {
     for (entity, transform, team, visibility) in &mut hidden {
-        if team.0 == view.team {
-            continue;
-        }
-        let seen = !view.fog_on || map.visible(view.team, transform.translation);
+        let seen =
+            team.0 == view.team || !view.fog_on || map.visible(view.team, transform.translation);
         let want = if seen {
             Visibility::Inherited
         } else {
@@ -290,10 +288,10 @@ struct FogOverlay {
 /// explicit world coords, so no UV orientation can mirror the fog.
 fn fog_mesh() -> Mesh {
     let n = FOG_WIDTH + 1;
-    let mut positions = Vec::with_capacity(n * n * 3);
-    let mut normals = Vec::with_capacity(n * n * 3);
-    let mut uvs = Vec::with_capacity(n * n * 2);
-    let mut colors = Vec::with_capacity(n * n * 4);
+    let mut positions = Vec::with_capacity(n * n);
+    let mut normals = Vec::with_capacity(n * n);
+    let mut uvs = Vec::with_capacity(n * n);
+    let mut colors = Vec::with_capacity(n * n);
     for row in 0..n {
         for col in 0..n {
             positions.push([
@@ -356,40 +354,208 @@ fn refresh_overlay(
     overlay: Res<FogOverlay>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    // Fog data changes at 4Hz. View changes and a newly created overlay
+    // must refresh immediately; fog ticks cannot affect an OFF overlay.
+    if !overlay.is_added() && !view.is_changed() && (!view.fog_on || !map.is_changed()) {
+        return;
+    }
     let Some(mut mesh) = meshes.get_mut(&overlay.mesh) else {
         return;
     };
     let n = FOG_WIDTH + 1;
     let fog = view.fog_on.then(|| map.0.get(&view.team)).flatten();
-    let Some(fog) = fog else {
-        // Spectator without fog, or team with no data yet: clear overlay.
-        let colors = vec![[0.0, 0.0, 0.0, 0.0]; n * n];
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-        return;
-    };
-    let mut colors = Vec::with_capacity(n * n * 4);
-    for row in 0..n {
-        for col in 0..n {
-            let cc = col.min(FOG_WIDTH - 1);
-            let rr = row.min(FOG_WIDTH - 1);
+    let alpha_at = |vertex: usize| {
+        fog.map_or(0.0, |fog| {
+            let cc = (vertex % n).min(FOG_WIDTH - 1);
+            let rr = (vertex / n).min(FOG_WIDTH - 1);
             let index = rr * FOG_WIDTH + cc;
-            let alpha = if fog.visible.get(index).copied().unwrap_or(false) {
+            if fog.visible.get(index).copied().unwrap_or(false) {
                 0.0
             } else if fog.explored.get(index).copied().unwrap_or(false) {
                 FOG_ALPHA
             } else {
                 SHROUD_ALPHA
-            };
-            colors.push([0.0, 0.0, 0.0, alpha]);
-        }
+            }
+        })
+    };
+    let Some(bevy::mesh::VertexAttributeValues::Float32x4(colors)) =
+        mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+    else {
+        return;
+    };
+    // An unchanged sight snapshot (or a change for another team) should
+    // not emit AssetEvent::Modified and upload the same mesh again.
+    if colors
+        .iter()
+        .enumerate()
+        .all(|(i, color)| color[3] == alpha_at(i))
+    {
+        return;
     }
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    let Some(bevy::mesh::VertexAttributeValues::Float32x4(colors)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR)
+    else {
+        return;
+    };
+    // Keep the mesh-owned allocation; only alpha changes in this overlay.
+    for (i, color) in colors.iter_mut().enumerate() {
+        color[3] = alpha_at(i);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn switching_view_restores_hidden_friendly_units_and_buildings() {
+        let mut app = App::new();
+        app.init_resource::<VisibilityMap>()
+            .init_resource::<ViewState>()
+            .add_systems(Update, conceal_unseen);
+        let mut entities = Vec::new();
+        for team in [0, 1] {
+            for building in [false, true] {
+                let mut entity = app.world_mut().spawn((
+                    Team(team),
+                    Transform::default(),
+                    Visibility::Inherited,
+                ));
+                if building {
+                    entity.insert(Building);
+                } else {
+                    entity.insert(Unit(team as u32));
+                }
+                entities.push((entity.id(), team));
+            }
+        }
+        for team in [0, 1, 0] {
+            app.world_mut().resource_mut::<ViewState>().team = team;
+            app.update();
+            for &(entity, owner) in &entities {
+                let expected = if owner == team {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+                assert_eq!(app.world().get::<Visibility>(entity), Some(&expected));
+            }
+        }
+        app.world_mut().resource_mut::<ViewState>().fog_on = false;
+        app.update();
+        for (entity, _) in entities {
+            assert_eq!(
+                app.world().get::<Visibility>(entity),
+                Some(&Visibility::Inherited)
+            );
+        }
+    }
+
+    fn overlay_app() -> (App, Handle<Mesh>) {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_resource::<VisibilityMap>()
+            .init_resource::<ViewState>()
+            .add_systems(Update, refresh_overlay);
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(fog_mesh());
+        app.insert_resource(FogOverlay { mesh: mesh.clone() });
+        app.finish();
+        app.cleanup();
+        (app, mesh)
+    }
+
+    fn mesh_changes(app: &mut App, mesh: &Handle<Mesh>) -> usize {
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .drain()
+            .filter(|event| matches!(event, AssetEvent::Modified { id } if *id == mesh.id()))
+            .count()
+    }
+
+    fn overlay_alpha(app: &App, mesh: &Handle<Mesh>, col: usize, row: usize) -> f32 {
+        let assets = app.world().resource::<Assets<Mesh>>();
+        let Some(bevy::mesh::VertexAttributeValues::Float32x4(colors)) =
+            assets.get(mesh).unwrap().attribute(Mesh::ATTRIBUTE_COLOR)
+        else {
+            panic!("fog overlay must contain vertex colors");
+        };
+        colors[row * (FOG_WIDTH + 1) + col][3]
+    }
+
+    #[test]
+    fn overlay_tracks_fog_view_and_reset_without_idle_asset_changes() {
+        let (mut app, mesh) = overlay_app();
+        app.update();
+        assert_eq!(overlay_alpha(&app, &mesh, 0, 0), 0.0);
+        mesh_changes(&mut app, &mesh);
+        for _ in 0..3 {
+            app.update();
+            assert_eq!(mesh_changes(&mut app, &mesh), 0);
+        }
+
+        let mut fog = TeamFog::default();
+        fog.ensure();
+        fog.explored[0] = true;
+        fog.visible[1] = true;
+        app.world_mut()
+            .resource_mut::<VisibilityMap>()
+            .0
+            .insert(0, fog);
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 1);
+        assert_eq!(overlay_alpha(&app, &mesh, 0, 0), FOG_ALPHA);
+        assert_eq!(overlay_alpha(&app, &mesh, 1, 0), 0.0);
+        assert_eq!(overlay_alpha(&app, &mesh, 2, 0), SHROUD_ALPHA);
+        assert_eq!(
+            overlay_alpha(&app, &mesh, FOG_WIDTH, FOG_WIDTH),
+            SHROUD_ALPHA
+        );
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 0);
+
+        // A fog tick can mark the map changed while producing identical
+        // visibility; that must not trigger another mesh upload either.
+        let same_map = app.world().resource::<VisibilityMap>().clone();
+        *app.world_mut().resource_mut::<VisibilityMap>() = same_map;
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 0);
+
+        app.world_mut().resource_mut::<ViewState>().fog_on = false;
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 1);
+        assert_eq!(overlay_alpha(&app, &mesh, 2, 0), 0.0);
+        app.world_mut()
+            .resource_mut::<VisibilityMap>()
+            .0
+            .get_mut(&0)
+            .unwrap()
+            .visible[2] = true;
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 0);
+
+        app.world_mut().resource_mut::<ViewState>().fog_on = true;
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 1);
+        assert_eq!(overlay_alpha(&app, &mesh, 2, 0), 0.0);
+        assert_eq!(overlay_alpha(&app, &mesh, 0, 0), FOG_ALPHA);
+
+        app.world_mut().resource_mut::<ViewState>().team = 1;
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 1);
+        assert_eq!(overlay_alpha(&app, &mesh, 0, 0), 0.0);
+        app.world_mut().resource_mut::<ViewState>().team = 0;
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 1);
+        *app.world_mut().resource_mut::<VisibilityMap>() = VisibilityMap::default();
+        app.update();
+        assert_eq!(mesh_changes(&mut app, &mesh), 1);
+        assert_eq!(overlay_alpha(&app, &mesh, 0, 0), 0.0);
+    }
 
     fn revealed(team: u8, at: Vec3, range: f32) -> VisibilityMap {
         let mut map = VisibilityMap::default();

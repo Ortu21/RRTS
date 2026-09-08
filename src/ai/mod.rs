@@ -45,6 +45,10 @@ pub use strategy::Personality;
 /// GameAIPro (Utility a bassa frequenza, micro ad alta).
 pub const SNAPSHOT_PERIOD: f32 = 0.25;
 pub const STRATEGY_PERIOD: f32 = 1.0;
+/// 0.0.20 — micro a 4Hz (solo Retreat/Focus/Hold/Screen), budget 2 ordini:
+/// correzioni di rotta rapide senza churn del planner macro.
+pub const MICRO_PERIOD: f32 = 0.25;
+pub const MICRO_BUDGET: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AiMode {
@@ -133,6 +137,8 @@ pub struct AiTeamStats {
 pub struct AiState {
     pub acc: f32,
     pub per_team: BTreeMap<u8, AiTeamStats>,
+    /// 0.0.20 — ultima ondata lanciata per team (catch-up: vedi `decide`).
+    pub last_wave: BTreeMap<u8, u64>,
 }
 
 impl AiState {
@@ -179,7 +185,7 @@ impl Plugin for AiPlugin {
             .init_resource::<EnemyMemory>()
             .add_systems(
                 Update,
-                (snapshot::refresh_snapshots, ai_tick)
+                (snapshot::refresh_snapshots, ai_tick, micro_tick)
                     .chain()
                     .after(MovementSystems)
                     .run_if(ai_active),
@@ -302,8 +308,23 @@ fn ai_tick(
             .collect();
         factory_queues.sort_by_key(|v| v.entity.to_bits());
 
-        let intents = strategy::decide(snapshot, &brain.personality, *scenario, &factory_queues);
+        let intents = strategy::decide(
+            snapshot,
+            &brain.personality,
+            *scenario,
+            &factory_queues,
+            state.last_wave.get(&brain.team).copied().unwrap_or(0),
+        );
         all_intent_labels.extend(intents.iter().map(|i| format!("t{}:{i:?}", brain.team)));
+        // 0.0.20 — catch-up onde: l'ondata lanciata consuma il periodo.
+        if intents
+            .iter()
+            .any(|i| matches!(i, strategy::AiIntent::AttackMoveGroup { .. }))
+        {
+            state
+                .last_wave
+                .insert(brain.team, strategy::wave_id(snapshot.tick));
+        }
         if intents.is_empty() {
             continue;
         }
@@ -355,6 +376,106 @@ fn ai_tick(
 
     if let Some(debug) = debug.as_deref_mut() {
         debug.last_intents = all_intent_labels;
+    }
+}
+
+/// 0.0.20 — micro a 4Hz: SOLO Retreat/FocusFire/HoldAtMaxRange/Screen
+/// (`strategy::decide_micro`), budget 2. La macro a 1Hz resta padrona di
+/// Build/Enqueue/ondate/Scout: niente doppio ordine, niente churn (isteresi
+/// in executor). Legge gli stessi snapshot onesti (4Hz): mai query nemiche
+/// dirette. Loop in ordine di team = deterministico.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn micro_tick(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut acc: Local<f32>,
+    config: Res<AiConfig>,
+    snapshots: Res<AiSnapshots>,
+    match_result: Option<Res<crate::game_over::MatchResult>>,
+    scenario: Res<crate::scenario::Scenario>,
+    grid: Res<crate::navigation::NavGrid>,
+    mut state: ResMut<AiState>,
+    mut debug: Option<ResMut<debug::AiDebugState>>,
+    units: Query<(Entity, &Transform, &Team, &UnitKind, &UnitOrder, &Health), With<Unit>>,
+    buildings: Query<
+        (
+            Entity,
+            &Team,
+            &crate::economy::balance::BuildingKind,
+            &Transform,
+            &Health,
+        ),
+        (With<Building>,),
+    >,
+    building_sites: Query<
+        (
+            Entity,
+            &Team,
+            &crate::economy::balance::BuildingKind,
+            &Transform,
+        ),
+        (With<Building>, With<Construction>),
+    >,
+) {
+    *acc += time.delta_secs();
+    if *acc < MICRO_PERIOD {
+        return;
+    }
+    *acc = 0.0;
+    if match_result.is_some_and(|r| r.over) {
+        return;
+    }
+
+    let mut flat_buildings: Vec<(Team, crate::economy::balance::BuildingKind, Vec3, bool)> =
+        Vec::new();
+    for (e, team, kind, transform, _) in buildings.iter() {
+        let site = building_sites.get(e).is_ok();
+        flat_buildings.push((*team, *kind, transform.translation, site));
+    }
+    flat_buildings.sort_by_key(|(_, _, pos, _)| (pos.x.to_bits(), pos.z.to_bits()));
+
+    // Il micro non costruisce: niente builders/footprints/factories.
+    let no_builders: Vec<(Team, Vec3, f32)> = Vec::new();
+    let no_footprints: Vec<(Vec3, f32)> = Vec::new();
+
+    let mut micro_labels: Vec<String> = Vec::new();
+    for brain in config.sorted_teams() {
+        let Some(snapshot) = snapshots.0.get(&brain.team) else {
+            continue;
+        };
+        if snapshot.tick == 0 {
+            continue;
+        }
+        let intents = strategy::decide_micro(snapshot, &brain.personality, *scenario);
+        micro_labels.extend(intents.iter().map(|i| format!("t{}:{i:?}", brain.team)));
+        if intents.is_empty() {
+            continue;
+        }
+        let mut flat_units: Vec<(Entity, Vec3, UnitKind, UnitOrder)> = units
+            .iter()
+            .filter(|(_, _, team, _, _, hp)| team.0 == brain.team && hp.current > 0.0)
+            .map(|(e, t, _, kind, order, _)| (e, t.translation, *kind, order.clone()))
+            .collect();
+        flat_units.sort_by_key(|(e, _, _, _)| e.to_bits());
+
+        let (orders, _, _) = executor::execute_movement_and_build(
+            &mut commands,
+            snapshot,
+            &intents,
+            brain.team,
+            MICRO_BUDGET,
+            &grid,
+            *scenario,
+            &flat_units,
+            &flat_buildings,
+            &no_builders,
+            &no_footprints,
+        );
+        state.stats_mut(brain.team).orders_issued += orders as u64;
+    }
+
+    if let Some(debug) = debug.as_deref_mut() {
+        debug.last_intents.extend(micro_labels);
     }
 }
 

@@ -55,6 +55,11 @@ pub struct Personality {
     /// (`novelty − minaccia_norm×peso` in `scout::frontier_target`).
     /// Turtle cauto (1.2) devia di più, rusher audace (0.5) esplora dritto.
     pub scout_threat_weight: f32,
+    /// 0.0.20 — commit del capitale: il Commander marcia nell'ondata solo se
+    /// la win_prob predetta supera questa soglia (deterministico: soglia, non
+    /// dado). 2.0 = mai (baseline prevedibili). Il capitale non si rischia
+    /// per ondate ordinarie: muore lui = game over.
+    pub commander_commit_prob: f32,
 }
 
 impl Personality {
@@ -79,6 +84,7 @@ impl Personality {
         focus_fire: true,
         attack_at_tick: u64::MAX,
         scout_threat_weight: 1.2,
+        commander_commit_prob: 0.95,
     };
     pub const RUSHER: Self = Self {
         name: "rusher",
@@ -101,6 +107,7 @@ impl Personality {
         focus_fire: true,
         attack_at_tick: u64::MAX,
         scout_threat_weight: 0.5,
+        commander_commit_prob: 0.9,
     };
     /// Baseline eco-only per la league: costruisce economia fino ai cap, non
     /// attacca mai (soglia impossibile), nessun micro aggressivo. Sacco da
@@ -126,6 +133,7 @@ impl Personality {
         focus_fire: false,
         attack_at_tick: u64::MAX,
         scout_threat_weight: 1.0,
+        commander_commit_prob: 2.0,
     };
     /// Baseline rush-scripted per la league: bootstrap + solo HeavyTank,
     /// ondata a tempo fisso comunque vada, niente ritirate né focus.
@@ -151,6 +159,7 @@ impl Personality {
         focus_fire: false,
         attack_at_tick: 480, // 120s: l'ondata parte a tempo, comunque vada
         scout_threat_weight: 0.5,
+        commander_commit_prob: 2.0,
     };
 
     pub fn from_name(name: &str) -> Self {
@@ -200,22 +209,60 @@ pub enum AiIntent {
         factory: Entity,
         kind: UnitKind,
     },
-    AttackMoveAll {
+    /// 0.0.20 — ondata: QUESTE unità (mai Commander salvo commit, mai scout,
+    /// mai arty ferite, mai builder sul sito) in AttackMove sulla meta.
+    /// Sostituisce `AttackMoveAll` (che mandava anche il capitale).
+    AttackMoveGroup {
+        units: Vec<Entity>,
         destination: Vec3,
     },
     Scout {
         destination: Vec3,
     },
-    /// 0.0.13 — queste unità (hp bassi) ripiegano alla base con Move
-    /// (spara in marcia, mai chase suicida).
+    /// 0.0.13 — queste unità (hp bassi) ripiegano con Move (spara in marcia,
+    /// mai chase suicida). 0.0.20: l'executor le porta in copertura torrette
+    /// (fallback base). Micro 4Hz.
     Retreat {
         units: Vec<Entity>,
     },
     /// 0.0.13 — i più vicini convergono su questo nemico (solo dominante).
+    /// Micro 4Hz.
     FocusFire {
         target: Entity,
     },
+    /// 0.0.20 — batteria: QUESTE arty sane tengono la massima gittata sul
+    /// nemico (Move allo stand-off, acquisizione automatica all'arrivo).
+    /// Micro 4Hz, solo senza ondata in corso per unità.
+    HoldAtMaxRange {
+        units: Vec<Entity>,
+        position: Vec3,
+    },
+    /// 0.0.20 — schermo: QUESTA linea copre le arty / la base (AttackMove in
+    /// posizione, ingaggia a contatto). Micro 4Hz, solo senza ondata in corso
+    /// per unità.
+    Screen {
+        units: Vec<Entity>,
+        position: Vec3,
+    },
 }
+
+/// 0.0.20 — periodo ondate in tick snapshot (4Hz): 300 = 75s. Rivalutazione
+/// con `predict_outcome()`: se bassa, l'ondata resta a casa (niente rinforzi
+/// suicidi). Multiplo di 4 per costruzione: la strategia a 1Hz vede ogni
+/// quarto tick, i tick d'ondata (0, 300, 600, ...) sono sempre osservati
+/// (test `waves_tick_alignment`).
+pub const WAVE_PERIOD_TICKS: u64 = 300;
+/// 0.0.20 — arty sotto questa frazione HP non marciano (inefficaci e fragili:
+/// il micro le ritira). Sopra marciano e tengono la gittata.
+pub const WOUNDED_ARTY_FRAC: f32 = 0.5;
+/// 0.0.20 — raggio base minacciata: nemico visibile o hotspot entro questa
+/// distanza da casa = difesa (richiamo: l'ondata non parte, il micro scherma
+/// a casa).
+pub const BASE_THREAT_RADIUS: f32 = 120.0;
+/// 0.0.20 — split linea/batteria per gittata cannone (da tabella, mai branch
+/// per-kind): sotto sono linea (screen), sopra batteria (hold). Heavy2 21.9
+/// resta linea, Arty 30.0 batteria.
+pub const BATTERY_MIN_RANGE: f32 = 25.0;
 
 /// Ricordi freschi con potenza stimata, pesata per età (stesso decay della
 /// threat map) e scontata (posizioni non verificate). 0.0.17: sostituisce lo
@@ -429,12 +476,143 @@ fn my_primary_kind(snapshot: &AiSnapshot) -> UnitKind {
         .unwrap_or(UnitKind::HeavyTank)
 }
 
+/// 0.0.20 — numero d'ondata (periodo 75s): tick snapshot (4Hz) / 300.
+/// Monotono per costruzione (test `waves_monotonic`). Puro.
+/// Uso diretto in telemetria/test; oggi solo test: allow per clippy.
+#[allow(dead_code)]
+pub fn wave_id(tick: u64) -> u64 {
+    tick / WAVE_PERIOD_TICKS
+}
+
+/// 0.0.20 — tick di lancio ondata (inizio periodo). La strategia a 1Hz vede
+/// ogni quarto tick e il periodo è multiplo di 4: i lanci non si perdono mai
+/// (test `waves_tick_alignment`). Puro.
+pub fn is_wave_tick(tick: u64) -> bool {
+    tick.is_multiple_of(WAVE_PERIOD_TICKS)
+}
+
+/// 0.0.20 — ruolo batteria (tiene la gittata) vs linea (fa schermo): dalla
+/// gittata cannone in tabella, mai branch per-kind. Puro.
+pub fn is_arty_role(kind: UnitKind) -> bool {
+    crate::units::archetype(kind).range >= BATTERY_MIN_RANGE
+}
+
+/// 0.0.20 — gruppo d'ondata: linea sana (niente scout, niente Commander, niente
+/// arty ferite, mai builder sul sito), ordinato per bits. Il Commander si
+/// aggiunge SOLO se `win_prob > commander_commit_prob` E la linea non è vuota
+/// (il capitale non forma mai un'ondata da solo). Puro e deterministico.
+pub fn wave_group(snapshot: &AiSnapshot, personality: &Personality, win_prob: f32) -> Vec<Entity> {
+    let mut group: Vec<Entity> = snapshot
+        .my_units
+        .iter()
+        .filter(|u| {
+            crate::units::archetype(u.kind).armed
+                && u.kind != UnitKind::Scout
+                && u.kind != UnitKind::Commander
+                && !(is_arty_role(u.kind)
+                    && u.max_health > 0.0
+                    && u.health / u.max_health < WOUNDED_ARTY_FRAC)
+                && !matches!(u.order, UnitOrder::Build { .. })
+                && u.health > 0.0
+        })
+        .map(|u| u.entity)
+        .collect();
+    group.sort_by_key(|e| e.to_bits());
+    // Commit del capitale: solo con vittoria quasi certa e scorta presente.
+    if !group.is_empty() && win_prob > personality.commander_commit_prob {
+        let mut capitals: Vec<Entity> = snapshot
+            .my_units
+            .iter()
+            .filter(|u| {
+                u.kind == UnitKind::Commander
+                    && u.health > 0.0
+                    && !matches!(u.order, UnitOrder::Build { .. })
+            })
+            .map(|u| u.entity)
+            .collect();
+        group.append(&mut capitals);
+        group.sort_by_key(|e| e.to_bits());
+    }
+    group
+}
+
+/// 0.0.20 — base minacciata: nemico visibile o hotspot threat entro il raggio
+/// da casa. Con la base sotto pressione l'ondata non parte (richiamo
+/// difensivo: il micro scherma a casa). Solo snapshot onesto. Puro.
+pub fn base_under_threat(snapshot: &AiSnapshot, scenario: Scenario) -> bool {
+    let home = scenario.center(snapshot.team as usize);
+    if snapshot
+        .visible_enemies
+        .iter()
+        .any(|e| e.pos.xz().distance(home.xz()) < BASE_THREAT_RADIUS)
+    {
+        return true;
+    }
+    super::threat::build_threat(snapshot)
+        .hotspot()
+        .is_some_and(|h| h.xz().distance(home.xz()) < BASE_THREAT_RADIUS)
+}
+
+/// 0.0.20 — baricentro nemici visibili (punto minaccia per screen/hold).
+/// Ordine snapshot (bits) = somma deterministica. `None` senza contatti live
+/// (niente posizionamento sui fantasmi). Puro.
+pub fn visible_centroid(snapshot: &AiSnapshot) -> Option<Vec3> {
+    if snapshot.visible_enemies.is_empty() {
+        return None;
+    }
+    let mut sum = Vec3::ZERO;
+    for e in &snapshot.visible_enemies {
+        sum += e.pos;
+    }
+    Some(sum / snapshot.visible_enemies.len() as f32)
+}
+
+/// 0.0.20 — ancora di ritirata: torretta completa propria più vicina a casa
+/// (copertura cannoni), fallback casa senza torrette. `turrets` = posizioni
+/// torrette complete del team ( executor: da edifici vivi). Puro.
+pub fn retreat_anchor(turrets: &[Vec3], home: Vec3) -> Vec3 {
+    turrets
+        .iter()
+        .min_by(|a, b| {
+            a.distance_squared(home)
+                .total_cmp(&b.distance_squared(home))
+                .then_with(|| a.x.to_bits().cmp(&b.x.to_bits()))
+                .then_with(|| a.z.to_bits().cmp(&b.z.to_bits()))
+        })
+        .copied()
+        .unwrap_or(home)
+}
+
+/// 0.0.20 — posizione schermo: 30% da guardia a minaccia (linea davanti alle
+/// batterie / alla base). Pura.
+pub fn screen_position(guard: Vec3, threat: Vec3) -> Vec3 {
+    guard.lerp(threat, 0.3).with_y(0.0)
+}
+
+/// 0.0.20 — posizione batteria: sul lato armata della minaccia, a
+/// `range − 4` (dentro gittata con margine). Assedio superato (sopra la
+/// minaccia): tiene il terreno. Pura.
+pub fn hold_position(anchor: Vec3, threat: Vec3, range: f32) -> Vec3 {
+    let mut dir = anchor - threat;
+    dir.y = 0.0;
+    if dir.length_squared() < 1.0 {
+        return anchor.with_y(0.0);
+    }
+    (threat + dir.normalize() * (range - 4.0)).with_y(0.0)
+}
+
 /// Utility scoring: ritorna intenti ordinati per priorità. Puro e deterministico.
+/// `last_wave_id` = ultima ondata lanciata (da `AiState`, thread di `ai_tick`):
+/// l'ondata parte al tick d'ondata oppure al primo tick pronto del periodo
+/// (catch-up: se la massa non era pronta al confine, parte appena pronta
+/// invece di aspettare 75s — e se la cadenza salta un tick d'ondata, parte al
+/// successivo). Puro: lo stato resta fuori, qui solo confronto.
 pub fn decide(
     snapshot: &AiSnapshot,
     personality: &Personality,
     scenario: Scenario,
     factories: &[FactoryView],
+    last_wave_id: u64,
 ) -> Vec<AiIntent> {
     let mut intents = Vec::new();
 
@@ -581,10 +759,13 @@ pub fn decide(
         }
     }
 
-    // 3. Tattica 0.0.17 — courage predittivo (Lanchester): attacco quando la
-    // win_prob stimata supera `courage` (0.0.19: courage effettivo = base +
-    // shift opponent ±0.1), oppure a tempo fisso per le baseline scripted
-    // (comunque vada, se c'è un esercito). La stima unisce vista live e
+    // 3. Tattica 0.0.17/0.0.20 — courage predittivo (Lanchester) a ONDE:
+    // l'ondata parte alla prima prontezza di ogni periodo (~75s) se la
+    // win_prob supera il courage effettivo (base + shift opponent ±0.1),
+    // oppure a tempo fisso per le baseline scripted (bypassano il cancello
+    // d'ondata, mai quello di difesa). Se bassa, resta a casa (niente
+    // rinforzi suicidi). Con la base minacciata niente ondata: richiamo
+    // difensivo, il micro scherma a casa. La stima unisce vista live e
     // ricordi freschi pesati per età; alla cieca resta la massa critica.
     let army_count = snapshot.army().len();
     let (my_list, foe_list) = estimate_forces(snapshot);
@@ -598,10 +779,17 @@ pub fn decide(
         win_prob > courage && army_count >= personality.army_threshold
     };
     let force_attack = army_count > 0 && snapshot.tick >= personality.attack_at_tick;
-    if (power_ok || force_attack) && army_count > 0 {
-        intents.push(AiIntent::AttackMoveAll {
-            destination: attack_destination(snapshot, scenario),
-        });
+    let on_wave = is_wave_tick(snapshot.tick);
+    // Catch-up: prima prontezza di ogni periodo (vedi doc di `decide`).
+    let wave_due = on_wave || wave_id(snapshot.tick) > last_wave_id;
+    if ((power_ok && wave_due) || force_attack) && !base_under_threat(snapshot, scenario) {
+        let group = wave_group(snapshot, personality, win_prob);
+        if !group.is_empty() {
+            intents.push(AiIntent::AttackMoveGroup {
+                units: group,
+                destination: attack_destination(snapshot, scenario),
+            });
+        }
     }
     // 0.0.19 — pattuglia frontiera (fix ramo morto: prima `army_count == 0`,
     // impossibile col Commander armato vivo, teneva lo scout in base).
@@ -638,8 +826,32 @@ pub fn decide(
         }
     }
 
-    // 4. Micro 0.0.13 — ritirata: armati sotto soglia HP ripiegano alla base.
-    // Mai i builder taskati sul sito (Build): mollare il cantiere peggiora.
+    // 4. Micro 0.0.13/0.0.20 — SOLO Retreat/Focus a 1Hz qui per compat? No:
+    // dal 0.0.20 il micro vive in `decide_micro()` a 4Hz (`micro_tick`).
+    // `decide()` resta macro (Build/Enqueue/ondate/Scout): niente doppio
+    // ordine alle stesse unità nello stesso tick.
+
+    intents
+}
+
+/// 0.0.20 — micro a 4Hz: SOLO Retreat/FocusFire/HoldAtMaxRange/Screen, in
+/// quest'ordine di priorità (il budget APM taglia dalla coda). Puro e
+/// deterministico. Screen/Hold solo per unità ferme (Idle/Hold): chi marcia
+/// in un'ondata non viene deviato (niente churn marcia↔schermo a 4Hz); chi
+/// arriva a destinazione torna Idle e si riposiziona. Retreat/Focus valgono
+/// sempre (urgenza e dominanza scavalcano la marcia).
+pub fn decide_micro(
+    snapshot: &AiSnapshot,
+    personality: &Personality,
+    scenario: Scenario,
+) -> Vec<AiIntent> {
+    let _ = scenario;
+    let mut intents = Vec::new();
+
+    // Ritirata: armati sotto soglia HP + arty ferite (<50%: inefficaci, si
+    // preservano). Mai i builder taskati sul sito. Il Commander ferito
+    // ripiega come gli altri (capitale!). L'executor porta in copertura
+    // torrette (fallback base).
     if personality.retreat_hp_frac > 0.0 {
         let mut low: Vec<Entity> = snapshot
             .my_units
@@ -647,7 +859,8 @@ pub fn decide(
             .filter(|u| {
                 crate::units::archetype(u.kind).armed
                     && u.max_health > 0.0
-                    && u.health / u.max_health < personality.retreat_hp_frac
+                    && (u.health / u.max_health < personality.retreat_hp_frac
+                        || (is_arty_role(u.kind) && u.health / u.max_health < WOUNDED_ARTY_FRAC))
                     && !matches!(u.order, UnitOrder::Build { .. })
             })
             .map(|u| u.entity)
@@ -658,10 +871,11 @@ pub fn decide(
         }
     }
 
-    // 5. Micro 0.0.17 — focus fire a priorità minaccia (dps × counter contro
-    // il kind primario proprio): prima i gun grossi, poi screen a pari
-    // priorità (hp minori, poi determinismo). Solo quando dominante
-    // (win_prob oltre soglia), mai inseguimenti suicidi.
+    // Focus fire a priorità minaccia (dps × counter contro il kind primario
+    // proprio): solo quando dominante (win_prob oltre soglia), mai
+    // inseguimenti suicidi. Stessa matematica 0.0.17.
+    let (my_list, foe_list) = estimate_forces(snapshot);
+    let win_prob = super::combat::predict_outcome(&my_list, &foe_list);
     if personality.focus_fire
         && !snapshot.visible_enemies.is_empty()
         && win_prob > FOCUS_MIN_WIN_PROB
@@ -682,7 +896,80 @@ pub fn decide(
         }
     }
 
+    // Schermo + batteria: solo a contatto live e solo per unità ferme
+    // (niente deviazioni dell'ondata in marcia). La batteria tiene la
+    // gittata sul lato armata; lo schermo sta davanti alla batteria
+    // (senza batteria: picchetto avanzato al 30% da guardia a minaccia).
+    if let Some(threat) = visible_centroid(snapshot) {
+        let mut battery: Vec<(Entity, f32)> = snapshot
+            .my_units
+            .iter()
+            .filter(|u| {
+                crate::units::archetype(u.kind).armed
+                    && is_arty_role(u.kind)
+                    && u.max_health > 0.0
+                    && u.health / u.max_health >= WOUNDED_ARTY_FRAC
+                    && matches!(u.order, UnitOrder::Idle | UnitOrder::HoldPosition)
+                    && !matches!(u.order, UnitOrder::Build { .. })
+            })
+            .map(|u| (u.entity, crate::units::archetype(u.kind).range))
+            .collect();
+        battery.sort_by_key(|(e, _)| e.to_bits());
+        let hold_spot = if battery.is_empty() {
+            None
+        } else {
+            let range = battery.iter().map(|(_, r)| *r).fold(0.0f32, f32::max);
+            let units: Vec<Entity> = battery.iter().map(|(e, _)| *e).collect();
+            let anchor = centroid_of(snapshot, &units).unwrap_or(threat);
+            Some(hold_position(anchor, threat, range))
+        };
+        let mut melee: Vec<Entity> = snapshot
+            .my_units
+            .iter()
+            .filter(|u| {
+                crate::units::archetype(u.kind).armed
+                    && !is_arty_role(u.kind)
+                    && u.kind != UnitKind::Scout
+                    && u.kind != UnitKind::Commander
+                    && u.health > 0.0
+                    && matches!(u.order, UnitOrder::Idle | UnitOrder::HoldPosition)
+                    && !matches!(u.order, UnitOrder::Build { .. })
+            })
+            .map(|u| u.entity)
+            .collect();
+        melee.sort_by_key(|e| e.to_bits());
+        if !melee.is_empty() {
+            let guard = centroid_of(snapshot, &melee).unwrap_or(threat);
+            let position = match hold_spot {
+                Some(hold) => hold.lerp(threat, 0.35).with_y(0.0),
+                None => screen_position(guard, threat),
+            };
+            intents.push(AiIntent::Screen {
+                units: melee,
+                position,
+            });
+        }
+        if let Some(position) = hold_spot {
+            let units: Vec<Entity> = battery.into_iter().map(|(e, _)| e).collect();
+            intents.push(AiIntent::HoldAtMaxRange { units, position });
+        }
+    }
+
     intents
+}
+
+/// Baricentro delle unità elencate (dalle posizioni snapshot). `None` se
+/// vuote o sparite. Puro.
+fn centroid_of(snapshot: &AiSnapshot, entities: &[Entity]) -> Option<Vec3> {
+    let mut sum = Vec3::ZERO;
+    let mut n = 0u32;
+    for u in &snapshot.my_units {
+        if entities.contains(&u.entity) {
+            sum += u.pos;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum / n as f32)
 }
 
 /// Rally default riparato: 18m verso il fronte, ma mai dentro roccia o senza
@@ -938,7 +1225,7 @@ mod tests {
     fn build_order_metal_solar_factory_in_sequence() {
         let snap = empty_snapshot(1);
         let p = Personality::TURTLE;
-        let intents = decide(&snap, &p, Scenario::Playground, &[]);
+        let intents = decide(&snap, &p, Scenario::Playground, &[], 0);
         assert_eq!(intents, vec![AiIntent::Build(BuildingKind::Metal)]);
     }
 
@@ -990,17 +1277,17 @@ mod tests {
             health: 100.0,
         });
         let _ = BTreeMap::<u8, ()>::new();
-        let rush = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
-        let turtle = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let rush = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
+        let turtle = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             rush.iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }))
         );
         // Turtle con 2 tank sotto soglia 4: non attacca.
         assert!(
             !turtle
                 .iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }))
         );
     }
 
@@ -1015,7 +1302,13 @@ mod tests {
             ..Personality::RUSHER
         };
         let snap = empty_snapshot(1);
-        let intents = decide(&snap, &p, Scenario::Playground, &[fac(1, 0, false, 1, &[])]);
+        let intents = decide(
+            &snap,
+            &p,
+            Scenario::Playground,
+            &[fac(1, 0, false, 1, &[])],
+            0,
+        );
         // Commander non è PRODUCIBLE: nessun Enqueue generato.
         assert!(
             !intents
@@ -1061,6 +1354,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
         // 6 heavy saturano il 60%: tocca al LightTank (0/3).
@@ -1076,6 +1370,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::LightTank));
     }
@@ -1092,6 +1387,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::Scout));
         let two = &[
@@ -1104,6 +1400,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
     }
@@ -1124,6 +1421,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         let kind = enqueue_kind(&intents).unwrap();
         assert_eq!(archetype(kind).tier, 1);
@@ -1133,6 +1431,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(2, 0, false, 2, &[])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank2));
     }
@@ -1144,23 +1443,23 @@ mod tests {
         // non solo il tick: la soglia temporale da sola non basta più.
         snap.income = [10.0, 24.0];
         snap.tick = 0;
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
                 .any(|i| matches!(i, AiIntent::Build(BuildingKind::LabT2)))
         );
         snap.tick = LABT2_MIN_TICK;
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(intents.contains(&AiIntent::Build(BuildingKind::LabT2)));
     }
 
     #[test]
     fn turret_defense_is_turtle_only_and_capped() {
         let snap = armed_snapshot(1, &[]);
-        let turtle = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let turtle = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(turtle.contains(&AiIntent::Build(BuildingKind::Turret)));
-        let rush = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let rush = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             !rush
                 .iter()
@@ -1179,7 +1478,7 @@ mod tests {
                     health: 100.0,
                 });
         }
-        let intents = decide(&capped, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&capped, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -1229,7 +1528,7 @@ mod tests {
         // Tank al 20% (< 0.25 rusher e < 0.35 turtle): ritirata per entrambi.
         let snap = armed_snapshot(1, &[(UnitKind::HeavyTank, max * 0.2, UnitOrder::Idle)]);
         for p in [Personality::TURTLE, Personality::RUSHER] {
-            let intents = decide(&snap, &p, Scenario::Playground, &[]);
+            let intents = decide_micro(&snap, &p, Scenario::Playground);
             assert!(
                 intents
                     .iter()
@@ -1239,7 +1538,7 @@ mod tests {
         }
         // Tank sano: nessuna ritirata.
         let healthy = armed_snapshot(1, &[(UnitKind::HeavyTank, max, UnitOrder::Idle)]);
-        let intents = decide(&healthy, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide_micro(&healthy, &Personality::TURTLE, Scenario::Playground);
         assert!(
             !intents
                 .iter()
@@ -1255,7 +1554,7 @@ mod tests {
                 UnitOrder::Build { site },
             )],
         );
-        let intents = decide(&tasked, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide_micro(&tasked, &Personality::TURTLE, Scenario::Playground);
         assert!(
             !intents
                 .iter()
@@ -1289,7 +1588,7 @@ mod tests {
             kind: UnitKind::HeavyTank,
             health: max * 0.3,
         });
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
         assert_eq!(
             intents.iter().find_map(|i| match i {
                 AiIntent::FocusFire { target } => Some(*target),
@@ -1305,7 +1604,7 @@ mod tests {
             kind: UnitKind::HeavyTank,
             health: max,
         });
-        let intents = decide(&even, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide_micro(&even, &Personality::RUSHER, Scenario::Playground);
         assert!(
             !intents
                 .iter()
@@ -1330,11 +1629,11 @@ mod tests {
         }
         // Eco completa ma niente torrette: turtle emetterebbe Build(Turret),
         // il rusher no — l'assert resta solo sull'attacco.
-        let intents = decide(&weak, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&weak, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }))
         );
         // 4 vs 1: win_prob ~1, l'ondata parte.
         let mut strong = armed_snapshot(
@@ -1347,11 +1646,11 @@ mod tests {
             ],
         );
         strong.visible_enemies.push(enemy(910));
-        let intents = decide(&strong, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&strong, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             intents
                 .iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }))
         );
     }
 
@@ -1385,6 +1684,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::LightTank));
     }
@@ -1417,7 +1717,7 @@ mod tests {
             kind: UnitKind::Artillery,
             health: archetype(UnitKind::Artillery).max_health,
         });
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
         assert_eq!(
             intents.iter().find_map(|i| match i {
                 AiIntent::FocusFire { target } => Some(*target),
@@ -1459,7 +1759,7 @@ mod tests {
                 under_construction: false,
                 health: 100.0,
             });
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert_eq!(intents, vec![AiIntent::Build(BuildingKind::Solar)]);
     }
 
@@ -1508,7 +1808,7 @@ mod tests {
         let mut snap = armed_snapshot(1, &[]);
         snap.tick = LABT2_MIN_TICK;
         snap.income = [0.0, 0.0];
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -1521,7 +1821,7 @@ mod tests {
         // Entrambi affamati: metallo 1.2×, energia 2.0× → vince il Solare
         // (la vecchia catena avrebbe preso il Metal per primo).
         let snap = eco_snapshot(1, 2, 1, 1, [10.0, 20.0], [12.0, 40.0]);
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert_eq!(intents, vec![AiIntent::Build(BuildingKind::Solar)]);
     }
 
@@ -1589,7 +1889,7 @@ mod tests {
             under_construction: false,
             health: 100.0,
         });
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(intents.contains(&AiIntent::Build(BuildingKind::Wall)));
         // Al cap (3 muri): basta.
         for i in 0..3 {
@@ -1601,14 +1901,14 @@ mod tests {
                 health: 100.0,
             });
         }
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
                 .any(|i| matches!(i, AiIntent::Build(BuildingKind::Wall)))
         );
         // Rusher non mura mai.
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -1762,7 +2062,7 @@ mod tests {
             ],
         );
         assert!(!has_fresh_eyes(&snap));
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             intents.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
             "scout cieco con armata viva deve uscire: {intents:?}"
@@ -1790,7 +2090,7 @@ mod tests {
             kind: UnitKind::HeavyTank,
             health: max,
         });
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         let scouts: Vec<Vec3> = intents
             .iter()
             .filter_map(|i| match i {
@@ -1829,7 +2129,7 @@ mod tests {
             kind: UnitKind::HeavyTank,
             health: max,
         });
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             intents.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
             "rotta calda: devia {intents:?}"
@@ -1851,7 +2151,7 @@ mod tests {
             kind: UnitKind::HeavyTank,
             health: max,
         });
-        let intents = decide(&cool, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&cool, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             !intents.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
             "rotta fredda: la finisce {intents:?}"
@@ -1927,6 +2227,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[])],
+            0,
         );
         assert_eq!(
             intents.iter().find_map(|i| match i {
@@ -1947,6 +2248,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, true, 1, &[])],
+            0,
         );
         assert!(
             !intents
@@ -2001,11 +2303,11 @@ mod tests {
     fn starved_metal_requests_metal_until_cap() {
         // Turtle affamata di metal (domanda > offerta): nuovo Metal.
         let snap = eco_snapshot(1, 1, 2, 1, [5.0, 24.0], [12.0, 10.0]);
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(intents.contains(&AiIntent::Build(BuildingKind::Metal)));
         // Al cap (3): basta, anche se affamata.
         let snap = eco_snapshot(1, 3, 2, 1, [15.0, 24.0], [30.0, 10.0]);
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -2013,7 +2315,7 @@ mod tests {
         );
         // Domanda soddisfatta: nessun nuovo Metal.
         let snap = eco_snapshot(1, 1, 2, 1, [5.0, 24.0], [4.0, 10.0]);
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -2024,11 +2326,11 @@ mod tests {
     #[test]
     fn starved_energy_requests_solar_until_cap() {
         let snap = eco_snapshot(1, 2, 1, 1, [10.0, 12.0], [5.0, 30.0]);
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(intents.contains(&AiIntent::Build(BuildingKind::Solar)));
         // Rusher al suo cap (2): basta.
         let snap = eco_snapshot(1, 2, 2, 1, [10.0, 24.0], [5.0, 60.0]);
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -2040,7 +2342,7 @@ mod tests {
     fn second_factory_needs_two_metals() {
         // Eco bilanciata ma un solo Metal: niente seconda lab.
         let snap = eco_snapshot(1, 1, 2, 1, [5.0, 24.0], [5.0, 10.0]);
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -2048,10 +2350,10 @@ mod tests {
         );
         // Due Metal: via alla seconda (sotto il cap turtle di 2).
         let snap = eco_snapshot(1, 2, 2, 1, [10.0, 24.0], [9.0, 10.0]);
-        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
         assert!(intents.contains(&AiIntent::Build(BuildingKind::Factory)));
         // Rusher resta a una sola lab per scelta.
-        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
         assert!(
             !intents
                 .iter()
@@ -2069,6 +2371,7 @@ mod tests {
             &Personality::TURTLE,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[UnitKind::Engineer])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
         // Scout accodato ma non ancora uscito: niente doppione.
@@ -2079,6 +2382,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[UnitKind::Scout])],
+            0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
     }
@@ -2093,6 +2397,7 @@ mod tests {
             &Personality::RUSHER,
             Scenario::Playground,
             &[fac(1, 0, false, 1, &[]), fac(2, 0, false, 1, &[])],
+            0,
         );
         let mut kinds: Vec<UnitKind> = intents
             .iter()
@@ -2134,10 +2439,10 @@ mod tests {
             kind: UnitKind::HeavyTank,
             health: archetype(UnitKind::HeavyTank).max_health,
         });
-        let intents = decide(&snap, &Personality::ECO_ONLY, Scenario::Playground, &[]);
+        let intents = decide(&snap, &Personality::ECO_ONLY, Scenario::Playground, &[], 0);
         assert!(!intents.iter().any(|i| matches!(
             i,
-            AiIntent::AttackMoveAll { .. } | AiIntent::FocusFire { .. }
+            AiIntent::AttackMoveGroup { .. } | AiIntent::FocusFire { .. }
         )));
     }
 
@@ -2168,11 +2473,12 @@ mod tests {
             &Personality::RUSH_SCRIPTED,
             Scenario::Playground,
             &[],
+            0,
         );
         assert!(
             !early
                 .iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }))
         );
         // ...allo schedule: l'ondata parte comunque.
         snap.tick = Personality::RUSH_SCRIPTED.attack_at_tick;
@@ -2181,11 +2487,213 @@ mod tests {
             &Personality::RUSH_SCRIPTED,
             Scenario::Playground,
             &[],
+            0,
         );
         assert!(
             late.iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveAll { .. }))
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }))
         );
+    }
+
+    #[test]
+    fn waves_tick_alignment() {
+        // Il periodo è multiplo della cadenza strategia/snapshot (1Hz vede
+        // ogni quarto tick a 4Hz): i lanci non si perdono mai.
+        assert_eq!(WAVE_PERIOD_TICKS % 4, 0);
+        assert!(is_wave_tick(0) && is_wave_tick(300) && is_wave_tick(600));
+        assert!(!is_wave_tick(1) && !is_wave_tick(299) && !is_wave_tick(301));
+        assert_eq!(wave_id(0), 0);
+        assert_eq!(wave_id(299), 0);
+        assert_eq!(wave_id(300), 1);
+    }
+
+    #[test]
+    fn waves_monotonic() {
+        use crate::units::archetype;
+        // Stessa forza dominante: l'ondata parte ai tick d'ondata, mai fuori
+        // (impulsi discreti ogni ~75s, rivalutati ogni volta).
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+            ],
+        );
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max,
+        });
+        // Come `ai_tick`: last evolve solo quando l'ondata parte davvero.
+        let mut last = 0u64;
+        let mut has_group = |tick: u64| {
+            let mut snap = snap.clone();
+            snap.tick = tick;
+            let fire = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], last)
+                .iter()
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. }));
+            if fire {
+                last = wave_id(tick);
+            }
+            fire
+        };
+        assert!(has_group(300));
+        assert!(!has_group(301));
+        assert!(!has_group(450));
+        assert!(has_group(600));
+        // Monotonia degli id d'ondata.
+        assert!(wave_id(300) < wave_id(600));
+    }
+
+    #[test]
+    fn wave_recalls_when_base_threatened() {
+        use crate::units::archetype;
+        // Stessa forza dominante, ma nemico in casa (entro 120m): niente
+        // ondata, il micro scherma a casa (richiamo difensivo).
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+            ],
+        );
+        // Casa team 1 = (260, 260): nemico a 50m dentro il raggio.
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: Vec3::new(230.0, 0.0, 230.0),
+            kind: UnitKind::HeavyTank,
+            health: max,
+        });
+        assert!(base_under_threat(&snap, Scenario::Playground));
+        snap.tick = 300;
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. })),
+            "con la base minacciata l'ondata resta a casa: {intents:?}"
+        );
+        // Il micro invece scherma: linea + batteria? (qui solo heavies).
+        let micro = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
+        assert!(
+            micro.iter().any(|i| matches!(i, AiIntent::Screen { .. })),
+            "schermo a casa: {micro:?}"
+        );
+    }
+
+    #[test]
+    fn commander_never_commits_early() {
+        use crate::units::archetype;
+        // Capitale + scorta con vittoria probabile ma non certa (0.6 < 0.9):
+        // l'ondata parte senza Commander. A 0.99 il Commander si unisce, ma
+        // mai da solo (scorta presente comunque).
+        let max_h = archetype(UnitKind::HeavyTank).max_health;
+        let max_c = archetype(UnitKind::Commander).max_health;
+        let escort = |snap: &mut AiSnapshot| {
+            snap.my_units.push(super::super::snapshot::AiUnit {
+                entity: Entity::from_bits(101),
+                pos: Vec3::ZERO,
+                kind: UnitKind::HeavyTank,
+                order: UnitOrder::Idle,
+                health: max_h,
+                max_health: max_h,
+            });
+            snap.my_units.push(super::super::snapshot::AiUnit {
+                entity: Entity::from_bits(102),
+                pos: Vec3::ZERO,
+                kind: UnitKind::HeavyTank,
+                order: UnitOrder::Idle,
+                health: max_h,
+                max_health: max_h,
+            });
+        };
+        // wave_group diretto: soglia commit rusher 0.9.
+        let mut snap = armed_snapshot(1, &[(UnitKind::Commander, max_c, UnitOrder::Idle)]);
+        escort(&mut snap);
+        let cautious = wave_group(&snap, &Personality::RUSHER, 0.6);
+        assert_eq!(cautious.len(), 2);
+        assert!(!cautious.contains(&Entity::from_bits(100)));
+        let committed = wave_group(&snap, &Personality::RUSHER, 0.99);
+        assert_eq!(committed.len(), 3);
+        assert!(committed.contains(&Entity::from_bits(100)));
+        // Solo capitale (niente scorta): mai ondata solitaria.
+        let alone = armed_snapshot(1, &[(UnitKind::Commander, max_c, UnitOrder::Idle)]);
+        assert!(wave_group(&alone, &Personality::RUSHER, 1.0).is_empty());
+    }
+
+    #[test]
+    fn arty_holds_behind_screen() {
+        use crate::units::archetype;
+        // Linea + batteria ferme a contatto live: schermo davanti, arty in
+        // gittata dietro (hold più lontano dalla minaccia dello screen).
+        let max_h = archetype(UnitKind::HeavyTank).max_health;
+        let max_a = archetype(UnitKind::Artillery).max_health;
+        let mut snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max_h, UnitOrder::Idle),
+                (UnitKind::Artillery, max_a, UnitOrder::Idle),
+            ],
+        );
+        let foe = Vec3::new(100.0, 0.0, 0.0);
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: foe,
+            kind: UnitKind::HeavyTank,
+            health: max_h,
+        });
+        let micro = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
+        let screen_pos = micro.iter().find_map(|i| match i {
+            AiIntent::Screen { position, .. } => Some(*position),
+            _ => None,
+        });
+        let hold_pos = micro.iter().find_map(|i| match i {
+            AiIntent::HoldAtMaxRange { position, .. } => Some(*position),
+            _ => None,
+        });
+        let (screen_pos, hold_pos) = (screen_pos.expect("screen"), hold_pos.expect("hold"));
+        // La batteria tiene la gittata con margine (~26m per 30m nominali),
+        // lo schermo sta davanti alla batteria senza immolarsi sul nemico.
+        assert!((hold_pos.distance(foe) - 26.0).abs() < 6.0);
+        assert!(screen_pos.distance(foe) < hold_pos.distance(foe));
+        assert!(screen_pos.distance(foe) > 5.0);
+        // Arty ferita (<50%): niente hold, va in ritirata.
+        let mut hurt = armed_snapshot(1, &[(UnitKind::Artillery, max_a * 0.4, UnitOrder::Idle)]);
+        hurt.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(901),
+            pos: foe,
+            kind: UnitKind::HeavyTank,
+            health: max_h,
+        });
+        let micro = decide_micro(&hurt, &Personality::RUSHER, Scenario::Playground);
+        assert!(
+            !micro
+                .iter()
+                .any(|i| matches!(i, AiIntent::HoldAtMaxRange { .. })),
+            "arty ferita non tiene: {micro:?}"
+        );
+        assert!(
+            micro.iter().any(|i| matches!(i, AiIntent::Retreat { .. })),
+            "arty ferita ripiega: {micro:?}"
+        );
+    }
+
+    #[test]
+    fn retreat_to_turret() {
+        // Ancora = torretta completa più vicina a casa; senza torrette, casa.
+        let home = Vec3::new(-260.0, 0.0, -260.0);
+        assert_eq!(retreat_anchor(&[], home), home);
+        let near = Vec3::new(-240.0, 0.0, -240.0);
+        let far = Vec3::new(0.0, 0.0, 0.0);
+        assert_eq!(retreat_anchor(&[far, near], home), near);
+        assert_eq!(retreat_anchor(&[near, far], home), near);
     }
 
     #[test]

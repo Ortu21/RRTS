@@ -590,15 +590,20 @@ pub fn screen_position(guard: Vec3, threat: Vec3) -> Vec3 {
 }
 
 /// 0.0.20 — posizione batteria: sul lato armata della minaccia, a
-/// `range − 4` (dentro gittata con margine). Assedio superato (sopra la
-/// minaccia): tiene il terreno. Pura.
+/// `range − 4` (dentro gittata con margine). Già in gittata (distanza
+/// ancora-minaccia <= `range − 4`): tiene il terreno (niente avanzate
+/// inutili dentro la gittata). Pura.
 pub fn hold_position(anchor: Vec3, threat: Vec3, range: f32) -> Vec3 {
     let mut dir = anchor - threat;
     dir.y = 0.0;
     if dir.length_squared() < 1.0 {
         return anchor.with_y(0.0);
     }
-    (threat + dir.normalize() * (range - 4.0)).with_y(0.0)
+    let dist = dir.length();
+    if dist <= range - 4.0 {
+        return anchor.with_y(0.0);
+    }
+    (threat + dir / dist * (range - 4.0)).with_y(0.0)
 }
 
 /// Utility scoring: ritorna intenti ordinati per priorità. Puro e deterministico.
@@ -907,6 +912,8 @@ pub fn decide_micro(
             .filter(|u| {
                 crate::units::archetype(u.kind).armed
                     && is_arty_role(u.kind)
+                    && u.kind != UnitKind::Scout
+                    && u.kind != UnitKind::Commander
                     && u.max_health > 0.0
                     && u.health / u.max_health >= WOUNDED_ARTY_FRAC
                     && matches!(u.order, UnitOrder::Idle | UnitOrder::HoldPosition)
@@ -2694,6 +2701,63 @@ mod tests {
         let far = Vec3::new(0.0, 0.0, 0.0);
         assert_eq!(retreat_anchor(&[far, near], home), near);
         assert_eq!(retreat_anchor(&[near, far], home), near);
+    }
+
+    #[test]
+    fn battery_excludes_scout_commander_explicitly() {
+        use crate::units::archetype;
+        // Anche se Scout/Commander cambiassero gittata in tabella, il filtro
+        // batteria non deve mai arruolarli: sono occhi/capitale, mai batteria.
+        let max_s = archetype(UnitKind::Scout).max_health;
+        let max_c = archetype(UnitKind::Commander).max_health;
+        let max_a = archetype(UnitKind::Artillery).max_health;
+        let mut snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::Scout, max_s, UnitOrder::Idle),
+                (UnitKind::Commander, max_c, UnitOrder::Idle),
+                (UnitKind::Artillery, max_a, UnitOrder::Idle),
+            ],
+        );
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: Vec3::new(100.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: archetype(UnitKind::HeavyTank).max_health,
+        });
+        let micro = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
+        let hold_units: Vec<Entity> = micro
+            .iter()
+            .filter_map(|i| match i {
+                AiIntent::HoldAtMaxRange { units, .. } => Some(units.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // Solo l'arty in batteria (bit 102 se ordine snapshot stabile).
+        assert_eq!(hold_units.len(), 1);
+        let arty_entity = snap
+            .my_units
+            .iter()
+            .find(|u| u.kind == UnitKind::Artillery)
+            .unwrap()
+            .entity;
+        assert!(hold_units.contains(&arty_entity));
+    }
+
+    #[test]
+    fn hold_holds_ground_when_already_in_range() {
+        // Ancora già dentro (range-4): tiene il terreno, niente avanzate.
+        let threat = Vec3::new(100.0, 0.0, 0.0);
+        let anchor_close = Vec3::new(110.0, 0.0, 0.0); // dist 10 <= 26
+        assert_eq!(
+            hold_position(anchor_close, threat, 30.0),
+            anchor_close.with_y(0.0)
+        );
+        // Fuori gittata: avanza a range-4 sul lato armata.
+        let anchor_far = Vec3::ZERO; // dist 100 > 26
+        let hold = hold_position(anchor_far, threat, 30.0);
+        assert!((hold.distance(threat) - 26.0).abs() < 0.01);
     }
 
     #[test]

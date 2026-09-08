@@ -186,10 +186,12 @@ fn footprint_occupies_and_destruction_frees_nav_without_rebuilding_unchanged_fra
             .segment_clear(Vec3::X * -10.0, Vec3::X * 10.0)
     );
     let obstacles = app.world().resource::<NavGrid>().obstacles.len();
+    let rebuilds = app.world().resource::<Occupancy>().rebuilds;
     for _ in 0..5 {
         app.update();
     }
     assert_eq!(obstacles, app.world().resource::<NavGrid>().obstacles.len());
+    assert_eq!(rebuilds, app.world().resource::<Occupancy>().rebuilds);
     app.world_mut().get_mut::<Health>(site).unwrap().current = 0.0;
     app.update();
     assert!(app.world().get_entity(site).is_err());

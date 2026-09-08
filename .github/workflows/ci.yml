@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: check + test + fog
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check
+      - name: unit tests (incl. fog data + concealment)
+        run: cargo test
+      - name: upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test
+          path: |
+            target/debug/build/**/output
+          if-no-files-found: ignore
+
+  bench-quick:
+    name: quick benchmark (movement/combat baselines)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: quick suite (correctness gates; timing descriptive only)
+        run: |
+          mkdir -p ci-artifacts/benchmark
+          RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
+            --benchmark-suite quick --output ci-artifacts/benchmark 2>&1 | tee ci-artifacts/benchmark.log
+          # Only functional correctness can fail (see report.md PASS/FAIL);
+          # timing deltas are descriptive and never gate the build.
+      - name: upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-quick
+          path: ci-artifacts/benchmark*
+
+  full-game:
+    name: full-game representative (economy + AI + fog)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: economy benchmark (industrial, reduced ticks for CI)
+        run: |
+          mkdir -p ci-artifacts/economy
+          RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
+            --economy-benchmark --ticks 600 --repeats 2 --output ci-artifacts/economy 2>&1 | tee ci-artifacts/economy.log
+      - name: ai-test (Playground + economy + fog + production, reduced ticks)
+        run: |
+          mkdir -p ci-artifacts/ai-test
+          RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
+            --benchmark --headless --workload ai-test --ticks 1800 --repeats 2 --output ci-artifacts/ai-test 2>&1 | tee ci-artifacts/ai-test.log
+      - name: ai-scenarios battery (L1 fast checks)
+        run: |
+          mkdir -p ci-artifacts/ai-scenarios
+          RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
+            --benchmark --headless --ai-scenarios --output ci-artifacts/ai-scenarios 2>&1 | tee ci-artifacts/ai-scenarios.log
+      - name: upload full-game reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-game
+          path: ci-artifacts/*
+
+  # Local-only graphical checks (no GPU on CI): fog overlay + frame pacing are
+  # validated manually via scripts/profile-visual.sh and
+  # `cargo run -- --benchmark`. CI keeps the headless fog unit tests above;
+  # baselines in benchmarks/history stay comparable because graphical runs
+  # never mix with headless artifacts (separate report `mode`).

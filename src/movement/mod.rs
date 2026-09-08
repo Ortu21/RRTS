@@ -72,7 +72,9 @@ fn move_units(
 ) {
     let dt = time.delta_secs();
     for (entity, mut transform, movement, target, kind, route) in &mut units {
-        let turn_rate = crate::units::archetype(*kind).hull_turn;
+        let stats = crate::units::archetype(*kind);
+        let turn_rate = stats.hull_turn;
+        let radius = stats.radius;
         match route {
             Some(mut route) => {
                 while route.next + 1 < route.points.len()
@@ -96,7 +98,7 @@ fn move_units(
                         remaining -= distance;
                         route.next += 1;
                     } else {
-                        steer(&mut transform, offset, remaining);
+                        steer_for(&mut transform, offset, remaining, radius);
                         break;
                     }
                 }
@@ -118,7 +120,7 @@ fn move_units(
                     commands.entity(entity).remove::<MoveTarget>();
                 } else if distance > f32::EPSILON {
                     face_toward(&mut transform, offset, turn_rate, dt);
-                    steer(&mut transform, offset, step);
+                    steer_for(&mut transform, offset, step, radius);
                 }
             }
         }
@@ -166,13 +168,23 @@ pub fn face_toward(transform: &mut Transform, offset: Vec3, turn_rate: f32, dt: 
 /// stay explicit at call sites so benchmarks keep exact destinations.
 /// Returns nothing; deterministic bit-for-bit with the inline code it
 /// replaces (clamping an in-bounds position is an exact no-op).
+/// Legacy scout-margin wrapper around [`steer_for`]; kept for tests and
+/// external callers.
+#[allow(dead_code)]
 pub fn steer(transform: &mut Transform, wish_dir: Vec3, max_step: f32) {
+    steer_for(transform, wish_dir, max_step, 0.5);
+}
+
+/// Body-aware [`steer`]: clamps to `HALF_SIZE - clearance_for(radius)` so
+/// large hulls (Commander 1.7) never step into a rim their planner rejected.
+/// Small hulls keep the exact legacy bound.
+pub fn steer_for(transform: &mut Transform, wish_dir: Vec3, max_step: f32, radius: f32) {
     let flat = Vec3::new(wish_dir.x, 0.0, wish_dir.z);
     if flat.length_squared() <= f32::EPSILON || max_step <= 0.0 {
         return;
     }
     transform.translation += flat.normalize_or_zero() * max_step.min(flat.length());
-    let bound = HALF_SIZE - UNIT_CLEARANCE;
+    let bound = HALF_SIZE - crate::navigation::NavGrid::clearance_for(radius).max(UNIT_CLEARANCE);
     transform.translation.x = transform.translation.x.clamp(-bound, bound);
     transform.translation.z = transform.translation.z.clamp(-bound, bound);
 }

@@ -176,8 +176,17 @@ pub fn execute_movement_and_build(
                     .copied()
                     .collect();
                 sorted.sort_by_key(|e| e.to_bits());
+                let max_radius = sorted
+                    .iter()
+                    .filter_map(|e| {
+                        units
+                            .iter()
+                            .find(|(ue, _, _, _)| ue == e)
+                            .map(|(_, _, k, _)| crate::units::archetype(*k).radius)
+                    })
+                    .fold(0.5, f32::max);
                 let slots = grid
-                    .formation(sorted.len(), home, 2.5)
+                    .formation_for(sorted.len(), home, 2.5, max_radius)
                     .unwrap_or_else(|| vec![home; sorted.len()]);
                 for (entity, slot) in sorted.into_iter().zip(slots) {
                     if unit_orders >= max_unit_orders {

@@ -541,7 +541,7 @@ fn placement_and_rally(
                 let probe = grid.cloned_with_obstacle(structures::building_obstacle(kind, point));
                 let approach =
                     structures::site_approach(&probe, point, *pos, kind.stats().half, *body);
-                probe.find_path(*pos, approach).is_some()
+                probe.find_path_for(*pos, approach, *body).is_some()
             });
             if !approach_ok {
                 placement.message =

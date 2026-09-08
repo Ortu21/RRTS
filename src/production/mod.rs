@@ -20,8 +20,13 @@ pub struct Factory {
     pub queue: VecDeque<Job>,
     pub rally: Option<Vec3>,
     pub blocked: bool,
-    /// Production tier: 1 = Factory, 2 = LabT2. Queues reject units above it.
     pub tier: u8,
+    /// Ticks to skip costly exit probes while blocked. Decremented on each
+    /// ready tick; a rally change bypasses it so re-targeting restarts
+    /// production immediately.
+    pub retry_in: u8,
+    /// Rally used at the last failed probe. `None` until the first block.
+    pub retry_rally: Option<Vec3>,
 }
 impl Default for Factory {
     fn default() -> Self {
@@ -30,6 +35,8 @@ impl Default for Factory {
             rally: None,
             blocked: false,
             tier: 1,
+            retry_in: 0,
+            retry_rally: None,
         }
     }
 }
@@ -56,6 +63,7 @@ impl Factory {
         self.queue.remove(index);
         if index == 0 {
             self.blocked = false;
+            self.retry_in = 0;
         }
     }
 }
@@ -65,6 +73,13 @@ impl Plugin for ProductionPlugin {
         app.add_systems(FixedUpdate, release_products.after(EconomyTick));
     }
 }
+
+/// Ticks to wait between exit probes for a blocked factory. At the 20 Hz
+/// economy tick this is ~1 s: a surrounded factory retries cheaply instead
+/// of burning up to 12 `find_path` searches every tick, while a freed exit
+/// still restarts production within a second. A rally change bypasses the
+/// wait so re-targeting restarts immediately.
+pub const BLOCKED_RETRY_TICKS: u8 = 20;
 
 /// Deterministic doors around the perimeter. Never search beyond the door
 /// apron: a surrounded factory must retain its product, not teleport it.
@@ -99,9 +114,11 @@ pub fn free_exit(
             }
             // An outward apron must also be reachable: don't spawn in a tiny
             // sealed pocket. A set rally additionally requires a valid route.
+            // Body-aware: the exiting hull must be able to execute the route,
+            // not just the scout margin.
             let outside = point + delta.normalize() * 4.0;
             let goal = rally.unwrap_or(outside);
-            if grid.find_path(point, goal).is_some() {
+            if grid.find_path_for(point, goal, radius).is_some() {
                 return Some(point);
             }
         }
@@ -126,9 +143,51 @@ fn release_products(
     >,
     units: Query<(&Transform, &CollisionRadius), With<Unit>>,
 ) {
-    let mut occupied: Vec<_> = units.iter().map(|(t, r)| (t.translation, r.0)).collect();
     let mut sorted: Vec<_> = factories.iter_mut().collect();
+    if sorted.is_empty() {
+        return;
+    }
     sorted.sort_by_key(|row| row.0.to_bits());
+    // Fast path: skip the O(units) occupancy scan unless at least one live
+    // factory actually needs an exit probe this tick (ready product + either
+    // unblocked, rally-changed, or cooldown expired).
+    let needs_probe = sorted.iter().any(|(_, _, _, _, health, factory)| {
+        if health.current <= 0.0 {
+            return false;
+        }
+        if !factory
+            .queue
+            .front()
+            .is_some_and(|job| job.project.complete())
+        {
+            return false;
+        }
+        if !factory.blocked {
+            return true;
+        }
+        factory.rally != factory.retry_rally || factory.retry_in == 0
+    });
+    if !needs_probe {
+        // Still tick down blocked cooldowns so freed exits restart without
+        // ever paying for occupancy or path searches while fully stalled.
+        for (_, _, _, _, health, mut factory) in sorted {
+            if health.current <= 0.0 {
+                continue;
+            }
+            if !factory
+                .queue
+                .front()
+                .is_some_and(|job| job.project.complete())
+            {
+                continue;
+            }
+            if factory.blocked && factory.rally == factory.retry_rally && factory.retry_in > 0 {
+                factory.retry_in -= 1;
+            }
+        }
+        return;
+    }
+    let mut occupied: Option<Vec<(Vec3, f32)>> = None;
     for (_, team, transform, kind, health, mut factory) in sorted {
         if health.current <= 0.0 {
             continue;
@@ -136,17 +195,28 @@ fn release_products(
         let Some(job) = factory.queue.front().filter(|job| job.project.complete()) else {
             continue;
         };
+        // Stagger costly probes while blocked: skip the up-to-12 find_path
+        // search until the cooldown expires, unless the rally changed (fresh
+        // target may be reachable even when the old one was not).
+        if factory.blocked && factory.rally == factory.retry_rally && factory.retry_in > 0 {
+            factory.retry_in -= 1;
+            continue;
+        }
         let unit_kind = job.kind;
         let radius = units::archetype(unit_kind).radius;
+        let occupied = occupied
+            .get_or_insert_with(|| units.iter().map(|(t, r)| (t.translation, r.0)).collect());
         let Some(position) = free_exit(
             &grid,
             transform.translation,
             kind.stats().half,
             radius,
-            &occupied,
+            occupied,
             factory.rally,
         ) else {
             factory.blocked = true;
+            factory.retry_in = BLOCKED_RETRY_TICKS;
+            factory.retry_rally = factory.rally;
             continue;
         };
         let id = ids.allocate();
@@ -157,5 +227,7 @@ fn release_products(
         occupied.push((position, radius));
         factory.queue.pop_front();
         factory.blocked = false;
+        factory.retry_in = 0;
+        factory.retry_rally = None;
     }
 }

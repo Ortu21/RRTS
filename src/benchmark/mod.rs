@@ -138,17 +138,30 @@ fn crossing_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
     let start = Instant::now();
     let scenario = *world.resource::<Scenario>();
     let mut units: Vec<_> = world
-        .query::<(Entity, &Unit, &Team)>()
+        .query::<(Entity, &Unit, &Team, Option<&UnitKind>)>()
         .iter(world)
-        .map(|(entity, unit, team)| (entity, unit.0, team.0))
+        .map(|(entity, unit, team, kind)| {
+            (
+                entity,
+                unit.0,
+                team.0,
+                kind.map_or(0.5, |k| crate::units::archetype(*k).radius),
+            )
+        })
         .collect();
-    units.sort_unstable_by_key(|(_, id, _)| *id);
+    units.sort_unstable_by_key(|(_, id, _, _)| *id);
+    let max_radius = units.iter().map(|(_, _, _, r)| *r).fold(0.5, f32::max);
     let grid = world.resource::<NavGrid>();
     let destinations: [Option<Vec<Vec3>>; 2] = std::array::from_fn(|team| {
-        grid.formation(scenario.per_team(), scenario.center(1 - team), 2.5)
+        grid.formation_for(
+            scenario.per_team(),
+            scenario.center(1 - team),
+            2.5,
+            max_radius,
+        )
     });
     let mut expected = Vec::with_capacity(units.len());
-    for (entity, id, team) in units {
+    for (entity, id, team, _) in units {
         let goals = destinations[team as usize]
             .as_ref()
             .ok_or_else(|| format!("benchmark formations do not fit the map for team {team}"))?;
@@ -228,7 +241,7 @@ fn guard_order(world: &mut World) -> Result<(Vec<Vec3>, f64), String> {
         for z in [100.0, -100.0] {
             let ideal = scenario.center(team).with_z(z);
             let point = grid
-                .formation(1, ideal, 2.5)
+                .formation_for(1, ideal, 2.5, 0.65)
                 .and_then(|points| points.into_iter().next())
                 .ok_or_else(|| "guard patrol does not fit the map".to_owned())?;
             points.push(point);

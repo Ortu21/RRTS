@@ -23,6 +23,9 @@ impl Plugin for SpatialPlugin {
 pub const DEFAULT_UNIT_RADIUS: f32 = 0.55;
 
 /// Playable half-extent for unit bodies, mirroring navigation clearance.
+/// Legacy scout-margin default; per-unit clamps now use
+/// `NavGrid::clearance_for(radius)` (see `apply_avoidance`).
+#[allow(dead_code)]
 pub const MAP_BOUND: f32 = crate::navigation::HALF_SIZE - crate::navigation::UNIT_CLEARANCE;
 
 /// Ordering anchor: the index is rebuilt before path planning and combat,
@@ -247,8 +250,12 @@ pub fn apply_avoidance(
             transform.translation.z += push.y * dt;
             // Never shove units out of the playable area: out-of-bounds
             // positions fail pathfinding and strand units without routes.
-            transform.translation.x = transform.translation.x.clamp(-MAP_BOUND, MAP_BOUND);
-            transform.translation.z = transform.translation.z.clamp(-MAP_BOUND, MAP_BOUND);
+            // Body-aware so large hulls stay inside their own clearance.
+            let bound = crate::navigation::HALF_SIZE
+                - crate::navigation::NavGrid::clearance_for(own_radius.0)
+                    .max(crate::navigation::UNIT_CLEARANCE);
+            transform.translation.x = transform.translation.x.clamp(-bound, bound);
+            transform.translation.z = transform.translation.z.clamp(-bound, bound);
         });
 }
 

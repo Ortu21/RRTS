@@ -232,4 +232,32 @@ checksum/winrate.
   identici, scenari all_pass True con checksum identici (meccanismi nuovi
   coperti da unit test puri: in suite la macro resta quasi sempre occupata e
   la minaccia è vuota, quindi non scattano — nessun delta involontario).
-- [ ] 0.0.19, 0.0.20, 0.0.21 (solo spec finché approvate)
+- [x] 0.0.19 code (scout frontiera + opponent modeling, mergiato in dev)
+- [x] 0.0.20 code (onde multi-ondata + capitale protetto + micro 4Hz, mergiato in dev)
+  - `AttackMoveGroup` con `wave_group()` (mai Commander salvo commit, mai scout,
+    mai arty ferite), `commander_commit_prob` 0.95/0.9/2.0/2.0, onde 75s
+    (`WAVE_PERIOD_TICKS=300`) rivalutate `predict_outcome()`, richiamo difensivo
+    `BASE_THREAT_RADIUS=120`, split `ai_tick` 1Hz + `micro_tick` 4Hz budget 2,
+    `HoldAtMaxRange`/`Screen`, retreat in copertura torrette.
+  - Harden: batteria esclude Scout/Commander espliciti, hold tiene terreno in
+    gittata, telemetria onde/micro (`waves_launched`, `micro_orders`,
+    `commander_alive`, milestone `median_waves`/`commander_survival_rate`,
+    check `waves-micro-sane`, label `M`/`m`).
+  - `cargo test` ai 99+ verdi, `clippy -D warnings` verde, `fmt` verde,
+    `ai-test` PASS deterministico, `ai-scenarios` 6/6 PASS deterministici.
+- [x] 0.0.21 code (`.ron` + handicap + suite hardening, in dev)
+  - `personalities/*.ron` (4, `ron` transitiva via bevy 0.12) + `from_ron` +
+    test `ron_roundtrip`, `try_from_name` strict + harness strict,
+    `src/ai/difficulty.rs` (`HARD/MEDIUM/EASY`, solo freno, income 1.0),
+    `AiTeamConfig.handicap`, courage/APM/periodo applicati in `ai_tick`,
+    league `turtle-hard/medium/easy` + quick 10 pairing + test `hard_beats_easy`,
+    scenari `counter-comp` (4v1) + `commander-snipe` (vivo, 86% base),
+    harness `ron-loaded` + `difficulty-applied`, full map-pool `[0,1,2,3]`.
+  - `cargo test` ai 104 verdi, `ai-test` PASS (checksum stabili), `ai-scenarios`
+    8/8 PASS deterministici.
+- [x] Debito Punto 5 minimo: TTA gate (niente Build scaling se `tta` INF) +
+  test `planner_waits_when_broke_e2e`.
+- [ ] Debito futuro (specificato, non codice): utility scoring vero (Graham/
+  Lewis/Hanlon-Watts), threat multilayer range-aware (Mark/Zielinski/Lewis),
+  opponent con isteresi + scout information-gain (Welsh/Walsh/Zielinski),
+  threat cache perf, TrueSkill/hot-reload (mai).

@@ -443,6 +443,140 @@ fn eval_no_cheat(
     (checks, BTreeMap::new())
 }
 
+fn setup_counter_comp(app: &mut App) {
+    // 0.0.21 — counter-comp: 4 Heavy blu vs 6 Light rossi, ordini speculari.
+    // La tabella counter (Heavy 1.15 vs Light, Light 0.9 vs Heavy) deve dare
+    // vantaggio blu a parità di micro nullo. Scriptato puro, niente cervelli.
+    let ids: Vec<u32> = (0..10)
+        .map(|_| app.world_mut().resource_mut::<UnitIds>().allocate())
+        .collect();
+    {
+        let world = app.world_mut();
+        let mut cmds = world.commands();
+        for (i, id) in ids[..4].iter().enumerate() {
+            let pos = Vec3::ZERO + Vec3::new(-20.0, 0.8, (i as f32 - 1.5) * 3.0);
+            let e = spawn_combat_unit(&mut cmds, *id, Team(0), UnitKind::HeavyTank, pos);
+            crate::orders::queue_attack_move(
+                &mut cmds.entity(e),
+                Vec3::ZERO + Vec3::new(20.0, 0.0, 0.0),
+            );
+        }
+        for (i, id) in ids[4..].iter().enumerate() {
+            let pos = Vec3::ZERO + Vec3::new(20.0, 0.8, (i as f32 - 2.5) * 3.0);
+            let e = spawn_combat_unit(&mut cmds, *id, Team(1), UnitKind::LightTank, pos);
+            crate::orders::queue_attack_move(
+                &mut cmds.entity(e),
+                Vec3::ZERO + Vec3::new(-20.0, 0.0, 0.0),
+            );
+        }
+    }
+    app.world_mut().flush();
+}
+
+fn eval_counter_comp(
+    app: &mut App,
+    _series: &[super::league::MatchSample],
+) -> (Vec<CheckResult>, BTreeMap<String, f64>) {
+    let world = app.world_mut();
+    let b0 = alive_units(world, 0);
+    let b1 = alive_units(world, 1);
+    let kills = 10usize.saturating_sub(b0 + b1);
+    let m = BTreeMap::from([
+        ("blue_survivors".to_owned(), b0 as f64),
+        ("red_survivors".to_owned(), b1 as f64),
+        ("kills".to_owned(), kills as f64),
+    ]);
+    // Tabella counter motivata (dato, non logica): Heavy batte Light.
+    let table_ok =
+        (crate::economy::balance::counter_mult(UnitKind::HeavyTank, UnitKind::LightTank) - 1.15)
+            .abs()
+            < 1e-6
+            && (crate::economy::balance::counter_mult(UnitKind::LightTank, UnitKind::HeavyTank)
+                - 0.9)
+                .abs()
+                < 1e-6;
+    let mut checks = vec![
+        check(
+            "counter-table-shaped",
+            table_ok,
+            "Heavy 1.15 vs Light, Light 0.9 vs Heavy".to_owned(),
+        ),
+        check(
+            "counter-duel-resolves",
+            kills > 0,
+            format!("kills={kills} survivors={b0}v{b1}"),
+        ),
+    ];
+    // Il counter deve dare vantaggio blu (più sopravvissuti o almeno pari con
+    // kill): gate morbida ma direzionale.
+    checks.push(check(
+        "counter-blue-holds-edge",
+        b0 >= b1,
+        format!("blue={b0} red={b1}"),
+    ));
+    (checks, m)
+}
+
+fn setup_commander_snipe(app: &mut App) {
+    // 0.0.21 — commander-snipe: turtle blu + torretta prebuilt vs 4 Heavy
+    // rossi in AttackMove sulla base (caccia al capitale). Il Commander blu
+    // deve sopravvivere (capitale protetto 0.0.20: retreat + screen).
+    let world = app.world_mut();
+    let scenario = *world.resource::<Scenario>();
+    let grid = world.resource::<crate::navigation::NavGrid>().clone();
+    let base = scenario.center(0);
+    let foe = scenario.center(1);
+    let dir = (foe - base).normalize_or_zero();
+    let tpos = grid.clear_point_for(base + Vec3::new(10.0, 0.0, 10.0), 2.0);
+    spawn_building(
+        &mut world.commands(),
+        Team(0),
+        BuildingKind::Turret,
+        tpos,
+        true,
+    );
+    world.flush();
+    let ids: Vec<u32> = (0..4)
+        .map(|_| app.world_mut().resource_mut::<UnitIds>().allocate())
+        .collect();
+    {
+        let world = app.world_mut();
+        let mut cmds = world.commands();
+        let side = Vec3::new(-dir.z, 0.0, dir.x);
+        for (i, id) in ids.into_iter().enumerate() {
+            let pos = base + dir * 150.0 + side * ((i as f32 - 1.5) * 4.0);
+            let e = spawn_combat_unit(&mut cmds, id, Team(1), UnitKind::HeavyTank, pos.with_y(0.8));
+            crate::orders::queue_attack_move(&mut cmds.entity(e), base);
+        }
+    }
+    app.world_mut().flush();
+}
+
+fn eval_commander_snipe(
+    app: &mut App,
+    _series: &[super::league::MatchSample],
+) -> (Vec<CheckResult>, BTreeMap<String, f64>) {
+    let world = app.world_mut();
+    let cmd = commander_alive(world, 0);
+    let hp = base_hp_fraction(world, 0);
+    let (honest, honest_detail) = fog_honest(world, 0);
+    let (clean, clean_detail) = nav_clean(world);
+    let m = BTreeMap::from([
+        ("base_hp_pct".to_owned(), hp * 100.0),
+        ("commander_alive".to_owned(), if cmd { 1.0 } else { 0.0 }),
+    ]);
+    let checks = vec![
+        check(
+            "snipe-commander-alive",
+            cmd,
+            "commander must survive focused rush".to_owned(),
+        ),
+        check("snipe-fog-honest", honest, honest_detail),
+        check("snipe-nav-clean", clean, clean_detail),
+    ];
+    (checks, m)
+}
+
 pub fn all_scenarios() -> Vec<ScenarioDef> {
     vec![
         ScenarioDef {
@@ -487,6 +621,20 @@ pub fn all_scenarios() -> Vec<ScenarioDef> {
             setup: setup_empty,
             evaluate: eval_no_cheat,
         },
+        ScenarioDef {
+            id: "counter-comp",
+            description: "4 heavy blu vs 6 light rossi: vantaggio counter",
+            ticks: 3600,
+            setup: setup_counter_comp,
+            evaluate: eval_counter_comp,
+        },
+        ScenarioDef {
+            id: "commander-snipe",
+            description: "turtle+torretta vs 4 heavy snipe: capitale vivo",
+            ticks: 3600,
+            setup: setup_commander_snipe,
+            evaluate: eval_commander_snipe,
+        },
     ]
 }
 
@@ -517,6 +665,8 @@ fn brains_for(id: &str) -> (Option<Personality>, Option<Personality>) {
         "micro-duel" => (None, None),
         "siege" => (None, None),
         "no-cheat" => (Some(P::TURTLE), Some(P::RUSHER)),
+        "counter-comp" => (None, None),
+        "commander-snipe" => (Some(P::TURTLE), None),
         _ => (None, None),
     }
 }
@@ -619,13 +769,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn battery_has_six_unique_scenarios() {
+    fn battery_has_eight_unique_scenarios() {
         let defs = all_scenarios();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 8);
         let mut ids: Vec<&str> = defs.iter().map(|d| d.id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 8);
         for def in &defs {
             assert!(def.ticks >= 1800, "{} troppo corto", def.id);
             assert!(!def.description.is_empty());
@@ -634,11 +784,11 @@ mod tests {
 
     #[test]
     fn every_scenario_has_a_brain_or_a_script() {
-        // micro-duel e siege sono scriptati puri (niente cervelli), gli altri
-        // hanno almeno un cervello che gioca.
+        // micro-duel, siege e counter-comp sono scriptati puri (niente
+        // cervelli), gli altri hanno almeno un cervello che gioca.
         for def in all_scenarios() {
             let (blue, red) = brains_for(def.id);
-            if def.id == "micro-duel" || def.id == "siege" {
+            if def.id == "micro-duel" || def.id == "siege" || def.id == "counter-comp" {
                 assert!(blue.is_none() && red.is_none(), "{}", def.id);
             } else {
                 assert!(blue.is_some() || red.is_some(), "{}", def.id);

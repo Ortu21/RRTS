@@ -22,6 +22,9 @@ pub const ENGINEER_SIGHT: f32 = 22.0;
 pub const STORAGE: [f64; 2] = [1000.0, 1500.0];
 pub const INITIAL_STOCK: [f64; 2] = [400.0, 220.0];
 pub const MAX_QUEUE: usize = 12;
+/// Moltiplicatore income del deposito centrale (G1): il Metal sopra rende
+/// il doppio. Dato di tuning come gli altri (vedi `MetalDeposit::mult`).
+pub const CENTER_YIELD_MULT: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Cost {

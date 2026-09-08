@@ -1,4 +1,9 @@
 //! MVP base construction: one site/team, fixed team work rate, factory radius.
+mod deposits;
+pub use deposits::{
+    MetalDeposit, MetalDeposits, MetalYield, Mirror, SPOT_CAPTURE, SPOT_MAGNET,
+    apply_deposit_yield, count_free, free_deposits, generate_deposits, metal_spot_ok, nearest_free,
+};
 mod visuals;
 pub use visuals::draw_rallies;
 #[cfg(test)]
@@ -54,6 +59,7 @@ impl Plugin for StructuresPlugin {
         app.init_resource::<Placement>()
             .init_resource::<Occupancy>()
             .add_systems(Startup, setup_base.after(crate::units::spawn_units))
+            .add_systems(Startup, setup_deposits)
             .add_systems(FixedUpdate, finish_sites.after(EconomyTick))
             .add_systems(
                 Update,
@@ -72,7 +78,62 @@ impl Plugin for StructuresPlugin {
             .add_systems(PostUpdate, sync_occupancy.after(DeathSystems));
         if self.visuals {
             app.add_plugins(visuals::BuildingVisualsPlugin);
+            app.add_systems(Startup, spawn_deposit_markers.after(setup_deposits));
         }
+    }
+}
+
+/// Depositi metallo (G1): terreno generato da grid + spawn, identico per ogni
+/// team. Option-res: harness di test senza mappa girano a depositi vuoti
+/// (regola chiusa → niente Metal, mai panic).
+fn setup_deposits(
+    mut commands: Commands,
+    grid: Option<Res<NavGrid>>,
+    scenario: Option<Res<Scenario>>,
+) {
+    let deposits = match (grid, scenario) {
+        (Some(grid), Some(scenario)) => {
+            let a = scenario.center(0).xz();
+            let b = scenario.center(1).xz();
+            generate_deposits(&grid, a, b, Mirror::Point)
+        }
+        _ => Vec::new(),
+    };
+    commands.insert_resource(MetalDeposits(deposits));
+}
+
+/// Marker depositi (solo grafica): cristalli oro, centro più grosso e caldo.
+/// Neutri e sempre visibili: sono terreno, mai coperti dal fog.
+fn spawn_deposit_markers(
+    mut commands: Commands,
+    deposits: Res<MetalDeposits>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    use std::f32::consts::FRAC_PI_4;
+    let gold = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.75, 0.2),
+        unlit: true,
+        ..default()
+    });
+    let hot = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.45, 0.1),
+        unlit: true,
+        ..default()
+    });
+    for dep in &deposits.0 {
+        let s = if dep.mult > 1.0 { 1.7 } else { 1.0 };
+        let mat = if dep.mult > 1.0 {
+            hot.clone()
+        } else {
+            gold.clone()
+        };
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(1.4 * s, 2.4 * s, 1.4 * s))),
+            MeshMaterial3d(mat),
+            Transform::from_translation(dep.pos.with_y(1.2 * s))
+                .with_rotation(Quat::from_rotation_y(FRAC_PI_4)),
+        ));
     }
 }
 pub fn spawn_building(

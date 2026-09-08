@@ -309,6 +309,23 @@ fn actions(
 }
 /// Build-grid overlay during placement: 2m lines in a patch around the
 /// snapped cursor, brighter every 10m. Visual-only, no sim state.
+/// G1: magnete Metal→deposito per il ghost: snappa allo spot più vicino
+/// entro `SPOT_MAGNET`, altrimenti lascia il punto (la regola rifiuta con
+/// messaggio). Puro e deterministico.
+fn snap_to_deposit(deposits: &[crate::structures::MetalDeposit], point: Vec3) -> Vec3 {
+    let mut best: Option<(f32, Vec3)> = None;
+    for dep in deposits {
+        let d = dep.pos.xz().distance_squared(point.xz());
+        if d <= crate::structures::SPOT_MAGNET * crate::structures::SPOT_MAGNET
+            && best.is_none_or(|(bd, _)| d < bd)
+        {
+            best = Some((d, dep.pos));
+        }
+    }
+    best.map(|(_, p)| point.with_x(p.x).with_z(p.z))
+        .unwrap_or(point)
+}
+
 fn draw_build_grid(gizmos: &mut Gizmos, center: Vec3) {
     use structures::BUILD_GRID;
     let half = 12.0;
@@ -369,6 +386,7 @@ fn placement_and_rally(
     units: Query<(&Transform, &CollisionRadius), With<Unit>>,
     interactions: Query<&Interaction, With<BlocksMap>>,
     view: Res<ViewState>,
+    deposits: Option<Res<crate::structures::MetalDeposits>>,
     mut gizmos: Gizmos,
 ) {
     if !window.focused {
@@ -390,13 +408,29 @@ fn placement_and_rally(
         return;
     };
     if let Some(kind) = placement.kind {
+        // Harness senza StructuresPlugin: depositi vuoti = regola chiusa
+        // (niente Metal), mai panic su risorsa assente.
+        let empty = crate::structures::MetalDeposits::default();
+        let deposits = deposits.as_deref().unwrap_or(&empty);
         // Grid-based: rule, preview, spawn and march all use the snapped
         // point so the site lands exactly where the ghost was.
+        // G1: il Metal snappa al deposito (magnete), così il ghost cade
+        // sempre sullo spot e la regola sotto conferma.
         let point = structures::snap_to_grid(point);
+        let point = if kind == BuildingKind::Metal {
+            snap_to_deposit(&deposits.0, point)
+        } else {
+            point
+        };
         let base: Vec<_> = buildings
             .iter()
             .filter(|r| r.4.current > 0.0)
             .map(|(t, k, p, c, _)| (*t, *k, p.translation, c))
+            .collect();
+        let metals: Vec<Vec3> = base
+            .iter()
+            .filter(|(_, k, _, _)| *k == BuildingKind::Metal)
+            .map(|(_, _, p, _)| *p)
             .collect();
         // Live builders only: the dead neither enable placement nor build.
         let live: Vec<_> = builders
@@ -420,7 +454,8 @@ fn placement_and_rally(
         let occupied: Vec<_> = units.iter().map(|(p, r)| (p.translation, r.0)).collect();
         let mut valid = structures::placement_rule(Team(view.team), point, &base, &live_builders)
             .and_then(|()| structures::valid_ground(&grid, kind, point, &occupied))
-            .and_then(|()| structures::factory_spawn_ok(&grid, kind, point));
+            .and_then(|()| structures::factory_spawn_ok(&grid, kind, point))
+            .and_then(|()| structures::metal_spot_ok(&deposits.0, kind, point, &metals));
         if tasked.is_empty() && valid.is_ok() {
             valid = Err("Tasked builders lost — pick builders and retry");
         }
@@ -449,6 +484,27 @@ fn placement_and_rally(
         };
         let s = kind.stats();
         draw_build_grid(&mut gizmos, point);
+        // G1: mentre piazzi Metal evidenzia i depositi (oro liberi, rossi
+        // occupati, anello largo per il centrale a mult).
+        if kind == BuildingKind::Metal {
+            for dep in &deposits.0 {
+                let taken = metals
+                    .iter()
+                    .any(|p| p.xz().distance(dep.pos.xz()) <= structures::SPOT_CAPTURE);
+                gizmos.circle(
+                    Isometry3d::new(
+                        dep.pos.with_y(0.15),
+                        Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                    ),
+                    if dep.mult > 1.0 { 4.5 } else { 3.5 },
+                    if taken {
+                        Color::srgb(1.0, 0.25, 0.15)
+                    } else {
+                        Color::srgb(1.0, 0.8, 0.25)
+                    },
+                );
+            }
+        }
         gizmos.cube(
             Transform::from_translation(point.with_y(s.height * 0.5)).with_scale(Vec3::new(
                 s.half.x * 2.0,

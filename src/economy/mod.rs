@@ -189,6 +189,7 @@ fn tick(
             &Transform,
             &Health,
             Has<Construction>,
+            Option<&crate::structures::MetalYield>,
         ),
         With<Building>,
     >,
@@ -225,7 +226,7 @@ fn tick(
     // Sort producers too: determinism does not depend on chunk/archetype migration.
     let mut sorted: Vec<_> = buildings.iter().collect();
     sorted.sort_by_key(|row| row.0.to_bits());
-    for (entity, team, kind, transform, health, construction) in sorted {
+    for (entity, team, kind, transform, health, construction, metal_yield) in sorted {
         if health.current <= 0.0 {
             continue;
         }
@@ -240,8 +241,11 @@ fn tick(
                 site_power(entity, transform.translation, team.0, &flat, any_builders);
             Some((&site.0, build_power, true))
         } else {
+            // G1: il Metal eredita il mult dallo spot (1.0 fuori regola =
+            // spawn diretti di test/scenari). Solo Metal porta il componente.
+            let mult = metal_yield.map(|y| y.0).unwrap_or(1.0).max(0.0);
             for r in 0..2 {
-                account.income[r] += kind.stats().income[r];
+                account.income[r] += kind.stats().income[r] * mult as f64;
             }
             None
         };

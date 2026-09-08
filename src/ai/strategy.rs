@@ -397,6 +397,22 @@ pub fn decide(
 
     // 1. Macro a loop chiuso: bootstrap + scaling a domanda.
     // Legge stock/income/demand invece di costruire "a memoria".
+    // G1 — Metal solo su spot liberi (propri + nemici visibili chiudono):
+    // senza spot si passa oltre (solare/altro), mai code intasate.
+    let mut metal_pos: Vec<Vec3> = snapshot
+        .my_buildings
+        .iter()
+        .filter(|b| b.kind == BuildingKind::Metal)
+        .map(|b| b.pos)
+        .collect();
+    metal_pos.extend(
+        snapshot
+            .visible_enemy_buildings
+            .iter()
+            .filter(|b| b.kind == BuildingKind::Metal)
+            .map(|b| b.pos),
+    );
+    let metal_free = crate::structures::count_free(&snapshot.deposits, &metal_pos);
     if snapshot.active_site.is_none() {
         let metal = snapshot.count_building(BuildingKind::Metal);
         let solar = snapshot.count_building(BuildingKind::Solar);
@@ -406,7 +422,7 @@ pub fn decide(
             snapshot.demand[0] > snapshot.income[0] * 1.1 && snapshot.income[0] > 0.0;
         let energy_starved =
             snapshot.demand[1] > snapshot.income[1] * 1.1 && snapshot.income[1] > 0.0;
-        if metal == 0 {
+        if metal == 0 && metal_free > 0 {
             intents.push(AiIntent::Build(BuildingKind::Metal));
         } else if solar == 0 {
             intents.push(AiIntent::Build(BuildingKind::Solar));
@@ -414,7 +430,7 @@ pub fn decide(
             intents.push(AiIntent::Build(BuildingKind::Factory));
         } else if personality.second_solar && solar < 2 {
             intents.push(AiIntent::Build(BuildingKind::Solar));
-        } else if metal_starved && metal < personality.max_metals {
+        } else if metal_starved && metal < personality.max_metals && metal_free > 0 {
             intents.push(AiIntent::Build(BuildingKind::Metal));
         } else if energy_starved && solar < personality.max_solars {
             intents.push(AiIntent::Build(BuildingKind::Solar));
@@ -592,6 +608,47 @@ pub fn default_rally(grid: &crate::navigation::NavGrid, from: Vec3, target: Vec3
 }
 
 /// Ricerca deterministica dello spot edificabile: spirale dal centro base.
+/// Stand-off reale + path builder (bordo footprint, non centro) sulla grid
+/// CON il futuro edificio. Condiviso da spirale e spot Metal: stessa garanzia
+/// anti-tasche per entrambi (vedi doc di `find_build_spot`).
+fn approach_ok(
+    grid: &crate::navigation::NavGrid,
+    kind: BuildingKind,
+    point: Vec3,
+    builder_pos: Vec3,
+) -> bool {
+    // Raggio scafo conservativo (commander 1.4) così vale per tutti.
+    // Validato sulla grid CON il futuro edificio: il suo stesso ostacolo può
+    // sigillare l'approach (lab grandi in basi dense).
+    let probe = grid.cloned_with_obstacle(building_obstacle(kind, point));
+    let approach = site_approach(&probe, point, builder_pos, kind.stats().half, 1.4);
+    probe.find_path(builder_pos, approach).is_some()
+}
+
+/// G1 — spot Metal: libero più vicino al builder (parità → mult maggiore,
+/// poi xz), con le stesse garanzie della spirale (`valid_ground` + approach).
+/// Occupati = Metal vivi di qualsiasi team (conteso = chiuso). Mai spirale:
+/// la regola è hard, senza spot niente Build (il chiamante salta il tick).
+pub fn find_metal_spot(
+    grid: &crate::navigation::NavGrid,
+    deposits: &[crate::structures::MetalDeposit],
+    metals: &[Vec3],
+    builder_pos: Vec3,
+    units: &[(Vec3, f32)],
+) -> Option<Vec3> {
+    let mut remaining = crate::structures::free_deposits(deposits, metals);
+    while let Some(dep) = crate::structures::nearest_free(&remaining, &[], builder_pos) {
+        remaining.retain(|d| d.pos != dep.pos);
+        if valid_ground(grid, BuildingKind::Metal, dep.pos, units).is_err() {
+            continue;
+        }
+        if approach_ok(grid, BuildingKind::Metal, dep.pos, builder_pos) {
+            return Some(dep.pos);
+        }
+    }
+    None
+}
+
 /// Ritorna il primo punto con `valid_ground` + `placement_rule` + path dal
 /// builder — e per le Factory anche una porta d'uscita libera, così le truppe
 /// in coda spawnano sempre (niente lab murati vivi).
@@ -630,11 +687,7 @@ pub fn find_build_spot(
             }
             // Stand-off reale del builder (bordo footprint, non centro):
             // raggio scafo conservativo (commander 1.4) così vale per tutti.
-            // Validato sulla grid CON il futuro edificio: il suo stesso
-            // ostacolo può sigillare l'approach (lab grandi in basi dense).
-            let probe = grid.cloned_with_obstacle(building_obstacle(kind, point));
-            let approach = site_approach(&probe, point, builder_pos, kind.stats().half, 1.4);
-            if probe.find_path(builder_pos, approach).is_none() {
+            if !approach_ok(grid, kind, point, builder_pos) {
                 continue;
             }
             return Some(point);
@@ -649,9 +702,19 @@ mod tests {
     use crate::orders::UnitOrder;
     use std::collections::BTreeMap;
 
+    fn home_deposit() -> crate::structures::MetalDeposit {
+        // G1: mondo con un deposito libero (i test che vogliono lo spot
+        // occupato lo coprono con edifici nemici/propri sopra).
+        crate::structures::MetalDeposit {
+            pos: Vec3::new(30.0, 0.0, 0.0),
+            mult: 1.0,
+        }
+    }
+
     fn empty_snapshot(team: u8) -> AiSnapshot {
         AiSnapshot {
             team,
+            deposits: vec![home_deposit()],
             ..Default::default()
         }
     }
@@ -1167,6 +1230,62 @@ mod tests {
         let map = super::super::threat::build_threat(&snap);
         assert!(power > 0.0);
         assert!((power - map.max()).abs() < 0.001);
+    }
+
+    #[test]
+    fn metal_without_free_spot_falls_through_to_solar() {
+        // G1: unico deposito occupato dal nemico visibile → niente Metal,
+        // la macro passa al Solare invece di intasarsi.
+        let mut snap = empty_snapshot(1);
+        snap.visible_enemy_buildings
+            .push(super::super::snapshot::AiBuilding {
+                entity: Entity::from_bits(800),
+                kind: BuildingKind::Metal,
+                pos: home_deposit().pos,
+                under_construction: false,
+                health: 100.0,
+            });
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert_eq!(intents, vec![AiIntent::Build(BuildingKind::Solar)]);
+    }
+
+    #[test]
+    fn metal_spot_picks_nearest_free_and_skips_occupied() {
+        use crate::navigation::{CELL_SIZE, HALF_SIZE, NavGrid};
+        use crate::structures::MetalDeposit;
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, vec![]);
+        let deps = vec![
+            MetalDeposit {
+                pos: Vec3::new(0.0, 0.0, 0.0),
+                mult: 1.0,
+            },
+            MetalDeposit {
+                pos: Vec3::new(100.0, 0.0, 0.0),
+                mult: 2.0,
+            },
+        ];
+        let builder = Vec3::new(10.0, 0.0, 0.0);
+        // Libero più vicino.
+        assert_eq!(
+            find_metal_spot(&grid, &deps, &[], builder, &[]),
+            Some(Vec3::new(0.0, 0.0, 0.0))
+        );
+        // Occupato → il lontano.
+        assert_eq!(
+            find_metal_spot(&grid, &deps, &[Vec3::new(1.0, 0.0, 0.0)], builder, &[]),
+            Some(Vec3::new(100.0, 0.0, 0.0))
+        );
+        // Tutto occupato → niente.
+        assert_eq!(
+            find_metal_spot(
+                &grid,
+                &deps,
+                &[Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0)],
+                builder,
+                &[]
+            ),
+            None
+        );
     }
 
     #[test]

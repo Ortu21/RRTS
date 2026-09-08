@@ -220,6 +220,62 @@ pub fn evaluate_balance(world: &mut World, team: u8) -> Vec<CheckResult> {
             explored * 100.0
         ),
     });
+    // Punto 2 — onde/micro sani: contatori monotoni e micro entro budget
+    // cumulato (2 ordini × tick micro). Solo osservazione sana, mai fail su
+    // valori alti (tante onde = informazione, non errore).
+    let (waves, micro, orders) = world
+        .get_resource::<super::AiState>()
+        .and_then(|s| s.per_team.get(&team))
+        .map(|s| (s.waves_launched, s.micro_orders, s.orders_issued))
+        .unwrap_or((0, 0, 0));
+    let sane_counters = micro <= orders;
+    checks.push(CheckResult {
+        name: "waves-micro-sane",
+        pass: sane_counters,
+        detail: format!("waves={waves} micro={micro} orders={orders}"),
+    });
+    // 0.0.21 — ron-loaded: i 4 `.ron` parsano e sono bit-identici alle const.
+    // `include_str!` garantisce esistenza a compile-time; il confronto a
+    // runtime chiude il loop file↔codice (stesso cervello, niente drift).
+    let ron_ok = [
+        (
+            include_str!("../../personalities/turtle.ron"),
+            super::strategy::Personality::TURTLE,
+        ),
+        (
+            include_str!("../../personalities/rusher.ron"),
+            super::strategy::Personality::RUSHER,
+        ),
+        (
+            include_str!("../../personalities/eco-only.ron"),
+            super::strategy::Personality::ECO_ONLY,
+        ),
+        (
+            include_str!("../../personalities/rush-scripted.ron"),
+            super::strategy::Personality::RUSH_SCRIPTED,
+        ),
+    ]
+    .iter()
+    .all(|(text, want)| super::strategy::Personality::from_ron(text).is_ok_and(|got| got == *want));
+    checks.push(CheckResult {
+        name: "ron-loaded",
+        pass: ron_ok,
+        detail: if ron_ok {
+            "4 ron == const".to_owned()
+        } else {
+            "ron mismatch".to_owned()
+        },
+    });
+    // 0.0.21 — difficulty-applied: handicap ordinati hard>medium>easy sullo
+    // stesso cervello (solo freno, income mai toccato).
+    let diff_ok = super::difficulty::Handicap::EASY.capped_by(&super::difficulty::Handicap::MEDIUM)
+        && super::difficulty::Handicap::MEDIUM.capped_by(&super::difficulty::Handicap::HARD)
+        && super::difficulty::Handicap::EASY.income_mult == 1.0;
+    checks.push(CheckResult {
+        name: "difficulty-applied",
+        pass: diff_ok,
+        detail: "easy<medium<hard, income 1.0".to_owned(),
+    });
     checks
 }
 

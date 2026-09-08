@@ -102,6 +102,10 @@ fn collect_report(app: &mut App, team: u8, ticks: usize, _samples: Vec<f64>) -> 
 }
 
 pub fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    // 0.0.21 — strict come league: personalità ignote sono errore, mai
+    // fallback silenzioso a turtle (allinea from_name a resolve_brain).
+    super::strategy::Personality::try_from_name(&config.ai_personality)
+        .map_err(|e| format!("{e}; use one of: turtle, rusher, eco-only, rush-scripted"))?;
     let team = config.ai_team;
     // Catena completa Metal->Solar->Factory->Tank richiede ~80-100s sim:
     // 7200 tick Update (120s) di default. Se l'utente passa --ticks esplicito,

@@ -163,11 +163,94 @@ impl Personality {
     };
 
     pub fn from_name(name: &str) -> Self {
+        Self::try_from_name(name).unwrap_or(Self::TURTLE)
+    }
+
+    /// 0.0.21 — strict come `league::resolve_brain`: nomi ignoti sono errore,
+    /// mai fallback silenzioso. `from_name()` resta compat (fallback turtle).
+    pub fn try_from_name(name: &str) -> Result<Self, String> {
         match name {
-            "rusher" => Self::RUSHER,
-            "eco-only" => Self::ECO_ONLY,
-            "rush-scripted" => Self::RUSH_SCRIPTED,
-            _ => Self::TURTLE,
+            "turtle" => Ok(Self::TURTLE),
+            "rusher" => Ok(Self::RUSHER),
+            "eco-only" => Ok(Self::ECO_ONLY),
+            "rush-scripted" => Ok(Self::RUSH_SCRIPTED),
+            other => Err(format!(
+                "Unknown personality '{other}'; use one of: turtle, rusher, eco-only, rush-scripted"
+            )),
+        }
+    }
+
+    /// 0.0.21 — carica da `.ron` (`personalities/*.ron`, `ron` transitiva via
+    /// bevy, vedi `cargo tree -i ron`). Il `name` viene leakato a `&'static`
+    /// (4 caricamenti, mai hot-reload). Errore = stringa, mai panic.
+    pub fn from_ron(text: &str) -> Result<Self, String> {
+        let def: PersonalityDef = ron::de::from_str(text).map_err(|e| e.to_string())?;
+        Ok(Self {
+            name: Box::leak(def.name.into_boxed_str()),
+            army_threshold: def.army_threshold,
+            courage: def.courage,
+            engineer_first: def.engineer_first,
+            second_solar: def.second_solar,
+            mix: def.mix,
+            max_turrets: def.max_turrets,
+            max_walls: def.max_walls,
+            max_metals: def.max_metals,
+            max_solars: def.max_solars,
+            max_factories: def.max_factories,
+            max_engineers: def.max_engineers,
+            retreat_hp_frac: def.retreat_hp_frac,
+            focus_fire: def.focus_fire,
+            attack_at_tick: def.attack_at_tick,
+            scout_threat_weight: def.scout_threat_weight,
+            commander_commit_prob: def.commander_commit_prob,
+        })
+    }
+}
+
+/// 0.0.21 — forma serializzabile di `Personality` per `.ron` (nome owned,
+/// resto identico). `Personality` resta `Copy` con `&'static str` per il sim;
+/// la conversione fa `Box::leak` una volta per caricamento.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersonalityDef {
+    pub name: String,
+    pub army_threshold: usize,
+    pub courage: f32,
+    pub engineer_first: bool,
+    pub second_solar: bool,
+    pub mix: [(UnitKind, u32); 3],
+    pub max_turrets: usize,
+    pub max_walls: usize,
+    pub max_metals: usize,
+    pub max_solars: usize,
+    pub max_factories: usize,
+    pub max_engineers: usize,
+    pub retreat_hp_frac: f32,
+    pub focus_fire: bool,
+    pub attack_at_tick: u64,
+    pub scout_threat_weight: f32,
+    pub commander_commit_prob: f32,
+}
+
+impl From<&Personality> for PersonalityDef {
+    fn from(p: &Personality) -> Self {
+        Self {
+            name: p.name.to_owned(),
+            army_threshold: p.army_threshold,
+            courage: p.courage,
+            engineer_first: p.engineer_first,
+            second_solar: p.second_solar,
+            mix: p.mix,
+            max_turrets: p.max_turrets,
+            max_walls: p.max_walls,
+            max_metals: p.max_metals,
+            max_solars: p.max_solars,
+            max_factories: p.max_factories,
+            max_engineers: p.max_engineers,
+            retreat_hp_frac: p.retreat_hp_frac,
+            focus_fire: p.focus_fire,
+            attack_at_tick: p.attack_at_tick,
+            scout_threat_weight: p.scout_threat_weight,
+            commander_commit_prob: p.commander_commit_prob,
         }
     }
 }
@@ -650,6 +733,11 @@ pub fn decide(
         let plan = super::planner::plan_build(snapshot.stock, snapshot.income, snapshot.demand);
         let metal_starved = plan.bottleneck == Some(BuildingKind::Metal);
         let energy_starved = plan.bottleneck == Some(BuildingKind::Solar);
+        // Debito Punto 5 — TTA gate: se il collo di bottiglia non è abbordabile
+        // entro l'orizzonte (tta INF: income zero o oltre 60s), aspetta eco
+        // invece di accodare un Build che resta fermo. Il bootstrap resta
+        // incondizionato (senza primo Metal/Solar/Factory non c'è income).
+        let affordable = plan.time_to_afford_secs.is_finite();
         if metal == 0 && metal_free > 0 {
             intents.push(AiIntent::Build(BuildingKind::Metal));
         } else if solar == 0 {
@@ -658,9 +746,9 @@ pub fn decide(
             intents.push(AiIntent::Build(BuildingKind::Factory));
         } else if personality.second_solar && solar < 2 {
             intents.push(AiIntent::Build(BuildingKind::Solar));
-        } else if metal_starved && metal < personality.max_metals && metal_free > 0 {
+        } else if metal_starved && affordable && metal < personality.max_metals && metal_free > 0 {
             intents.push(AiIntent::Build(BuildingKind::Metal));
-        } else if energy_starved && solar < personality.max_solars {
+        } else if energy_starved && affordable && solar < personality.max_solars {
             intents.push(AiIntent::Build(BuildingKind::Solar));
         } else if factory < personality.max_factories && metal >= 2 {
             // Seconda lab solo a eco metal avviata (2 Metal): raddoppia il
@@ -2346,6 +2434,24 @@ mod tests {
     }
 
     #[test]
+    fn planner_waits_when_broke_e2e() {
+        // Debito Punto 5 — collo di bottiglia ma non abbordabile entro 60s
+        // (income 0.5/s su costo 100: tta 200s = INF): niente Build, aspetta eco.
+        // Stessa fame con income sano (5/s: tta 20s) costruisce.
+        let broke = eco_snapshot(1, 1, 2, 1, [0.5, 24.0], [12.0, 10.0]);
+        let intents = decide(&broke, &Personality::TURTLE, Scenario::Playground, &[], 0);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::Build(BuildingKind::Metal))),
+            "broke: aspetta eco {intents:?}"
+        );
+        let funded = eco_snapshot(1, 1, 2, 1, [5.0, 24.0], [12.0, 10.0]);
+        let intents = decide(&funded, &Personality::TURTLE, Scenario::Playground, &[], 0);
+        assert!(intents.contains(&AiIntent::Build(BuildingKind::Metal)));
+    }
+
+    #[test]
     fn second_factory_needs_two_metals() {
         // Eco bilanciata ma un solo Metal: niente seconda lab.
         let snap = eco_snapshot(1, 1, 2, 1, [5.0, 24.0], [5.0, 10.0]);
@@ -2769,5 +2875,30 @@ mod tests {
         );
         assert_eq!(Personality::from_name("rusher"), Personality::RUSHER);
         assert_eq!(Personality::from_name("???"), Personality::TURTLE);
+        // 0.0.21 — strict: ignoti sono errore, mai fallback silenzioso.
+        assert!(Personality::try_from_name("gandalf").is_err());
+        assert!(Personality::try_from_name("turtle").is_ok());
+    }
+
+    #[test]
+    fn ron_roundtrip() {
+        // 0.0.21 — 4 `.ron` bit-identici alle const (stesso cervello, file).
+        for (name, want) in [
+            ("turtle", Personality::TURTLE),
+            ("rusher", Personality::RUSHER),
+            ("eco-only", Personality::ECO_ONLY),
+            ("rush-scripted", Personality::RUSH_SCRIPTED),
+        ] {
+            let path = format!("personalities/{name}.ron");
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("manca {path}"));
+            let got = Personality::from_ron(&text).expect("ron deve parsare");
+            assert_eq!(got, want, "mismatch {name}");
+            // Roundtrip via def: ser -> de stabile.
+            let def = PersonalityDef::from(&want);
+            let ser = ron::ser::to_string(&def).expect("ron ser");
+            let back = Personality::from_ron(&ser).expect("ron de");
+            assert_eq!(back, want, "roundtrip {name}");
+        }
+        assert!(Personality::from_ron("(name: \"x\")").is_err());
     }
 }

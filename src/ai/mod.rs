@@ -13,6 +13,7 @@
 
 pub mod combat;
 pub mod debug;
+pub mod difficulty;
 pub mod director;
 pub mod executor;
 pub mod harness;
@@ -69,6 +70,8 @@ pub struct AiTeamConfig {
     pub team: u8,
     pub personality: Personality,
     pub max_orders_per_tick: usize,
+    /// 0.0.21 — handicap puro sullo stesso cervello (solo freno, mai bonus).
+    pub handicap: difficulty::Handicap,
 }
 
 impl AiTeamConfig {
@@ -77,6 +80,20 @@ impl AiTeamConfig {
             team,
             personality,
             max_orders_per_tick: 8,
+            handicap: difficulty::Handicap::default(),
+        }
+    }
+
+    pub fn with_handicap(
+        team: u8,
+        personality: Personality,
+        handicap: difficulty::Handicap,
+    ) -> Self {
+        Self {
+            team,
+            personality,
+            max_orders_per_tick: handicap.max_orders_per_tick.min(8),
+            handicap,
         }
     }
 }
@@ -131,6 +148,10 @@ pub struct AiTeamStats {
     pub orders_issued: u64,
     pub builds_done: u64,
     pub enqueues_done: u64,
+    /// Punto 2 — telemetria onde/micro: ondate lanciate (macro 1Hz) e ordini
+    /// micro (4Hz, budget 2). `orders_issued` resta il totale per compat.
+    pub waves_launched: u64,
+    pub micro_orders: u64,
 }
 
 #[derive(Resource, Default, Debug)]
@@ -308,14 +329,28 @@ fn ai_tick(
             .collect();
         factory_queues.sort_by_key(|v| v.entity.to_bits());
 
+        // 0.0.21 — handicap periodo: macro più lenta (salta tick). Deterministico
+        // su snapshot.tick (4Hz): macro_id = tick/4, corre ogni period_mult.
+        // Catch-up onde invariato: il periodo perso resta dovuto.
+        let macro_id = snapshot.tick / 4;
+        let period = brain.handicap.strategy_period_mult.max(1.0) as u64;
+        if period > 1 && macro_id % period != 0 {
+            continue;
+        }
+        // 0.0.21 — handicap courage + APM sullo stesso cervello (solo freno).
+        let mut pers = brain.personality;
+        pers.courage = (pers.courage + brain.handicap.courage_malus).clamp(0.0, 1.2);
+        let apm = brain
+            .max_orders_per_tick
+            .min(brain.handicap.max_orders_per_tick);
         let intents = strategy::decide(
             snapshot,
-            &brain.personality,
+            &pers,
             *scenario,
             &factory_queues,
             state.last_wave.get(&brain.team).copied().unwrap_or(0),
         );
-        all_intent_labels.extend(intents.iter().map(|i| format!("t{}:{i:?}", brain.team)));
+        all_intent_labels.extend(intents.iter().map(|i| format!("M{}:{i:?}", brain.team)));
         // 0.0.20 — catch-up onde: l'ondata lanciata consuma il periodo.
         if intents
             .iter()
@@ -324,6 +359,7 @@ fn ai_tick(
             state
                 .last_wave
                 .insert(brain.team, strategy::wave_id(snapshot.tick));
+            state.stats_mut(brain.team).waves_launched += 1;
         }
         if intents.is_empty() {
             continue;
@@ -342,7 +378,7 @@ fn ai_tick(
             snapshot,
             &intents,
             brain.team,
-            brain.max_orders_per_tick,
+            apm,
             &grid,
             *scenario,
             &flat_units,
@@ -447,7 +483,7 @@ fn micro_tick(
             continue;
         }
         let intents = strategy::decide_micro(snapshot, &brain.personality, *scenario);
-        micro_labels.extend(intents.iter().map(|i| format!("t{}:{i:?}", brain.team)));
+        micro_labels.extend(intents.iter().map(|i| format!("m{}:{i:?}", brain.team)));
         if intents.is_empty() {
             continue;
         }
@@ -472,6 +508,7 @@ fn micro_tick(
             &no_footprints,
         );
         state.stats_mut(brain.team).orders_issued += orders as u64;
+        state.stats_mut(brain.team).micro_orders += orders as u64;
     }
 
     if let Some(debug) = debug.as_deref_mut() {

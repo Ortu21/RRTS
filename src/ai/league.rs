@@ -58,17 +58,49 @@ pub const HISTORY_SUBDIR: &str = "ai";
 
 /// Sfidanti della league. `null` = team senza cervello (commander idle che
 /// si difende da solo): perderci è regressione critica.
-pub const CONTESTANTS: [&str; 5] = ["turtle", "rusher", "eco-only", "rush-scripted", "null"];
+/// 0.0.21 — `turtle-hard/medium/easy` = stesso turtle, handicap puro.
+pub const CONTESTANTS: [&str; 8] = [
+    "turtle",
+    "rusher",
+    "eco-only",
+    "rush-scripted",
+    "null",
+    "turtle-hard",
+    "turtle-medium",
+    "turtle-easy",
+];
 
 /// Risolve un nome in cervello opzionale (`None` = null baseline, nessun AI).
 /// Stretto: nomi ignoti sono errore, mai fallback silenzioso a turtle.
 pub fn resolve_brain(name: &str) -> Result<Option<Personality>, String> {
+    Ok(resolve_config(name)?.map(|c| c.personality))
+}
+
+/// 0.0.21 — risolve nome in config completa (cervello + handicap).
+/// `turtle-hard/medium/easy` = turtle + freno; resto come prima.
+pub fn resolve_config(name: &str) -> Result<Option<AiTeamConfig>, String> {
+    // Placeholder team 0: il chiamante imposta il team vero (vedi run_match).
     match name {
         "null" => Ok(None),
-        "turtle" => Ok(Some(Personality::TURTLE)),
-        "rusher" => Ok(Some(Personality::RUSHER)),
-        "eco-only" => Ok(Some(Personality::ECO_ONLY)),
-        "rush-scripted" => Ok(Some(Personality::RUSH_SCRIPTED)),
+        "turtle" => Ok(Some(AiTeamConfig::new(0, Personality::TURTLE))),
+        "rusher" => Ok(Some(AiTeamConfig::new(0, Personality::RUSHER))),
+        "eco-only" => Ok(Some(AiTeamConfig::new(0, Personality::ECO_ONLY))),
+        "rush-scripted" => Ok(Some(AiTeamConfig::new(0, Personality::RUSH_SCRIPTED))),
+        "turtle-hard" => Ok(Some(AiTeamConfig::with_handicap(
+            0,
+            Personality::TURTLE,
+            super::difficulty::Handicap::try_from_name("hard").expect("hard noto"),
+        ))),
+        "turtle-medium" => Ok(Some(AiTeamConfig::with_handicap(
+            0,
+            Personality::TURTLE,
+            super::difficulty::Handicap::try_from_name("medium").expect("medium noto"),
+        ))),
+        "turtle-easy" => Ok(Some(AiTeamConfig::with_handicap(
+            0,
+            Personality::TURTLE,
+            super::difficulty::Handicap::try_from_name("easy").expect("easy noto"),
+        ))),
         other => Err(format!(
             "Unknown contestant '{other}'; use one of: {}",
             CONTESTANTS.join(", ")
@@ -90,7 +122,8 @@ impl MatchCase {
 }
 
 /// Matrice quick: direzioni incrociate dei main + mirror (bias detector) +
-/// copertura null/rush-scripted/eco-only. 8 pairing x 2 repeat.
+/// copertura null/rush-scripted/eco-only + hard-vs-easy (difficoltà).
+/// 10 pairing x 2 repeat.
 pub fn quick_matrix() -> Vec<(String, String)> {
     [
         ("turtle", "rusher"),
@@ -101,6 +134,8 @@ pub fn quick_matrix() -> Vec<(String, String)> {
         ("rusher", "null"),
         ("rusher", "rush-scripted"),
         ("rusher", "eco-only"),
+        ("turtle-hard", "turtle-easy"),
+        ("turtle-easy", "turtle-hard"),
     ]
     .into_iter()
     .map(|(b, r)| (b.to_owned(), r.to_owned()))
@@ -125,7 +160,8 @@ pub fn full_matrix() -> Vec<(String, String)> {
 }
 
 pub fn match_seeds(full: bool) -> Vec<u64> {
-    if full { vec![0, 1] } else { vec![0] }
+    // 0.0.21 — map-pool 4 seed in full (nightly); quick resta seed 0.
+    if full { vec![0, 1, 2, 3] } else { vec![0] }
 }
 
 /// App di match: stesso Playground + plugin dell'harness, ma con 0-2 cervelli
@@ -142,6 +178,11 @@ pub(crate) fn build_match_app(
     if let Some(p) = red {
         teams.push(AiTeamConfig::new(1, p));
     }
+    build_match_app_with_configs(teams, seed)
+}
+
+/// 0.0.21 — variante con handicap (config complete, team già assegnati).
+pub(crate) fn build_match_app_with_configs(teams: Vec<AiTeamConfig>, seed: u64) -> App {
     let grid = if seed == 0 {
         NavGrid::default()
     } else {
@@ -271,6 +312,13 @@ pub struct TeamSample {
     pub threat_mean: f64,
     #[serde(default)]
     pub threat_max: f64,
+    /// Punto 2 — telemetria onde/micro + capitale (solo osservazione).
+    #[serde(default)]
+    pub waves_launched: u64,
+    #[serde(default)]
+    pub micro_orders: u64,
+    #[serde(default)]
+    pub commander_alive: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -328,6 +376,15 @@ pub(crate) fn sample_teams(world: &mut World, tick: usize) -> MatchSample {
             .and_then(|s| s.per_team.get(&id))
             .map(|s| s.orders_issued + s.builds_done + s.enqueues_done)
             .unwrap_or(0);
+        let (waves_launched, micro_orders) = world
+            .get_resource::<super::AiState>()
+            .and_then(|s| s.per_team.get(&id))
+            .map(|s| (s.waves_launched, s.micro_orders))
+            .unwrap_or((0, 0));
+        let commander_alive = world
+            .query_filtered::<(&Team, &Health), (With<Unit>, With<crate::units::Commander>)>()
+            .iter(world)
+            .any(|(t, h)| t.0 == id && h.current > 0.0);
         let (blocked_factories, queued_units) = world
             .query_filtered::<(&Team, &crate::production::Factory), With<Building>>()
             .iter(world)
@@ -352,6 +409,9 @@ pub(crate) fn sample_teams(world: &mut World, tick: usize) -> MatchSample {
             queued_units,
             threat_mean,
             threat_max,
+            waves_launched,
+            micro_orders,
+            commander_alive,
         }
     };
     MatchSample {
@@ -373,6 +433,11 @@ pub struct MatchGame {
     pub mean_ms: f64,
     pub first_blood_tick: Option<usize>,
     pub max_army: [f64; 2],
+    /// Punto 2 — ondate lanciate e capitale vivo a fine match (osservazione).
+    #[serde(default)]
+    pub waves: [u64; 2],
+    #[serde(default)]
+    pub commander_alive: [bool; 2],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -387,9 +452,16 @@ pub struct MatchCaseResult {
 
 /// Gioca un match fino a game-over (early exit), stallo o cap.
 pub fn run_match(case: &MatchCase, repeat: usize, ticks_cap: usize) -> MatchGame {
-    let blue = resolve_brain(&case.blue).expect("league validates names first");
-    let red = resolve_brain(&case.red).expect("league validates names first");
-    let mut app = build_match_app(blue, red, case.seed);
+    let mut blue_cfg = resolve_config(&case.blue).expect("league validates names first");
+    let mut red_cfg = resolve_config(&case.red).expect("league validates names first");
+    if let Some(c) = blue_cfg.as_mut() {
+        c.team = 0;
+    }
+    if let Some(c) = red_cfg.as_mut() {
+        c.team = 1;
+    }
+    let teams: Vec<AiTeamConfig> = [blue_cfg, red_cfg].into_iter().flatten().collect();
+    let mut app = build_match_app_with_configs(teams, case.seed);
     let init = sample_teams(app.world_mut(), 0);
     let mut samples = vec![init];
     let mut seen = false;
@@ -466,10 +538,18 @@ pub fn run_match(case: &MatchCase, repeat: usize, ticks_cap: usize) -> MatchGame
         reason,
         ticks: final_tick,
         checksum,
-        samples,
+        samples: samples.clone(),
         mean_ms: ms_sum / ms_n.max(1) as f64,
         first_blood_tick,
         max_army,
+        waves: [
+            samples.last().map_or(0, |s| s.blue.waves_launched),
+            samples.last().map_or(0, |s| s.red.waves_launched),
+        ],
+        commander_alive: [
+            samples.last().is_some_and(|s| s.blue.commander_alive),
+            samples.last().is_some_and(|s| s.red.commander_alive),
+        ],
     }
 }
 
@@ -728,6 +808,9 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // 0.0.16 — copertura e threat shadow (solo osservazione).
     let mut explored: Vec<f64> = vec![];
     let mut threats: Vec<f64> = vec![];
+    // Punto 2 — ondate e sopravvivenza capitale (solo osservazione).
+    let mut waves: Vec<f64> = vec![];
+    let mut commander_alive_rate: Vec<f64> = vec![];
     for case in &cases {
         for game in &case.games {
             if let Some(t) = game.first_blood_tick {
@@ -735,6 +818,12 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             max_armies.push(game.max_army[0].max(game.max_army[1]));
             durations.push(game.ticks as f64);
+            waves.push((game.waves[0] + game.waves[1]) as f64);
+            commander_alive_rate.push(
+                (usize::from(game.commander_alive[0]) + usize::from(game.commander_alive[1]))
+                    as f64
+                    / 2.0,
+            );
             if let Some(last) = game.samples.last() {
                 explored.push(last.blue.explored_pct.max(last.red.explored_pct) * 100.0);
                 threats.push(last.blue.threat_max.max(last.red.threat_max));
@@ -747,6 +836,8 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         ("median_match_ticks", durations),
         ("median_explored_pct", explored),
         ("median_threat_max", threats),
+        ("median_waves", waves),
+        ("commander_survival_rate", commander_alive_rate),
     ] {
         values.sort_by(f64::total_cmp);
         let median = if values.is_empty() {
@@ -1064,11 +1155,14 @@ mod tests {
     #[test]
     fn matrices_have_expected_coverage() {
         let quick = quick_matrix();
-        assert_eq!(quick.len(), 8);
+        assert_eq!(quick.len(), 10);
         assert!(quick.contains(&("turtle".to_owned(), "turtle".to_owned())));
         assert!(quick.contains(&("rusher".to_owned(), "rusher".to_owned())));
         assert!(quick.contains(&("turtle".to_owned(), "null".to_owned())));
         assert!(quick.contains(&("rusher".to_owned(), "rush-scripted".to_owned())));
+        // 0.0.21 — hard vs easy in entrambe le direzioni (stesso cervello).
+        assert!(quick.contains(&("turtle-hard".to_owned(), "turtle-easy".to_owned())));
+        assert!(quick.contains(&("turtle-easy".to_owned(), "turtle-hard".to_owned())));
         // Niente null-vs-null mai.
         for (b, r) in quick.iter().chain(full_matrix().iter()) {
             assert!(!(b == "null" && r == "null"));
@@ -1076,6 +1170,19 @@ mod tests {
         let full = full_matrix();
         assert_eq!(full.len(), 24);
         assert!(full.contains(&("eco-only".to_owned(), "rush-scripted".to_owned())));
+    }
+
+    #[test]
+    fn hard_beats_easy_by_construction() {
+        // 0.0.21 — stesso turtle, freno strictly maggiore su easy: hard deve
+        // avere più APM, meno malus, periodo più veloce. La misura winrate
+        // vera è nightly (full-cap); qui il gate è strutturale.
+        let hard = resolve_config("turtle-hard").unwrap().unwrap();
+        let easy = resolve_config("turtle-easy").unwrap().unwrap();
+        assert_eq!(hard.personality, easy.personality);
+        assert!(hard.max_orders_per_tick > easy.max_orders_per_tick);
+        assert!(hard.handicap.courage_malus < easy.handicap.courage_malus);
+        assert!(hard.handicap.strategy_period_mult < easy.handicap.strategy_period_mult);
     }
 
     #[test]

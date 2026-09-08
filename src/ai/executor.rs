@@ -40,10 +40,12 @@ pub fn execute_movement_and_build(
     // `decide()` emette mete distinte per max 2 scout, mai in pila).
     let mut tasked_scouts: Vec<Entity> = Vec::new();
 
-    // Ordine di arbitraggio = ordine del vettore da decide(): Build (una),
-    // Enqueue (solo conteggio qui), AttackMoveAll/Scout, Retreat, FocusFire.
+    // Ordine di arbitraggio = ordine del vettore da decide()/decide_micro():
+    // Build (una), Enqueue (solo conteggio qui), AttackMoveGroup/Scout,
+    // Retreat, FocusFire, Screen, HoldAtMaxRange.
     // 0.0.17: Retreat prima di FocusFire — i feriti ripiegano invece di
     // convergere sul designato; il budget APM taglia dalla coda se pieno.
+    // 0.0.20: micro a 4Hz con budget 2 (solo Retreat/Focus/Hold/Screen).
     for intent in intents {
         match intent {
             AiIntent::Build(kind) => {
@@ -126,17 +128,19 @@ pub fn execute_movement_and_build(
             AiIntent::Enqueue { factory, kind } => {
                 enqueues.push((*factory, *kind));
             }
-            AiIntent::AttackMoveAll { destination } => {
-                // 0.0.19 — gli Scout restano fuori dall'ondata: sono occhi
-                // (8.5 dps contro 11.5 di un Heavy, muoiono all'istante e
-                // costano la vista che guida il courage). La linea combatte,
-                // gli scout mappano con l'intento Scout dedicato.
+            AiIntent::AttackMoveGroup {
+                units: group,
+                destination,
+            } => {
+                // 0.0.20 — ondata: SOLO le unità elencate (la strategia ha già
+                // escluso capitale/scout/feriti/builder). Validazione viva +
+                // isteresi come prima (niente churn del planner budgetato).
+                // Solo unità ancora vive: gli intenti nascono dallo snapshot
+                // e ordinare un morto fa panic al flush.
                 let mut attackers: Vec<(Entity, UnitOrder)> = units
                     .iter()
-                    .filter(|(_, _, k, o)| {
-                        crate::units::archetype(*k).armed
-                            && *k != UnitKind::Scout
-                            && !matches!(o, UnitOrder::Build { .. })
+                    .filter(|(e, _, _, o)| {
+                        group.contains(e) && !matches!(o, UnitOrder::Build { .. })
                     })
                     .map(|(e, _, _, o)| (*e, o.clone()))
                     .collect();
@@ -153,6 +157,102 @@ pub fn execute_movement_and_build(
                         continue;
                     }
                     queue_attack_move(&mut commands.entity(entity), *destination);
+                    unit_orders += 1;
+                }
+            }
+            AiIntent::HoldAtMaxRange {
+                units: battery,
+                position,
+            } => {
+                // 0.0.20 — batteria in posizione (Move allo stand-off,
+                // acquisizione automatica all'arrivo). Riparazione body-aware
+                // sullo scafo maggiore; fallback casa se irriparabile.
+                // Isteresi: chi è già in Move lì resta.
+                let radius = battery
+                    .iter()
+                    .filter_map(|e| {
+                        units
+                            .iter()
+                            .find(|(ue, _, _, _)| ue == e)
+                            .map(|(_, _, k, _)| crate::units::archetype(*k).radius)
+                    })
+                    .fold(0.5, f32::max);
+                let mut placed: Vec<(Entity, Vec3, UnitOrder)> = units
+                    .iter()
+                    .filter(|(e, _, _, o)| {
+                        battery.contains(e) && !matches!(o, UnitOrder::Build { .. })
+                    })
+                    .map(|(e, pos, _, o)| (*e, *pos, o.clone()))
+                    .collect();
+                placed.sort_by_key(|(e, _, _)| e.to_bits());
+                let mut goal = grid.clear_point_for(*position, radius);
+                if !(grid.is_walkable(goal) && grid.has_clearance_for(goal, radius)) {
+                    goal = scenario.center(team as usize);
+                }
+                for (entity, pos, order) in placed {
+                    if unit_orders >= max_unit_orders {
+                        break;
+                    }
+                    // Isteresi sulla meta riparata (quella ordinata davvero):
+                    // confrontare l'ideale darebbe churn a ogni tick.
+                    if let UnitOrder::Move { destination: d } = &order
+                        && (goal - *d).length_squared() < 100.0
+                    {
+                        continue;
+                    }
+                    // Raggiungibilità: mete walkable ma sigillate (tasche tra
+                    // le rocce) manderebbero il planner in fail-loop a 4Hz
+                    // (l'ordine fallito viene rimosso e riemesso ogni tick).
+                    if grid.find_path_for(pos, goal, radius).is_none() {
+                        continue;
+                    }
+                    queue_move(&mut commands.entity(entity), goal);
+                    unit_orders += 1;
+                }
+            }
+            AiIntent::Screen {
+                units: line,
+                position,
+            } => {
+                // 0.0.20 — schermo davanti a batterie/base (AttackMove in
+                // posizione, ingaggia a contatto). Stessa riparazione e
+                // isteresi della batteria (sullo stesso fronte).
+                let radius = line
+                    .iter()
+                    .filter_map(|e| {
+                        units
+                            .iter()
+                            .find(|(ue, _, _, _)| ue == e)
+                            .map(|(_, _, k, _)| crate::units::archetype(*k).radius)
+                    })
+                    .fold(0.5, f32::max);
+                let mut screen: Vec<(Entity, Vec3, UnitOrder)> = units
+                    .iter()
+                    .filter(|(e, _, _, o)| {
+                        line.contains(e) && !matches!(o, UnitOrder::Build { .. })
+                    })
+                    .map(|(e, pos, _, o)| (*e, *pos, o.clone()))
+                    .collect();
+                screen.sort_by_key(|(e, _, _)| e.to_bits());
+                let mut goal = grid.clear_point_for(*position, radius);
+                if !(grid.is_walkable(goal) && grid.has_clearance_for(goal, radius)) {
+                    goal = scenario.center(team as usize);
+                }
+                for (entity, pos, order) in screen {
+                    if unit_orders >= max_unit_orders {
+                        break;
+                    }
+                    // Isteresi sulla meta riparata (vedi Hold).
+                    if let UnitOrder::AttackMove { destination: d } = &order
+                        && (goal - *d).length_squared() < 100.0
+                    {
+                        continue;
+                    }
+                    // Raggiungibilità come Hold (niente fail-loop a 4Hz).
+                    if grid.find_path_for(pos, goal, radius).is_none() {
+                        continue;
+                    }
+                    queue_attack_move(&mut commands.entity(entity), goal);
                     unit_orders += 1;
                 }
             }
@@ -197,11 +297,19 @@ pub fn execute_movement_and_build(
                 }
             }
             AiIntent::Retreat { units: low } => {
-                // Ripiego ordinato: slot in formazione attorno alla base.
-                // Isteresi: chi marcia già verso casa non viene riordinato.
-                // Solo unità ancora vive: gli intenti nascono dallo snapshot
-                // (fino a 1s fa) e ordinare un morto fa panic al flush.
+                // 0.0.20 — ripiego in copertura torrette: slot in formazione
+                // attorno alla torretta completa più vicina a casa (fallback
+                // casa senza torrette). Isteresi a 30m dall'ancora (gli slot
+                // stanno entro ~15m: niente churn, ma si segue l'ancora se la
+                // torretta cade). Solo unità ancora vive: gli intenti nascono
+                // dallo snapshot e ordinare un morto fa panic al flush.
                 let home = scenario.center(team as usize);
+                let turrets: Vec<Vec3> = buildings
+                    .iter()
+                    .filter(|(t, k, _, site)| t.0 == team && *k == BuildingKind::Turret && !site)
+                    .map(|(_, _, p, _)| *p)
+                    .collect();
+                let anchor = super::strategy::retreat_anchor(&turrets, home);
                 let mut sorted: Vec<Entity> = low
                     .iter()
                     .filter(|e| units.iter().any(|(ue, _, _, _)| ue == *e))
@@ -218,21 +326,27 @@ pub fn execute_movement_and_build(
                     })
                     .fold(0.5, f32::max);
                 let slots = grid
-                    .formation_for(sorted.len(), home, 2.5, max_radius)
-                    .unwrap_or_else(|| vec![home; sorted.len()]);
+                    .formation_for(sorted.len(), anchor, 2.5, max_radius)
+                    .unwrap_or_else(|| vec![anchor; sorted.len()]);
                 for (entity, slot) in sorted.into_iter().zip(slots) {
                     if unit_orders >= max_unit_orders {
                         break;
                     }
-                    let already_home = units.iter().find(|(e, _, _, _)| *e == entity).is_some_and(
-                        |(_, _, _, order)| match order {
-                            UnitOrder::Move { destination } => {
-                                destination.xz().distance(home.xz()) < 20.0
-                            }
-                            _ => false,
-                        },
-                    );
+                    let (pos, already_home) = units
+                        .iter()
+                        .find(|(e, _, _, _)| *e == entity)
+                        .map(|(_, p, _, order)| {
+                            (
+                                *p,
+                                matches!(order, UnitOrder::Move { destination } if destination.xz().distance(anchor.xz()) < 30.0),
+                            )
+                        })
+                        .unwrap_or((slot, false));
                     if already_home {
+                        continue;
+                    }
+                    // Raggiungibilità come Hold/Screen (niente fail-loop).
+                    if grid.find_path_for(pos, slot, max_radius).is_none() {
                         continue;
                     }
                     queue_move(&mut commands.entity(entity), slot);
@@ -243,7 +357,7 @@ pub fn execute_movement_and_build(
                 // Fino a 3 attaccanti vicini sul bersaglio designato.
                 // Isteresi: chi lo attacca già resta dov'è.
                 // 0.0.19 — senza Scout: i veloci in prima linea si immolano e
-                // costano gli occhi (come nell'ondata, vedi AttackMoveAll).
+                // costano gli occhi (come nell'ondata, vedi AttackMoveGroup).
                 let target_pos = snapshot
                     .visible_enemies
                     .iter()
@@ -275,4 +389,66 @@ pub fn execute_movement_and_build(
         }
     }
     (unit_orders, builds, enqueues)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{orders::UnitOrder, units::UnitKind};
+
+    fn open_grid() -> crate::navigation::NavGrid {
+        crate::navigation::NavGrid::new(
+            crate::navigation::HALF_SIZE,
+            crate::navigation::CELL_SIZE,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn micro_respects_budget() {
+        // 0.0.20 — micro a 4Hz con budget 2: 5 feriti, solo 2 ordini.
+        use crate::units::archetype;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.finish();
+        app.cleanup();
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = AiSnapshot {
+            team: 1,
+            ..Default::default()
+        };
+        let mut units = Vec::new();
+        for _ in 0..5 {
+            let e = app.world_mut().spawn_empty().id();
+            snap.my_units.push(crate::ai::snapshot::AiUnit {
+                entity: e,
+                pos: Vec3::ZERO,
+                kind: UnitKind::HeavyTank,
+                order: UnitOrder::Idle,
+                health: max * 0.1,
+                max_health: max,
+            });
+            units.push((e, Vec3::ZERO, UnitKind::HeavyTank, UnitOrder::Idle));
+        }
+        let low: Vec<Entity> = units.iter().map(|(e, _, _, _)| *e).collect();
+        let intents = vec![AiIntent::Retreat { units: low }];
+        let grid = open_grid();
+        let mut commands = app.world_mut().commands();
+        let (orders, builds, _) = execute_movement_and_build(
+            &mut commands,
+            &snap,
+            &intents,
+            1,
+            crate::ai::MICRO_BUDGET,
+            &grid,
+            crate::scenario::Scenario::Playground,
+            &units,
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(orders, 2, "budget micro = 2 ordini");
+        assert_eq!(builds, 0);
+        assert_eq!(crate::ai::MICRO_BUDGET, 2);
+    }
 }

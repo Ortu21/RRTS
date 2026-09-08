@@ -224,5 +224,12 @@ checksum/winrate.
   cervelli — repeats bit-identici, contract ok, causa non isolata (duelli
   knife-edge; identità cross-versione mai promessa). Non inseguire oltre.
 - [ ] G2 spawn E/O ACCANTONATO (decisione owner: nessuno sbilanciamento osservato,
-  si tengono spawn fissi SW/NE per stabilità suite) + 0.0.18, 0.0.19, 0.0.20,
-  0.0.21 (spec finché approvate)
+  si tengono spawn fissi SW/NE per stabilità suite)
+- [x] 0.0.18 macro (branch feat/0.0.18-macro): planner bottleneck su costi reali,
+  LabT2 con cancello eco (10/24), torrette su anchor hotspot (fallback base),
+  muri turtle (max 3, slot davanti alla torretta senza murare factory).
+  175 test verdi (14 nuovi), clippy/fmt puliti, ai-test PASS con checksum
+  identici, scenari all_pass True con checksum identici (meccanismi nuovi
+  coperti da unit test puri: in suite la macro resta quasi sempre occupata e
+  la minaccia è vuota, quindi non scattano — nessun delta involontario).
+- [ ] 0.0.19, 0.0.20, 0.0.21 (solo spec finché approvate)

@@ -18,6 +18,7 @@ pub mod executor;
 pub mod harness;
 pub mod league;
 pub mod memory;
+pub mod planner;
 pub mod scenarios;
 pub mod snapshot;
 pub mod strategy;

@@ -13,6 +13,38 @@ use std::collections::BTreeMap;
 pub const MEMORY_TTL_TICKS: u64 = 240;
 /// Sotto questa età (30s) un ricordo è "fresco" per decisioni e scouting.
 pub const MEMORY_FRESH_TICKS: u64 = 120;
+/// Costante di decadimento confidence (0.0.19, Walsh Pro2 Ch28):
+/// `confidence = 1/(1+age/K)` con età in tick snapshot (4Hz).
+/// Stesso K della threat map (`THREAT_DECAY_K`): le due non divergono mai
+/// (test `confidence_matches_threat_decay` in `threat::tests`).
+/// Uso diretto in 0.0.19+ (percezione pesata); oggi solo test: allow per
+/// clippy `-D warnings`.
+#[allow(dead_code)]
+pub const CONFIDENCE_K: f32 = 60.0;
+
+/// Confidence di un ricordo da età in tick snapshot: 1.0 a vista live,
+/// decade verso 0 (0.5 a 15s, 0.33 a 30s, 0.2 a 60s/TTL). Pura.
+/// Uso diretto in 0.0.19+; oggi solo test: allow per clippy `-D warnings`.
+#[allow(dead_code)]
+pub fn confidence(age_ticks: u64) -> f32 {
+    1.0 / (1.0 + age_ticks as f32 / CONFIDENCE_K)
+}
+
+/// Uso diretto in 0.0.19+ (classifica/decadimento per età); oggi solo test:
+/// allow per clippy `-D warnings`.
+#[allow(dead_code)]
+impl Contact {
+    /// Età in tick snapshot (4Hz) rispetto a `tick` corrente. Pura.
+    pub fn age(&self, tick: u64) -> u64 {
+        tick.saturating_sub(self.tick)
+    }
+
+    /// Confidence 0..1 del contatto a `tick` corrente (Walsh perception:
+    /// contatto → traccia → memoria con decadimento). Pura.
+    pub fn confidence(&self, tick: u64) -> f32 {
+        confidence(self.age(tick))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Contact {
@@ -142,5 +174,26 @@ mod tests {
         let centroid = remembered_centroid(&memory, 160, 100).unwrap();
         assert!((centroid.x - 10.0).abs() < 0.001);
         assert!(remembered_centroid(&memory, 10_000, 10).is_none());
+    }
+
+    #[test]
+    fn confidence_decays_with_age() {
+        // 0.0.19 — Walsh perception: 1/(1+age/60), stesso K della threat.
+        assert!((confidence(0) - 1.0).abs() < 1e-6);
+        assert!((confidence(60) - 0.5).abs() < 1e-6);
+        assert!(confidence(120) < confidence(60));
+        assert!(confidence(120) > 0.0);
+        // Metodo su Contact: età da tick assoluto.
+        let c = Contact {
+            entity_bits: 7,
+            pos: Vec3::ZERO,
+            tick: 100,
+            kind: Some(UnitKind::Scout),
+            hp: 60.0,
+            building: false,
+        };
+        assert!((c.confidence(100) - 1.0).abs() < 1e-6);
+        assert!((c.confidence(160) - confidence(60)).abs() < 1e-6);
+        assert_eq!(c.age(90), 0);
     }
 }

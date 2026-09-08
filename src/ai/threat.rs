@@ -178,6 +178,19 @@ mod tests {
     }
 
     #[test]
+    fn confidence_matches_threat_decay() {
+        // 0.0.19 — `memory::confidence` e `age_decay` stessa formula, stesso K:
+        // percezione e threat non divergono mai.
+        assert!((super::super::memory::CONFIDENCE_K - THREAT_DECAY_K).abs() < 1e-6);
+        for age in [0u64, 1, 10, 60, 120, 240] {
+            assert!(
+                (super::super::memory::confidence(age) - age_decay(age)).abs() < 1e-6,
+                "age {age}"
+            );
+        }
+    }
+
+    #[test]
     fn threat_decays_with_age() {
         assert!((age_decay(0) - 1.0).abs() < 1e-6);
         assert!(age_decay(60) < 1.0 && age_decay(60) > 0.0);

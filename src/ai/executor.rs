@@ -62,6 +62,9 @@ pub fn execute_movement_and_build(
                 // G1 — Metal solo su spot (regola hard, come il ghost player);
                 // altri edifici sulla spirale classica. Lo spot eredita il
                 // mult del deposito (centro ×2).
+                // 0.0.18 — torrette: spirale sull'hotspot minaccia (fallback
+                // base); muri: slot davanti alla prima torretta che non murano
+                // le factory. Threat dalla snapshot onesta (mai query dirette).
                 let Some(spot) = (if *kind == BuildingKind::Metal {
                     let metals: Vec<Vec3> = buildings
                         .iter()
@@ -75,7 +78,23 @@ pub fn execute_movement_and_build(
                         builder_pos,
                         unit_footprints,
                     )
+                } else if *kind == BuildingKind::Wall {
+                    let hotspot = super::threat::build_threat(snapshot)
+                        .hotspot()
+                        .unwrap_or_else(|| scenario.attack_target(team as usize));
+                    super::strategy::find_wall_spot(
+                        grid,
+                        team,
+                        buildings,
+                        builder_pos,
+                        unit_footprints,
+                        hotspot,
+                        scenario.center(team as usize),
+                    )
                 } else {
+                    let anchor = (*kind == BuildingKind::Turret)
+                        .then(|| super::threat::build_threat(snapshot).hotspot())
+                        .flatten();
                     find_build_spot(
                         grid,
                         team,
@@ -85,6 +104,7 @@ pub fn execute_movement_and_build(
                         buildings,
                         builders_live,
                         unit_footprints,
+                        anchor,
                     )
                 }) else {
                     continue;

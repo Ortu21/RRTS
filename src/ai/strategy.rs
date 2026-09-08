@@ -35,6 +35,9 @@ pub struct Personality {
     pub mix: [(UnitKind, u32); 3],
     /// Torrette difensive massime (0 = mai, solo turtle).
     pub max_turrets: usize,
+    /// 0.0.18 — muri difensivi massimi (0 = mai, solo turtle: schermo
+    /// davanti alla prima torretta verso la minaccia).
+    pub max_walls: usize,
     /// 0.0.15 — scaling: massimi per tipo (oltre il bootstrap).
     pub max_metals: usize,
     pub max_solars: usize,
@@ -63,6 +66,7 @@ impl Personality {
             (UnitKind::Artillery, 3),
         ],
         max_turrets: 2,
+        max_walls: 3,
         max_metals: 3,
         max_solars: 3,
         max_factories: 2,
@@ -83,6 +87,7 @@ impl Personality {
             (UnitKind::Artillery, 1),
         ],
         max_turrets: 0,
+        max_walls: 0,
         max_metals: 2,
         max_solars: 2,
         max_factories: 1,
@@ -106,6 +111,7 @@ impl Personality {
             (UnitKind::HeavyTank, 0),
         ],
         max_turrets: 0,
+        max_walls: 0,
         max_metals: 3,
         max_solars: 3,
         max_factories: 2,
@@ -129,6 +135,7 @@ impl Personality {
             (UnitKind::Artillery, 0),
         ],
         max_turrets: 0,
+        max_walls: 0,
         max_metals: 2,
         max_solars: 2,
         max_factories: 1,
@@ -263,6 +270,10 @@ pub fn attack_destination(snapshot: &AiSnapshot, scenario: Scenario) -> Vec3 {
 /// Tick snapshot (4Hz) minimo per il LabT2: 360 = 90s di partita. Prima il
 /// T1 deve chiudersi (placeholder della futura logica a domanda 0.0.15).
 pub const LABT2_MIN_TICK: u64 = 360;
+/// 0.0.18 — cancello eco LabT2: serve vera economia (2 Metal + 2 Solar di
+/// income), non solo il tick. Sotto soglia si espande l'eco T1.
+pub const LABT2_MIN_METAL_INCOME: f64 = 10.0;
+pub const LABT2_MIN_ENERGY_INCOME: f64 = 24.0;
 
 /// Mix produttivo T2 (kind, peso): i LabT2 inseguono queste proporzioni.
 pub const T2_MIX: [(UnitKind, u32); 2] = [(UnitKind::HeavyTank2, 2), (UnitKind::Artillery2, 1)];
@@ -417,11 +428,13 @@ pub fn decide(
         let metal = snapshot.count_building(BuildingKind::Metal);
         let solar = snapshot.count_building(BuildingKind::Solar);
         let factory = snapshot.count_building(BuildingKind::Factory);
-        // Domanda insoddisfatta (isteresi 10%): l'eco chiede più di quanto entra.
-        let metal_starved =
-            snapshot.demand[0] > snapshot.income[0] * 1.1 && snapshot.income[0] > 0.0;
-        let energy_starved =
-            snapshot.demand[1] > snapshot.income[1] * 1.1 && snapshot.income[1] > 0.0;
+        // 0.0.18 — collo di bottiglia da planner su costi reali (stock,
+        // income, demand + costi tabella): sostituisce l'euristica
+        // domanda > offerta × 1.1 a pari casi singoli, sceglie meglio se
+        // entrambe le risorse mancano (vince il deficit relativo maggiore).
+        let plan = super::planner::plan_build(snapshot.stock, snapshot.income, snapshot.demand);
+        let metal_starved = plan.bottleneck == Some(BuildingKind::Metal);
+        let energy_starved = plan.bottleneck == Some(BuildingKind::Solar);
         if metal == 0 && metal_free > 0 {
             intents.push(AiIntent::Build(BuildingKind::Metal));
         } else if solar == 0 {
@@ -441,6 +454,8 @@ pub fn decide(
         } else if snapshot.complete_building(BuildingKind::LabT2) == 0
             && snapshot.complete_building(BuildingKind::Factory) > 0
             && snapshot.tick >= LABT2_MIN_TICK
+            && snapshot.income[0] >= LABT2_MIN_METAL_INCOME
+            && snapshot.income[1] >= LABT2_MIN_ENERGY_INCOME
         {
             intents.push(AiIntent::Build(BuildingKind::LabT2));
         }
@@ -452,6 +467,15 @@ pub fn decide(
         && snapshot.count_building(BuildingKind::Turret) < personality.max_turrets
     {
         intents.push(AiIntent::Build(BuildingKind::Turret));
+    }
+    // 0.0.18 — muri: schermo davanti alla prima torretta completa (l'executor
+    // cerca gli slot verso la minaccia, senza murare le factory). Solo turtle,
+    // contati con i siti: niente doppie richieste.
+    if personality.max_walls > 0
+        && snapshot.complete_building(BuildingKind::Turret) > 0
+        && snapshot.count_building(BuildingKind::Wall) < personality.max_walls
+    {
+        intents.push(AiIntent::Build(BuildingKind::Wall));
     }
 
     // 0.0.17 — comp nemica stimata una volta per tick: guida i pesi mix
@@ -607,7 +631,81 @@ pub fn default_rally(grid: &crate::navigation::NavGrid, from: Vec3, target: Vec3
     (grid.is_walkable(repaired) && grid.has_clearance(repaired)).then_some(repaired)
 }
 
-/// Ricerca deterministica dello spot edificabile: spirale dal centro base.
+/// 0.0.18 — slot muro davanti alla torretta verso la minaccia: 3
+/// caselle perpendicolari a 10m, snappate alla build grid (schermo che
+/// rallenta, non sigillo). Puro e deterministico.
+pub fn wall_slots(turret_pos: Vec3, threat_dir: Vec3) -> Vec<Vec3> {
+    let mut dir = threat_dir;
+    dir.y = 0.0;
+    let dir = if dir.length_squared() > 1e-6 {
+        dir.normalize()
+    } else {
+        Vec3::X
+    };
+    let side = Vec3::new(-dir.z, 0.0, dir.x);
+    [-1.0, 0.0, 1.0]
+        .into_iter()
+        .map(|s| {
+            let p = turret_pos + dir * 10.0 + side * (s * 2.0);
+            snap_to_grid(p.with_y(0.0))
+        })
+        .collect()
+}
+
+/// 0.0.18 — muro mirato: prima torretta completa propria + slot
+/// verso la minaccia che (a) stanno su `valid_ground`, (b) restano
+/// raggiungibili dal builder, (c) non murano NESSUNA factory propria
+/// (porte verificate sulla grid col muro aggiunto). Fallback: nessuno spot
+/// (il chiamante salta il tick, mai muri a caso).
+#[allow(clippy::too_many_arguments)]
+pub fn find_wall_spot(
+    grid: &crate::navigation::NavGrid,
+    team: u8,
+    buildings: &[(crate::units::Team, BuildingKind, Vec3, bool)],
+    builder_pos: Vec3,
+    units: &[(Vec3, f32)],
+    threat_pos: Vec3,
+    home: Vec3,
+) -> Option<Vec3> {
+    // Prima torretta completa (xz minima = deterministico).
+    let turret = buildings
+        .iter()
+        .filter(|(t, k, _, site)| t.0 == team && *k == BuildingKind::Turret && !site)
+        .map(|(_, _, p, _)| *p)
+        .min_by(|a, b| a.x.total_cmp(&b.x).then_with(|| a.z.total_cmp(&b.z)))?;
+    let mut dir = threat_pos - turret;
+    dir.y = 0.0;
+    let dir = if dir.length_squared() > 1.0 {
+        dir.normalize()
+    } else {
+        (home - turret).normalize_or_zero()
+    };
+    for slot in wall_slots(turret, dir) {
+        if valid_ground(grid, BuildingKind::Wall, slot, units).is_err() {
+            continue;
+        }
+        if !approach_ok(grid, BuildingKind::Wall, slot, builder_pos) {
+            continue;
+        }
+        // Porte factory proprie ancora libere col muro aggiunto.
+        let probe = grid.cloned_with_obstacle(building_obstacle(BuildingKind::Wall, slot));
+        let mut seals = false;
+        for (t, k, p, _) in buildings {
+            if t.0 != team {
+                continue;
+            }
+            if factory_spawn_ok(&probe, *k, *p).is_err() {
+                seals = true;
+                break;
+            }
+        }
+        if seals {
+            continue;
+        }
+        return Some(slot);
+    }
+    None
+}
 /// Stand-off reale + path builder (bordo footprint, non centro) sulla grid
 /// CON il futuro edificio. Condiviso da spirale e spot Metal: stessa garanzia
 /// anti-tasche per entrambi (vedi doc di `find_build_spot`).
@@ -649,6 +747,8 @@ pub fn find_metal_spot(
     None
 }
 
+/// Ricerca deterministica dello spot edificabile: spirale dal centro base
+/// (0.0.18: per le torrette, prima spirale sull'anchor hotspot se dato).
 /// Ritorna il primo punto con `valid_ground` + `placement_rule` + path dal
 /// builder — e per le Factory anche una porta d'uscita libera, così le truppe
 /// in coda spawnano sempre (niente lab murati vivi).
@@ -666,31 +766,43 @@ pub fn find_build_spot(
     buildings: &[(crate::units::Team, BuildingKind, Vec3, bool)],
     builders: &[(crate::units::Team, Vec3, f32)],
     units: &[(Vec3, f32)],
+    anchor: Option<Vec3>,
 ) -> Option<Vec3> {
     use std::f32::consts::PI;
     let base = scenario.center(team as usize);
+    // 0.0.18 — torrette: prima spirale sull'anchor (hotspot minaccia),
+    // poi sulla base come fallback. Altri edifici sempre dalla base.
+    let mut centers = vec![base];
+    if kind == BuildingKind::Turret
+        && let Some(a) = anchor
+        && a.distance_squared(base) > 1.0
+    {
+        centers.insert(0, a);
+    }
     // Raggi crescenti deterministici dalla base: prima vicino (difendibile),
     // poi espansione. Angoli fissi 16 per anello = ordine stabile.
-    for radius in [10.0, 14.0, 18.0, 24.0, 32.0, 42.0, 56.0] {
-        for step in 0..16 {
-            let angle = step as f32 / 16.0 * 2.0 * PI;
-            let ideal = base + Vec3::new(angle.cos() * radius, 0.0, angle.sin() * radius);
-            let point = snap_to_grid(ideal.with_y(0.0));
-            if valid_ground(grid, kind, point, units).is_err() {
-                continue;
+    for base in centers {
+        for radius in [10.0, 14.0, 18.0, 24.0, 32.0, 42.0, 56.0] {
+            for step in 0..16 {
+                let angle = step as f32 / 16.0 * 2.0 * PI;
+                let ideal = base + Vec3::new(angle.cos() * radius, 0.0, angle.sin() * radius);
+                let point = snap_to_grid(ideal.with_y(0.0));
+                if valid_ground(grid, kind, point, units).is_err() {
+                    continue;
+                }
+                if factory_spawn_ok(grid, kind, point).is_err() {
+                    continue; // porte murate: la spirale cerca un punto libero
+                }
+                if placement_rule(crate::units::Team(team), point, buildings, builders).is_err() {
+                    return None; // sito attivo o nessun builder: inutile cercare oltre
+                }
+                // Stand-off reale del builder (bordo footprint, non centro):
+                // raggio scafo conservativo (commander 1.4) così vale per tutti.
+                if !approach_ok(grid, kind, point, builder_pos) {
+                    continue;
+                }
+                return Some(point);
             }
-            if factory_spawn_ok(grid, kind, point).is_err() {
-                continue; // porte murate: la spirale cerca un punto libero
-            }
-            if placement_rule(crate::units::Team(team), point, buildings, builders).is_err() {
-                return None; // sito attivo o nessun builder: inutile cercare oltre
-            }
-            // Stand-off reale del builder (bordo footprint, non centro):
-            // raggio scafo conservativo (commander 1.4) così vale per tutti.
-            if !approach_ok(grid, kind, point, builder_pos) {
-                continue;
-            }
-            return Some(point);
         }
     }
     None
@@ -929,6 +1041,9 @@ mod tests {
     #[test]
     fn labt2_needs_time_and_factory() {
         let mut snap = armed_snapshot(1, &[]);
+        // 0.0.18 — il LabT2 vuole eco vera (2 Metal + 2 Solar di income),
+        // non solo il tick: la soglia temporale da sola non basta più.
+        snap.income = [10.0, 24.0];
         snap.tick = 0;
         let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
         assert!(
@@ -1283,6 +1398,173 @@ mod tests {
                 &[Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0)],
                 builder,
                 &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn labt2_without_income_stays_locked() {
+        // 0.0.18 — tick ok ma eco a zero: niente LabT2 (l'eco T1 prima).
+        let mut snap = armed_snapshot(1, &[]);
+        snap.tick = LABT2_MIN_TICK;
+        snap.income = [0.0, 0.0];
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::Build(BuildingKind::LabT2)))
+        );
+    }
+
+    #[test]
+    fn planner_picks_bigger_relative_deficit() {
+        // Entrambi affamati: metallo 1.2×, energia 2.0× → vince il Solare
+        // (la vecchia catena avrebbe preso il Metal per primo).
+        let snap = eco_snapshot(1, 2, 1, 1, [10.0, 20.0], [12.0, 40.0]);
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert_eq!(intents, vec![AiIntent::Build(BuildingKind::Solar)]);
+    }
+
+    #[test]
+    fn turret_spiral_uses_hotspot_anchor() {
+        use crate::navigation::{CELL_SIZE, HALF_SIZE, NavGrid};
+        // Campo aperto: primo anello a ovest dell'anchor (dentro la mappa),
+        // non della base.
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, vec![]);
+        let base = Scenario::Playground.center(1);
+        let anchor = base + Vec3::new(-100.0, 0.0, 0.0);
+        let builders = [(crate::units::Team(1), base, 1.0)];
+        let spot = find_build_spot(
+            &grid,
+            1,
+            BuildingKind::Turret,
+            Scenario::Playground,
+            base,
+            &[],
+            &builders,
+            &[],
+            Some(anchor),
+        );
+        assert_eq!(spot, Some(anchor + Vec3::new(10.0, 0.0, 0.0)));
+        // Senza anchor: stesso primo anello ma dalla base.
+        let spot = find_build_spot(
+            &grid,
+            1,
+            BuildingKind::Turret,
+            Scenario::Playground,
+            base,
+            &[],
+            &builders,
+            &[],
+            None,
+        );
+        assert_eq!(spot, Some(base + Vec3::new(10.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn wall_slots_form_ahead_screen() {
+        // Torretta in (0,0), minaccia da +x: 3 slot a x=10, simmetrici in z.
+        let slots = wall_slots(Vec3::ZERO, Vec3::X);
+        assert_eq!(slots.len(), 3);
+        for s in &slots {
+            assert!((s.x - 10.0).abs() < 0.001, "{s:?}");
+        }
+        let mut zs: Vec<f32> = slots.iter().map(|s| s.z).collect();
+        zs.sort_by(f32::total_cmp);
+        assert_eq!(zs, vec![-2.0, 0.0, 2.0]);
+        // Direzione nulla: fallback +x, mai NaN.
+        let slots = wall_slots(Vec3::ZERO, Vec3::ZERO);
+        assert!(slots.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn walls_need_a_turret_and_respect_cap() {
+        use super::super::snapshot::AiBuilding;
+        // Turtle + torretta completa: chiede il muro.
+        let mut snap = armed_snapshot(1, &[]);
+        snap.my_buildings.push(AiBuilding {
+            entity: Entity::from_bits(700),
+            kind: BuildingKind::Turret,
+            pos: Vec3::ZERO,
+            under_construction: false,
+            health: 100.0,
+        });
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        assert!(intents.contains(&AiIntent::Build(BuildingKind::Wall)));
+        // Al cap (3 muri): basta.
+        for i in 0..3 {
+            snap.my_buildings.push(AiBuilding {
+                entity: Entity::from_bits(710 + i),
+                kind: BuildingKind::Wall,
+                pos: Vec3::new(20.0 + i as f32 * 4.0, 0.0, 0.0),
+                under_construction: false,
+                health: 100.0,
+            });
+        }
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[]);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::Build(BuildingKind::Wall)))
+        );
+        // Rusher non mura mai.
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::Build(BuildingKind::Wall)))
+        );
+    }
+
+    #[test]
+    fn wall_spot_needs_turret_leaves_factory_doors_open() {
+        use crate::navigation::{CELL_SIZE, HALF_SIZE, NavGrid};
+        use crate::units::Team;
+        let grid = NavGrid::new(HALF_SIZE, CELL_SIZE, vec![]);
+        let turret = Vec3::new(0.0, 0.0, 0.0);
+        let mine = Team(1);
+        let complete = false; // false = completa (no Construction)
+        let buildings = vec![(mine, BuildingKind::Turret, turret, complete)];
+        // Campo aperto: primo slot valido davanti (verso +x).
+        let spot = find_wall_spot(
+            &grid,
+            1,
+            &buildings,
+            Vec3::new(0.0, 0.0, -10.0),
+            &[],
+            Vec3::new(100.0, 0.0, 0.0),
+            Vec3::new(-260.0, 0.0, -260.0),
+        );
+        assert_eq!(spot, Some(Vec3::new(10.0, 0.0, -2.0)));
+        // Senza torrette: niente muri mirati.
+        assert_eq!(
+            find_wall_spot(
+                &grid,
+                1,
+                &[],
+                Vec3::new(0.0, 0.0, -10.0),
+                &[],
+                Vec3::new(100.0, 0.0, 0.0),
+                Vec3::new(-260.0, 0.0, -260.0),
+            ),
+            None
+        );
+        // Slot occupati da unità: niente (valid_ground li rifiuta tutti).
+        let bodies = vec![
+            (Vec3::new(10.0, 0.0, -2.0), 0.5),
+            (Vec3::new(10.0, 0.0, 0.0), 0.5),
+            (Vec3::new(10.0, 0.0, 2.0), 0.5),
+        ];
+        assert_eq!(
+            find_wall_spot(
+                &grid,
+                1,
+                &buildings,
+                Vec3::new(0.0, 0.0, -10.0),
+                &bodies,
+                Vec3::new(100.0, 0.0, 0.0),
+                Vec3::new(-260.0, 0.0, -260.0),
             ),
             None
         );

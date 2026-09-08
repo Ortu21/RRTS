@@ -223,4 +223,6 @@ checksum/winrate.
   Nota: micro-duel/siege cambiano esito vs baseline (6 vs 7 kill) pur senza
   cervelli — repeats bit-identici, contract ok, causa non isolata (duelli
   knife-edge; identità cross-versione mai promessa). Non inseguire oltre.
-- [ ] G2 spawn E/O + 0.0.18, 0.0.19, 0.0.20, 0.0.21 (spec finché approvate)
+- [ ] G2 spawn E/O ACCANTONATO (decisione owner: nessuno sbilanciamento osservato,
+  si tengono spawn fissi SW/NE per stabilità suite) + 0.0.18, 0.0.19, 0.0.20,
+  0.0.21 (spec finché approvate)

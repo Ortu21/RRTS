@@ -51,6 +51,10 @@ pub struct Personality {
     /// Tick snapshot (4Hz) oltre il quale si attacca comunque (scripted
     /// baseline). `u64::MAX` = mai: solo potenza/soglie decidono.
     pub attack_at_tick: u64,
+    /// 0.0.19 — peso minaccia nella frontiera scout
+    /// (`novelty − minaccia_norm×peso` in `scout::frontier_target`).
+    /// Turtle cauto (1.2) devia di più, rusher audace (0.5) esplora dritto.
+    pub scout_threat_weight: f32,
 }
 
 impl Personality {
@@ -74,6 +78,7 @@ impl Personality {
         retreat_hp_frac: 0.35,
         focus_fire: true,
         attack_at_tick: u64::MAX,
+        scout_threat_weight: 1.2,
     };
     pub const RUSHER: Self = Self {
         name: "rusher",
@@ -95,6 +100,7 @@ impl Personality {
         retreat_hp_frac: 0.25,
         focus_fire: true,
         attack_at_tick: u64::MAX,
+        scout_threat_weight: 0.5,
     };
     /// Baseline eco-only per la league: costruisce economia fino ai cap, non
     /// attacca mai (soglia impossibile), nessun micro aggressivo. Sacco da
@@ -119,6 +125,7 @@ impl Personality {
         retreat_hp_frac: 0.0,
         focus_fire: false,
         attack_at_tick: u64::MAX,
+        scout_threat_weight: 1.0,
     };
     /// Baseline rush-scripted per la league: bootstrap + solo HeavyTank,
     /// ondata a tempo fisso comunque vada, niente ritirate né focus.
@@ -143,6 +150,7 @@ impl Personality {
         retreat_hp_frac: 0.0,
         focus_fire: false,
         attack_at_tick: 480, // 120s: l'ondata parte a tempo, comunque vada
+        scout_threat_weight: 0.5,
     };
 
     pub fn from_name(name: &str) -> Self {
@@ -238,23 +246,29 @@ pub fn has_fresh_eyes(snapshot: &AiSnapshot) -> bool {
             .any(|m| !m.building && m.age_ticks <= MEMORY_FRESH_TICKS)
 }
 
-/// Meta scouting 0.0.14: ciclo deterministico su punti strategici (base
-/// nemica, centro, fianchi). Il tick snapshot è a 4Hz: nuova meta ogni 2s.
-/// 0.0.16: riusa `AiSnapshot::fresh_troop_memory` (stessa matematica di prima,
-/// niente cambi di comportamento).
+/// Meta scouting 0.0.19: frontiera (`scout::frontier_target`:
+/// conferma del ricordo fresco + `novelty − minaccia_norm×peso` su celle
+/// `explored==false`, max 2 scout, waypoint threat-aware in executor).
+/// Sostituisce il ciclo 0.0.14 su 4 punti fissi (che mandava gli scout in
+/// roccia sui flank ±60m: il rosso `scout-nav-clean` pre-esistente).
+/// Wrapper per compat (test + chiamanti legacy): `decide()` chiama
+/// `frontier_target` col peso vero. Allow per clippy `-D warnings` fuori test.
+/// Uso diretto nei test; oggi solo test oltre a quelli: allow per clippy.
+#[allow(dead_code)]
 pub fn scout_destination(snapshot: &AiSnapshot, scenario: Scenario) -> Vec3 {
-    let foe_base = scenario.attack_target(snapshot.team as usize);
-    // Ricordo fresco di truppe: lo scout va a confermare lì.
-    if let Some(first) = snapshot.fresh_troop_memory(MEMORY_FRESH_TICKS).first() {
-        return first.pos;
-    }
-    let flank = Vec3::new(0.0, 0.0, 60.0);
-    let points = [foe_base, Vec3::ZERO, foe_base + flank, foe_base - flank];
-    points[(snapshot.tick as usize / 8) % points.len()]
+    let threat = super::threat::build_threat(snapshot);
+    // La personalità qui non è nota al chiamante legacy: usa il peso medio
+    // dei main (0.85). `decide()` chiama `frontier_target` col peso vero.
+    let fallback = Personality {
+        scout_threat_weight: 0.85,
+        ..Personality::RUSHER
+    };
+    super::scout::frontier_target(snapshot, scenario, &threat, &fallback)
 }
 
-/// Meta attacco: baricentro dei ricordi freschi se il nemico è sparito dalla
-/// vista (inseguimento onesto), altrimenti base nemica.
+/// Meta attacco: inseguimento onesto dei ricordi freschi se il nemico è
+/// sparito dalla vista, altrimenti base nemica *ricordata* (0.0.19: edifici
+/// visti guidano anche sotto fog — Walsh), altrimenti target statico.
 /// 0.0.16: riusa `AiSnapshot::remembered_centroid` (stessa matematica di
 /// `memory::remembered_centroid` su `AiMemory`, niente cambi di comportamento).
 pub fn attack_destination(snapshot: &AiSnapshot, scenario: Scenario) -> Vec3 {
@@ -263,6 +277,13 @@ pub fn attack_destination(snapshot: &AiSnapshot, scenario: Scenario) -> Vec3 {
         && centroid.is_finite()
     {
         return centroid;
+    }
+    // 0.0.19 — base nemica ricordata (edifici freschi) prima del target
+    // statico: marciare su posizioni verificate invece che su stime.
+    if let Some(base) = snapshot.remembered_building_centroid(MEMORY_FRESH_TICKS)
+        && base.is_finite()
+    {
+        return base;
     }
     scenario.attack_target(snapshot.team as usize)
 }
@@ -350,10 +371,21 @@ fn counter_edge(kind: UnitKind, foe: &[(UnitKind, f32)]) -> f32 {
         / total
 }
 
-/// Pesi mix già corretti per counter: (kind, peso*edge). Puro.
-fn weighted_mix(mix: &[(UnitKind, u32)], foe: &[(UnitKind, f32)]) -> Vec<(UnitKind, f32)> {
+/// Pesi mix già corretti per counter e opponent-bias: (kind, peso*edge*bias).
+/// Puro. 0.0.19: il bias da tabella `opponent::mix_bias` (±0.1) sposta il mix
+/// verso i counter della classe avversaria; Unknown = 1.0 = vecchio comportamento.
+fn weighted_mix(
+    mix: &[(UnitKind, u32)],
+    foe: &[(UnitKind, f32)],
+    opponent: super::opponent::OpponentKind,
+) -> Vec<(UnitKind, f32)> {
     mix.iter()
-        .map(|(kind, w)| (*kind, *w as f32 * counter_edge(*kind, foe)))
+        .map(|(kind, w)| {
+            (
+                *kind,
+                *w as f32 * counter_edge(*kind, foe) * super::opponent::mix_bias(*kind, opponent),
+            )
+        })
         .collect()
 }
 
@@ -481,6 +513,11 @@ pub fn decide(
     // 0.0.17 — comp nemica stimata una volta per tick: guida i pesi mix
     // (counter) e il predittore Lanchester. Vuota = nemico ignoto.
     let foe = foe_mix(snapshot);
+    // 0.0.19 — opponent modeling leggero: classifica da conteggi freschi +
+    // timing primo contatto + edifici visti → shift mix/courage ±0.1 da
+    // tabella. Unknown = neutro = vecchio comportamento.
+    let opponent = super::opponent::classify(snapshot);
+    let courage = super::opponent::adjust_courage(personality.courage, opponent);
 
     // 2. Produzione: una enqueue per factory libera (N lab = N code in
     // parallelo). Le bloccate si saltano: accodare lì brucia solo eco.
@@ -501,23 +538,26 @@ pub fn decide(
             && snapshot.complete_building(BuildingKind::Factory) > 0
         {
             UnitKind::Engineer
-        } else if scouts < 1
+        } else if scouts < super::scout::MAX_SCOUTS
             && !has_fresh_eyes(snapshot)
             && snapshot.complete_building(BuildingKind::Factory) > 0
             && UnitKind::PRODUCIBLE.contains(&UnitKind::Scout)
         {
-            // 0.0.14 — occhi prima di muscoli: uno Scout esploratore.
+            // 0.0.14 — occhi prima di muscoli: Scout esploratori (0.0.19: max
+            // 2, frontiera novelty−minaccia invece di un singolo punto fisso).
             UnitKind::Scout
         } else if view.tier >= 2 {
-            // LabT2: mix pesante T2 pesato per counter. Il gate di `enqueue`
-            // lo ribadisce, ma qui non si emette mai un T2 verso una T1.
-            pick_deficit(&weighted_mix(&T2_MIX, &foe), |k| {
+            // LabT2: mix pesante T2 pesato per counter + bias opponent. Il gate
+            // di `enqueue` lo ribadisce, ma qui non si emette mai un T2 verso
+            // una T1.
+            pick_deficit(&weighted_mix(&T2_MIX, &foe, opponent), |k| {
                 count_kind(snapshot, &queued_all, k)
             })
         } else {
-            // Mix T1 per deficit di copertura pesato per counter (vivi +
-            // accodati). Pesi 0 = mai (baseline eco): mix vuoto → nessuna
-            // enqueue. Nemico ignoto → edge 1.0 = vecchio comportamento.
+            // Mix T1 per deficit di copertura pesato per counter e opponent
+            // (vivi + accodati). Pesi 0 = mai (baseline eco): mix vuoto →
+            // nessuna enqueue. Nemico ignoto → edge/bias 1.0 = vecchio
+            // comportamento.
             let mix: Vec<(UnitKind, u32)> = personality
                 .mix
                 .iter()
@@ -527,7 +567,7 @@ pub fn decide(
             if mix.is_empty() {
                 continue;
             }
-            pick_deficit(&weighted_mix(&mix, &foe), |k| {
+            pick_deficit(&weighted_mix(&mix, &foe, opponent), |k| {
                 count_kind(snapshot, &queued_all, k)
             })
         };
@@ -542,9 +582,10 @@ pub fn decide(
     }
 
     // 3. Tattica 0.0.17 — courage predittivo (Lanchester): attacco quando la
-    // win_prob stimata supera `courage`, oppure a tempo fisso per le baseline
-    // scripted (comunque vada, se c'è un esercito). La stima unisce vista
-    // live e ricordi freschi pesati per età; alla cieca resta la massa critica.
+    // win_prob stimata supera `courage` (0.0.19: courage effettivo = base +
+    // shift opponent ±0.1), oppure a tempo fisso per le baseline scripted
+    // (comunque vada, se c'è un esercito). La stima unisce vista live e
+    // ricordi freschi pesati per età; alla cieca resta la massa critica.
     let army_count = snapshot.army().len();
     let (my_list, foe_list) = estimate_forces(snapshot);
     let win_prob = super::combat::predict_outcome(&my_list, &foe_list);
@@ -554,20 +595,46 @@ pub fn decide(
         // andare in overflow.
         army_count >= personality.army_threshold.saturating_add(2)
     } else {
-        win_prob > personality.courage && army_count >= personality.army_threshold
+        win_prob > courage && army_count >= personality.army_threshold
     };
     let force_attack = army_count > 0 && snapshot.tick >= personality.attack_at_tick;
     if (power_ok || force_attack) && army_count > 0 {
         intents.push(AiIntent::AttackMoveAll {
             destination: attack_destination(snapshot, scenario),
         });
-    } else if !has_fresh_eyes(snapshot) && army_count == 0 {
-        // Scout cieco: ciclo su punti strategici se hai uno scout.
-        let has_scout = snapshot.my_units.iter().any(|u| u.kind == UnitKind::Scout);
-        if has_scout {
-            intents.push(AiIntent::Scout {
-                destination: scout_destination(snapshot, scenario),
-            });
+    }
+    // 0.0.19 — pattuglia frontiera (fix ramo morto: prima `army_count == 0`,
+    // impossibile col Commander armato vivo, teneva lo scout in base).
+    // Ogni scout libero (Idle/Hold) ha sempre una meta + ogni scout in rotta
+    // verso una meta diventata CALDA (threat > soglia: lo attende un esercito
+    // avvistato dopo l'ordine — devia invece di immolarsi, visto dal vivo:
+    // lo striker moriva nei cannoni a 10m dalla base rossa).
+    // Mete = conferma del contatto perso a vista live vuota, altrimenti top-N
+    // frontiera (`novelty − minaccia_norm×peso`, ventaglio su assi distinti e
+    // corridoi in corso per max 2 scout). Indipendente dall'attacco: gli
+    // scout sono occhi, non linea — mentre l'esercito marcia, loro mappano
+    // (explored) e riacquisiscono (occhi per il courage, che attacca a soglia
+    // invece che a massa cieca: first-blood).
+    {
+        let threat = super::threat::build_threat(snapshot);
+        let free_scouts = snapshot
+            .my_units
+            .iter()
+            .filter(|u| {
+                u.kind == UnitKind::Scout
+                    && (matches!(u.order, UnitOrder::Idle | UnitOrder::HoldPosition)
+                        || matches!(u.order, UnitOrder::Move { destination }
+                        if threat.query(destination)
+                            > super::scout::SCOUT_THREAT_THRESHOLD))
+            })
+            .count();
+        let n = free_scouts.min(super::scout::MAX_SCOUTS);
+        if n > 0 {
+            for destination in
+                super::scout::frontier_targets(snapshot, scenario, &threat, personality, n)
+            {
+                intents.push(AiIntent::Scout { destination });
+            }
         }
     }
 
@@ -982,10 +1049,13 @@ mod tests {
 
     #[test]
     fn mix_chases_target_shares() {
-        // Scout vivo (niente ramo scout): a conteggi vuoti vince il peso
-        // maggiore, poi il deficit guida le scelte successive.
-        let scout = &[(UnitKind::Scout, 60.0, UnitOrder::Idle)];
-        let snap = armed_snapshot(1, scout);
+        // 0.0.19 — due Scout vivi (cap max, niente ramo scout): a conteggi
+        // vuoti vince il peso maggiore, poi il deficit guida le scelte.
+        let scouts = &[
+            (UnitKind::Scout, 60.0, UnitOrder::Idle),
+            (UnitKind::Scout, 60.0, UnitOrder::Idle),
+        ];
+        let snap = armed_snapshot(1, scouts);
         let intents = decide(
             &snap,
             &Personality::RUSHER,
@@ -995,7 +1065,7 @@ mod tests {
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
         // 6 heavy saturano il 60%: tocca al LightTank (0/3).
         let mut heavies: Vec<(UnitKind, f32, UnitOrder)> =
-            scout.iter().map(|(k, h, o)| (*k, *h, o.clone())).collect();
+            scouts.iter().map(|(k, h, o)| (*k, *h, o.clone())).collect();
         let max = crate::units::archetype(UnitKind::HeavyTank).max_health;
         for _ in 0..6 {
             heavies.push((UnitKind::HeavyTank, max, UnitOrder::Idle));
@@ -1008,6 +1078,34 @@ mod tests {
             &[fac(1, 0, false, 1, &[])],
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::LightTank));
+    }
+
+    #[test]
+    fn blind_single_scout_builds_second_up_to_cap() {
+        // 0.0.19 — max 2 scout (Welsh): con uno Scout vivo ma ancora alla
+        // cieca, la factory accoda il secondo; con due, passa ai muscoli.
+        let one = &[(UnitKind::Scout, 60.0, UnitOrder::Idle)];
+        let snap = armed_snapshot(1, one);
+        assert!(!has_fresh_eyes(&snap));
+        let intents = decide(
+            &snap,
+            &Personality::RUSHER,
+            Scenario::Playground,
+            &[fac(1, 0, false, 1, &[])],
+        );
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::Scout));
+        let two = &[
+            (UnitKind::Scout, 60.0, UnitOrder::Idle),
+            (UnitKind::Scout, 60.0, UnitOrder::Idle),
+        ];
+        let snap = armed_snapshot(1, two);
+        let intents = decide(
+            &snap,
+            &Personality::RUSHER,
+            Scenario::Playground,
+            &[fac(1, 0, false, 1, &[])],
+        );
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
     }
 
     #[test]
@@ -1572,16 +1670,35 @@ mod tests {
     }
 
     #[test]
-    fn scouting_cycles_strategic_points_and_uses_memory() {
+    fn scouting_uses_frontier_and_memory() {
         use super::super::snapshot::AiMemory;
-        // Scout senza occhi: mete diverse al passare dei tick.
+        // 0.0.19 — frontiera deterministica: a parità di esplorato la meta non
+        // balla più col tick (il ciclo su 4 punti fissi mandava in roccia).
         let mut snap = armed_snapshot(1, &[(UnitKind::Scout, 60.0, UnitOrder::Idle)]);
         snap.tick = 0;
         let early = scout_destination(&snap, Scenario::Playground);
         snap.tick = 8;
         let later = scout_destination(&snap, Scenario::Playground);
-        assert_ne!(early, later);
-        // Ricordo fresco: lo scout va a confermare lì.
+        assert_eq!(early, later);
+        // Frontiera diversa se l'esplorato cambia: cella vista esclusa.
+        snap.explored_cells = vec![
+            false;
+            super::super::snapshot::EXPLORED_GRID_N
+                * super::super::snapshot::EXPLORED_GRID_N
+        ];
+        let blind = scout_destination(&snap, Scenario::Playground);
+        // Marca la cella della meta come vista → la meta si sposta.
+        {
+            use crate::navigation::HALF_SIZE;
+            let n = super::super::snapshot::EXPLORED_GRID_N;
+            let side = (HALF_SIZE * 2.0) / n as f32;
+            let col = (((blind.x + HALF_SIZE) / side).floor() as usize).min(n - 1);
+            let row = (((blind.z + HALF_SIZE) / side).floor() as usize).min(n - 1);
+            snap.explored_cells[row * n + col] = true;
+        }
+        let moved = scout_destination(&snap, Scenario::Playground);
+        assert_ne!(blind, moved);
+        // Ricordo fresco: lo scout va a confermare lì (come 0.0.14).
         snap.memory.push(AiMemory {
             pos: Vec3::new(50.0, 0.0, -30.0),
             age_ticks: 10,
@@ -1593,10 +1710,211 @@ mod tests {
             scout_destination(&snap, Scenario::Playground),
             Vec3::new(50.0, 0.0, -30.0)
         );
-        // Attacco su ricordi quando la vista è vuota.
+        // Attacco su ricordi-truppa quando la vista è vuota.
         assert_eq!(
             attack_destination(&snap, Scenario::Playground),
             Vec3::new(50.0, 0.0, -30.0)
+        );
+    }
+
+    #[test]
+    fn building_memory_redirects_attack() {
+        use super::super::snapshot::AiMemory;
+        // 0.0.19 — base nemica ricordata (edifici freschi, vista vuota) batte
+        // il target statico: marcia su posizioni verificate.
+        let mut snap = armed_snapshot(1, &[]);
+        let static_target = Scenario::Playground.attack_target(1);
+        // Senza memoria: target statico.
+        assert_eq!(
+            attack_destination(&snap, Scenario::Playground),
+            static_target
+        );
+        // Con edificio ricordato fresco altrove: la meta si sposta lì.
+        let base_seen = Vec3::new(200.0, 0.0, 180.0);
+        assert!((base_seen - static_target).length() > 50.0);
+        snap.memory.push(AiMemory {
+            pos: base_seen,
+            age_ticks: 10,
+            kind: None,
+            hp: 450.0,
+            building: true,
+        });
+        assert_eq!(attack_destination(&snap, Scenario::Playground), base_seen);
+        // Ricordo stantio oltre il fresh: si torna allo statico.
+        snap.memory[0].age_ticks = MEMORY_FRESH_TICKS + 1;
+        assert_eq!(
+            attack_destination(&snap, Scenario::Playground),
+            static_target
+        );
+    }
+
+    #[test]
+    fn scout_intent_is_free_from_army_count() {
+        use crate::units::archetype;
+        // 0.0.19 — fix ramo morto: lo scout esce anche con l'esercito vivo
+        // (prima `army_count == 0` impossibile col Commander armato).
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::Scout, 60.0, UnitOrder::Idle),
+            ],
+        );
+        assert!(!has_fresh_eyes(&snap));
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert!(
+            intents.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
+            "scout cieco con armata viva deve uscire: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn scouts_patrol_distinct_frontiers_with_eyes_on() {
+        use crate::units::archetype;
+        // 0.0.19 — pattuglia continua: con occhi aperti ma scout liberi, gli
+        // scout mappano (frontiere distinte) invece di marcire in base; non
+        // si immolano nella battaglia live (meta ≠ nemico visibile).
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max, UnitOrder::Idle),
+                (UnitKind::Scout, 60.0, UnitOrder::Idle),
+                (UnitKind::Scout, 60.0, UnitOrder::Idle),
+            ],
+        );
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max,
+        });
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        let scouts: Vec<Vec3> = intents
+            .iter()
+            .filter_map(|i| match i {
+                AiIntent::Scout { destination } => Some(*destination),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scouts.len(), 2, "due scout liberi = due mete: {intents:?}");
+        assert!(
+            scouts[0].distance(scouts[1]) > 9.0,
+            "frontiere distinte, mai in pila: {scouts:?}"
+        );
+        for dest in &scouts {
+            assert!(
+                dest.distance(Vec3::new(10.0, 0.0, 0.0)) > 9.0,
+                "niente immolazione sul live: {dest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scout_diverts_from_hot_route() {
+        use crate::units::archetype;
+        // 0.0.19 — scout in rotta verso una meta diventata calda (tank
+        // avvistato lì dopo l'ordine): devia invece di immolarsi. Rotta
+        // fredda: la finisce, nessun intento.
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let hot = Vec3::new(100.0, 0.0, 100.0);
+        let mut snap = armed_snapshot(
+            1,
+            &[(UnitKind::Scout, 60.0, UnitOrder::Move { destination: hot })],
+        );
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: hot,
+            kind: UnitKind::HeavyTank,
+            health: max,
+        });
+        let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert!(
+            intents.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
+            "rotta calda: devia {intents:?}"
+        );
+        // Stesso nemico, rotta fredda altrove: nessun re-task.
+        let mut cool = armed_snapshot(
+            1,
+            &[(
+                UnitKind::Scout,
+                60.0,
+                UnitOrder::Move {
+                    destination: Vec3::new(-100.0, 0.0, -100.0),
+                },
+            )],
+        );
+        cool.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: hot,
+            kind: UnitKind::HeavyTank,
+            health: max,
+        });
+        let intents = decide(&cool, &Personality::RUSHER, Scenario::Playground, &[]);
+        assert!(
+            !intents.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
+            "rotta fredda: la finisce {intents:?}"
+        );
+    }
+
+    #[test]
+    fn opponent_shift_moves_courage_and_mix() {
+        use super::super::snapshot::{AiBuilding, AiMemory};
+        use crate::units::archetype;
+        // Vs rusher (massa precoce): courage effettivo scende di 0.1 e il mix
+        // sposta verso Heavy/Arty (bias 1.1) contro Light (0.9).
+        let max_h = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = armed_snapshot(1, &[(UnitKind::Scout, 60.0, UnitOrder::Idle)]);
+        snap.tick = 200;
+        for i in 0..3 {
+            snap.memory.push(AiMemory {
+                pos: Vec3::new(i as f32 * 5.0, 0.0, 0.0),
+                age_ticks: 5,
+                kind: Some(UnitKind::HeavyTank),
+                hp: max_h,
+                building: false,
+            });
+        }
+        snap.memory.push(AiMemory {
+            pos: Vec3::ZERO,
+            age_ticks: 150,
+            kind: Some(UnitKind::HeavyTank),
+            hp: max_h,
+            building: false,
+        });
+        assert_eq!(
+            super::super::opponent::classify(&snap),
+            super::super::opponent::OpponentKind::Rusher
+        );
+        assert!(
+            (super::super::opponent::adjust_courage(
+                0.55,
+                super::super::opponent::OpponentKind::Rusher
+            ) - 0.45)
+                .abs()
+                < 1e-6
+        );
+        // Vs turtle (torretta vista): courage sale e Arty bias 1.1.
+        snap.visible_enemy_buildings.push(AiBuilding {
+            entity: Entity::from_bits(700),
+            kind: BuildingKind::Turret,
+            pos: Vec3::new(200.0, 0.0, 200.0),
+            under_construction: false,
+            health: 450.0,
+        });
+        assert_eq!(
+            super::super::opponent::classify(&snap),
+            super::super::opponent::OpponentKind::Turtle
+        );
+        assert!(
+            super::super::opponent::mix_bias(
+                UnitKind::Artillery,
+                super::super::opponent::OpponentKind::Turtle
+            ) > super::super::opponent::mix_bias(
+                UnitKind::LightTank,
+                super::super::opponent::OpponentKind::Turtle
+            )
         );
     }
 

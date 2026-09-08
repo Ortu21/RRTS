@@ -56,6 +56,22 @@ pub struct AiMemory {
     pub building: bool,
 }
 
+impl AiMemory {
+    /// 0.0.19 — confidence Walsh: `1/(1+age/60)`, stesso K di
+    /// `memory::confidence` e `threat::age_decay`. Pura.
+    /// Uso diretto in 0.0.19+ (percezione pesata); oggi solo test: allow per
+    /// clippy `-D warnings`.
+    #[allow(dead_code)]
+    pub fn confidence(&self) -> f32 {
+        super::memory::confidence(self.age_ticks)
+    }
+}
+
+/// 0.0.19 — risoluzione griglia esplorata per-team (frontiera scout).
+/// Stessa geometria della threat map 32×32 su `HALF_SIZE`: le due restano
+/// allineate per costruzione (test in `scout::tests`).
+pub const EXPLORED_GRID_N: usize = 32;
+
 /// Team-local view. Sorted by entity bits for determinism.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct AiSnapshot {
@@ -73,8 +89,13 @@ pub struct AiSnapshot {
     /// La regola Metal li legge da qui: niente nuove query nei sistemi.
     pub deposits: Vec<crate::structures::MetalDeposit>,
     /// 0.0.16 — frazione mappa esplorata dal team (0..1), da `VisibilityMap`.
-    /// Solo osservazione in shadow: `decide()` non la legge ancora.
+    /// 0.0.19 — driver della frontiera scout (`scout::frontier_target` legge
+    /// `explored_cells`, non solo questa frazione).
     pub explored_pct: f32,
+    /// 0.0.19 — griglia esplorata grossolana (`EXPLORED_GRID_N`², row-major)
+    /// campionata da `VisibilityMap` in `build_snapshot`. Vuota = nessun dato
+    /// fog (test senza plugin): la frontiera tratta tutto come inesplorato.
+    pub explored_cells: Vec<bool>,
     #[allow(dead_code)]
     pub stock: [f64; 2],
     #[allow(dead_code)]
@@ -143,6 +164,47 @@ impl AiSnapshot {
             sum += m.pos;
         }
         Some(sum / fresh.len() as f32)
+    }
+
+    /// 0.0.19 — ricordi freschi di edifici (base nemica ricordata).
+    /// Speculare a `fresh_troop_memory`: l'ordine resta quello dello snapshot
+    /// (freschi prima). Puro.
+    pub fn fresh_building_memory(&self, max_age: u64) -> Vec<&AiMemory> {
+        self.memory
+            .iter()
+            .filter(|m| m.building && m.age_ticks <= max_age)
+            .collect()
+    }
+
+    /// 0.0.19 — baricentro degli edifici nemici ricordati (freschi).
+    /// Meta attacco quando la base è stata vista ma è ora sotto fog:
+    /// preferita al target statico (`strategy::attack_destination`).
+    /// `None` se nessun edificio fresco in memoria.
+    pub fn remembered_building_centroid(&self, max_age: u64) -> Option<Vec3> {
+        let fresh = self.fresh_building_memory(max_age);
+        if fresh.is_empty() {
+            return None;
+        }
+        let mut sum = Vec3::ZERO;
+        for m in &fresh {
+            sum += m.pos;
+        }
+        Some(sum / fresh.len() as f32)
+    }
+
+    /// 0.0.19 — cella esplorata della griglia frontiera (`EXPLORED_GRID_N`²).
+    /// `explored_cells` vuota (test senza fog) = tutto inesplorato (novelty 1).
+    /// Pura, mai panic su indici fuori mappa (clamp al bordo).
+    pub fn explored_cell(&self, col: usize, row: usize) -> bool {
+        if self.explored_cells.is_empty() {
+            return false;
+        }
+        let c = col.min(EXPLORED_GRID_N - 1);
+        let r = row.min(EXPLORED_GRID_N - 1);
+        self.explored_cells
+            .get(r * EXPLORED_GRID_N + c)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -296,6 +358,8 @@ pub fn build_snapshot(
         .map(|f| f.explored.iter().filter(|c| **c).count() as f32 / FOG_COUNT as f32)
         .unwrap_or(0.0);
 
+    let explored_cells = sample_explored_cells(map, team);
+
     AiSnapshot {
         team,
         tick,
@@ -306,11 +370,37 @@ pub fn build_snapshot(
         active_site,
         memory: to_ai_memory(memory),
         explored_pct,
+        explored_cells,
         deposits: deposits.to_vec(),
         stock,
         income,
         demand,
     }
+}
+
+/// 0.0.19 — campiona la griglia frontiera (`EXPLORED_GRID_N`²) da
+/// `VisibilityMap`: centro di ogni cella grossolana interrogato con
+/// `explored(team, center)`. Vuota senza dati fog (open fallback dei test).
+/// Pura e deterministica (row-major, nessun HashMap/rand).
+fn sample_explored_cells(map: Option<&VisibilityMap>, team: u8) -> Vec<bool> {
+    let Some(map) = map else {
+        return Vec::new();
+    };
+    if !map.0.contains_key(&team) {
+        return Vec::new();
+    }
+    use crate::navigation::HALF_SIZE;
+    let n = EXPLORED_GRID_N;
+    let side = (HALF_SIZE * 2.0) / n as f32;
+    let mut out = Vec::with_capacity(n * n);
+    for row in 0..n {
+        for col in 0..n {
+            let x = -HALF_SIZE + (col as f32 + 0.5) * side;
+            let z = -HALF_SIZE + (row as f32 + 0.5) * side;
+            out.push(map.explored(team, Vec3::new(x, 0.0, z)));
+        }
+    }
+    out
 }
 
 /// Vista memoria per lo snapshot: età calcolata, freschi prima, poi per
@@ -609,5 +699,52 @@ mod tests {
         });
         assert!(only_buildings.fresh_troop_memory(120).is_empty());
         assert_eq!(only_buildings.remembered_centroid(120), None);
+    }
+
+    #[test]
+    fn building_memory_helpers_and_confidence() {
+        use super::AiMemory;
+        let mut snap = AiSnapshot {
+            team: 1,
+            ..Default::default()
+        };
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(200.0, 0.0, 200.0),
+            age_ticks: 5,
+            kind: None,
+            hp: 450.0,
+            building: true,
+        });
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(210.0, 0.0, 210.0),
+            age_ticks: 200,
+            kind: None,
+            hp: 450.0,
+            building: true,
+        });
+        snap.memory.push(AiMemory {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            age_ticks: 5,
+            kind: Some(UnitKind::HeavyTank),
+            hp: 100.0,
+            building: false,
+        });
+        // Solo edifici freschi: 1 (l'altro è oltre 120).
+        let fresh_b = snap.fresh_building_memory(120);
+        assert_eq!(fresh_b.len(), 1);
+        assert!((fresh_b[0].pos.x - 200.0).abs() < 0.001);
+        let centroid = snap
+            .remembered_building_centroid(120)
+            .expect("base ricordata");
+        assert!((centroid.x - 200.0).abs() < 0.001);
+        assert!(snap.remembered_building_centroid(0).is_none());
+        // Confidence decade con l'età (stesso K della threat).
+        assert!((snap.memory[0].confidence() - super::super::memory::confidence(5)).abs() < 1e-6);
+        assert!(snap.memory[1].confidence() < snap.memory[0].confidence());
+        // Senza fog: griglia vuota = tutto inesplorato.
+        assert!(snap.explored_cells.is_empty());
+        assert!(!snap.explored_cell(0, 0));
+        let empty = build_snapshot(1, 5, &[], &[], &[], &BTreeMap::new(), None, &[], &[]);
+        assert!(empty.explored_cells.is_empty());
     }
 }

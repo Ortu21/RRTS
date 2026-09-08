@@ -36,6 +36,9 @@ pub fn execute_movement_and_build(
     let mut unit_orders = 0;
     let mut builds = 0;
     let mut enqueues: Vec<(Entity, UnitKind)> = Vec::new();
+    // 0.0.19 — scout già taskati nel tick (un intento Scout = uno scout:
+    // `decide()` emette mete distinte per max 2 scout, mai in pila).
+    let mut tasked_scouts: Vec<Entity> = Vec::new();
 
     // Ordine di arbitraggio = ordine del vettore da decide(): Build (una),
     // Enqueue (solo conteggio qui), AttackMoveAll/Scout, Retreat, FocusFire.
@@ -124,10 +127,16 @@ pub fn execute_movement_and_build(
                 enqueues.push((*factory, *kind));
             }
             AiIntent::AttackMoveAll { destination } => {
+                // 0.0.19 — gli Scout restano fuori dall'ondata: sono occhi
+                // (8.5 dps contro 11.5 di un Heavy, muoiono all'istante e
+                // costano la vista che guida il courage). La linea combatte,
+                // gli scout mappano con l'intento Scout dedicato.
                 let mut attackers: Vec<(Entity, UnitOrder)> = units
                     .iter()
                     .filter(|(_, _, k, o)| {
-                        crate::units::archetype(*k).armed && !matches!(o, UnitOrder::Build { .. })
+                        crate::units::archetype(*k).armed
+                            && *k != UnitKind::Scout
+                            && !matches!(o, UnitOrder::Build { .. })
                     })
                     .map(|(e, _, _, o)| (*e, o.clone()))
                     .collect();
@@ -148,20 +157,43 @@ pub fn execute_movement_and_build(
                 }
             }
             AiIntent::Scout { destination } => {
-                let mut scouts: Vec<Entity> = units
+                // 0.0.19 — un intento = uno scout (mete distinte da
+                // `frontier_targets`, mai in pila): primo libero non ancora
+                // taskato nel tick, in ordine di bits (deterministico).
+                // Liberi = Idle/Hold + Move verso meta calda (stesso predicato
+                // di `decide()`: la coppia resta 1:1). Waypoint threat-aware +
+                // riparazione walkable così la frontiera non genera mai
+                // nav-failure. Chi è in rotta fredda la finisce (niente churn
+                // da re-target a 1Hz), al prossimo Idle nuova frontiera.
+                let threat = super::threat::build_threat(snapshot);
+                let mut scouts: Vec<(Entity, Vec3, UnitOrder)> = units
                     .iter()
-                    .filter(|(_, _, k, o)| {
+                    .filter(|(e, _, k, o)| {
                         *k == UnitKind::Scout
-                            && matches!(o, UnitOrder::Idle | UnitOrder::HoldPosition)
+                            && !tasked_scouts.contains(e)
+                            && (matches!(o, UnitOrder::Idle | UnitOrder::HoldPosition)
+                                || matches!(o, UnitOrder::Move { destination }
+                                if threat.query(*destination)
+                                    > super::scout::SCOUT_THREAT_THRESHOLD))
                     })
-                    .map(|(e, _, _, _)| *e)
+                    .map(|(e, pos, _, o)| (*e, *pos, o.clone()))
                     .collect();
-                scouts.sort_by_key(|e| e.to_bits());
-                if let Some(entity) = scouts.first()
+                scouts.sort_by_key(|(e, _, _)| e.to_bits());
+                if let Some((entity, pos, _)) = scouts.into_iter().next()
                     && unit_orders < max_unit_orders
                 {
-                    queue_move(&mut commands.entity(*entity), *destination);
-                    unit_orders += 1;
+                    let waypoint = super::scout::scout_waypoint(
+                        pos,
+                        *destination,
+                        &threat,
+                        super::scout::SCOUT_THREAT_THRESHOLD,
+                    );
+                    let repaired = grid.clear_point_for(waypoint, 0.5);
+                    if grid.is_walkable(repaired) && grid.has_clearance(repaired) {
+                        queue_move(&mut commands.entity(entity), repaired);
+                        tasked_scouts.push(entity);
+                        unit_orders += 1;
+                    }
                 }
             }
             AiIntent::Retreat { units: low } => {
@@ -210,6 +242,8 @@ pub fn execute_movement_and_build(
             AiIntent::FocusFire { target } => {
                 // Fino a 3 attaccanti vicini sul bersaglio designato.
                 // Isteresi: chi lo attacca già resta dov'è.
+                // 0.0.19 — senza Scout: i veloci in prima linea si immolano e
+                // costano gli occhi (come nell'ondata, vedi AttackMoveAll).
                 let target_pos = snapshot
                     .visible_enemies
                     .iter()
@@ -220,6 +254,7 @@ pub fn execute_movement_and_build(
                     .iter()
                     .filter(|(_, _, k, o)| {
                         crate::units::archetype(*k).armed
+                            && *k != UnitKind::Scout
                             && !matches!(o, UnitOrder::Build { .. })
                             && !matches!(o, UnitOrder::Attack { target: t } if *t == *target)
                     })

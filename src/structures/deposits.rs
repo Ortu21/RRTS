@@ -132,9 +132,16 @@ pub fn generate_deposits(
 
 /// Ripara un anchor sul walkable con nudge deterministici; se nulla va,
 /// tiene il punto riparato grezzo (la validazione a placement gestisce).
+/// 0.0.19 — Metal-aware: il punto deve passare anche `valid_ground` per un
+/// Metal (footprint 5×5m + margini), non solo clearance da punto. Prima un
+/// anchor poteva riparare su un punto "walkable" dove il Metal non entra
+/// (visto dal vivo: home blu nella roccia → commander in marcia 70s verso il
+/// centro, mai factory/scout in 120s, `scout-blitz` inchiodato al 4%).
+/// L'ordine dei candidati è invariato (anchor prima): gli spot già validi
+/// restano bit-identici, si spostano solo quelli morti.
 fn repair_spot(grid: &NavGrid, anchor: Vec2) -> Vec2 {
     let mut cands = vec![anchor];
-    for r in [4.0, 8.0, 12.0] {
+    for r in [4.0, 8.0, 12.0, 16.0, 20.0, 24.0] {
         for (dx, dz) in [
             (r, 0.0),
             (-r, 0.0),
@@ -148,14 +155,23 @@ fn repair_spot(grid: &NavGrid, anchor: Vec2) -> Vec2 {
             cands.push(anchor + Vec2::new(dx, dz));
         }
     }
+    let mut fallback: Option<Vec2> = None;
     for c in cands {
         let p = grid.clear_point_for(Vec3::new(c.x, 0.0, c.y), 3.0);
-        if grid.is_walkable(p) && grid.has_clearance(p) {
+        if !(grid.is_walkable(p) && grid.has_clearance(p)) {
+            continue;
+        }
+        // Primo punto walkable = fallback storico (invariato se nulla passa
+        // il footprint).
+        fallback.get_or_insert(p.xz());
+        if super::valid_ground(grid, BuildingKind::Metal, p, &[]).is_ok() {
             return p.xz();
         }
     }
-    grid.clear_point_for(Vec3::new(anchor.x, 0.0, anchor.y), 3.0)
-        .xz()
+    fallback.unwrap_or_else(|| {
+        grid.clear_point_for(Vec3::new(anchor.x, 0.0, anchor.y), 3.0)
+            .xz()
+    })
 }
 
 /// Regola di piazzamento Metal (4ª della catena, vale per player e AI):
@@ -299,6 +315,15 @@ mod tests {
         for d in &d1 {
             let p = Vec3::new(d.pos.x, 0.0, d.pos.z);
             assert!(grid.is_walkable(p) && grid.has_clearance(p), "{d:?}");
+        }
+        // 0.0.19 — ogni spot deve ospitare davvero un Metal (footprint +
+        // margini): home morte = commander in marcia verso il centro.
+        for d in &d1 {
+            let p = Vec3::new(d.pos.x, 0.0, d.pos.z);
+            assert!(
+                super::super::valid_ground(&grid, BuildingKind::Metal, p, &[]).is_ok(),
+                "spot senza footprint Metal: {d:?}"
+            );
         }
         for (i, x) in d1.iter().enumerate() {
             for y in &d1[i + 1..] {

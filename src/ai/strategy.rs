@@ -628,7 +628,7 @@ pub fn default_rally(grid: &crate::navigation::NavGrid, from: Vec3, target: Vec3
         return None;
     }
     let repaired = grid.clear_point_for(from + dir * 18.0, 0.5);
-    (grid.is_walkable(repaired) && grid.has_clearance(repaired)).then_some(repaired)
+    (grid.is_walkable(repaired) && grid.has_clearance_for(repaired, 0.5)).then_some(repaired)
 }
 
 /// 0.0.18 — slot muro davanti alla torretta verso la minaccia: 3
@@ -717,10 +717,11 @@ fn approach_ok(
 ) -> bool {
     // Raggio scafo conservativo (commander 1.4) così vale per tutti.
     // Validato sulla grid CON il futuro edificio: il suo stesso ostacolo può
-    // sigillare l'approach (lab grandi in basi dense).
+    // sigillare l'approach (lab grandi in basi dense). Body-aware: lo scafo
+    // grande deve poter eseguire il percorso, non solo il margine scout.
     let probe = grid.cloned_with_obstacle(building_obstacle(kind, point));
     let approach = site_approach(&probe, point, builder_pos, kind.stats().half, 1.4);
-    probe.find_path(builder_pos, approach).is_some()
+    probe.find_path_for(builder_pos, approach, 1.4).is_some()
 }
 
 /// G1 — spot Metal: libero più vicino al builder (parità → mult maggiore,
@@ -855,7 +856,7 @@ mod tests {
         let from = Vec3::new(-40.0, 0.0, 0.0);
         let target = Vec3::new(100.0, 0.0, 0.0);
         let rally = default_rally(&grid, from, target).expect("rally riparato");
-        assert!(grid.is_walkable(rally) && grid.has_clearance(rally));
+        assert!(grid.is_walkable(rally) && grid.has_clearance_for(rally, 0.5));
         // Punta ancora verso il fronte (non dietro).
         assert!(rally.x > from.x);
         // Senza direzione (factory sul target): niente rally, fallback apron.

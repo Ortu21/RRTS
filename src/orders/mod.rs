@@ -155,7 +155,7 @@ fn issue_move_order(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
-    selected: Query<(Entity, &Unit, &UnitOrder), With<Selected>>,
+    selected: Query<(Entity, &Unit, &UnitOrder, Option<&crate::units::UnitKind>), With<Selected>>,
     enemies: Query<
         (
             Entity,
@@ -216,7 +216,7 @@ fn issue_move_order(
             .collect();
         if let Some((target, _)) = candidates.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)) {
             let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-            for (entity, _, order) in &selected {
+            for (entity, _, order, _) in &selected {
                 if additive && is_busy(order, &mut queues, entity) {
                     enqueue_order(
                         &mut commands,
@@ -242,7 +242,7 @@ fn issue_move_order(
         if let Some(ward) = pick_enemy_target(&ray, &wards) {
             let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
             let mut issued = false;
-            for (entity, _, order) in &selected {
+            for (entity, _, order, _) in &selected {
                 if entity == ward {
                     continue;
                 }
@@ -284,10 +284,10 @@ fn issue_move_order(
             let builders: Vec<_> = builder_units.iter().collect();
             let tasked: Vec<_> = selected
                 .iter()
-                .filter(|(entity, _, _)| builders.contains(entity))
+                .filter(|(entity, _, _, _)| builders.contains(entity))
                 .collect();
             if !tasked.is_empty() {
-                for (entity, _, order) in tasked {
+                for (entity, _, order, _) in tasked {
                     if additive && is_busy(order, &mut queues, entity) {
                         enqueue_order(
                             &mut commands,
@@ -307,13 +307,19 @@ fn issue_move_order(
         return;
     };
     let mut units: Vec<_> = selected.iter().collect();
-    units.sort_unstable_by_key(|(_, unit, _)| unit.0);
-    let Some(slots) = grid.formation(units.len(), center, settings.spacing) else {
+    units.sort_unstable_by_key(|(_, unit, _, _)| unit.0);
+    // Body-aware destinations: the whole group uses the largest hull so the
+    // Commander never receives a scout-clear slot it cannot execute.
+    let max_radius = units
+        .iter()
+        .map(|(_, _, _, kind)| kind.map_or(0.5, |k| crate::units::archetype(*k).radius))
+        .fold(0.5, f32::max);
+    let Some(slots) = grid.formation_for(units.len(), center, settings.spacing, max_radius) else {
         return;
     };
     // Shift queues behind the live order; plain click replaces everything.
     let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    for (slot, (entity, _, order)) in slots.into_iter().zip(units) {
+    for (slot, (entity, _, order, _)) in slots.into_iter().zip(units) {
         let destination = UnitOrder::Move { destination: slot };
         if additive && is_busy(order, &mut queues, entity) {
             enqueue_order(&mut commands, &mut queues, entity, destination);
@@ -509,7 +515,7 @@ fn issue_pending_attack_move(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<RtsCamera>>,
-    selected: Query<(Entity, &Unit, &UnitOrder), With<Selected>>,
+    selected: Query<(Entity, &Unit, &UnitOrder, Option<&crate::units::UnitKind>), With<Selected>>,
     settings: Res<FormationSettings>,
     grid: Res<NavGrid>,
     mut pending: ResMut<PendingOrder>,
@@ -533,14 +539,18 @@ fn issue_pending_attack_move(
         return;
     };
     let mut units: Vec<_> = selected.iter().collect();
-    units.sort_unstable_by_key(|(_, unit, _)| unit.0);
-    let Some(slots) = grid.formation(units.len(), center, settings.spacing) else {
+    units.sort_unstable_by_key(|(_, unit, _, _)| unit.0);
+    let max_radius = units
+        .iter()
+        .map(|(_, _, _, kind)| kind.map_or(0.5, |k| crate::units::archetype(*k).radius))
+        .fold(0.5, f32::max);
+    let Some(slots) = grid.formation_for(units.len(), center, settings.spacing, max_radius) else {
         return;
     };
     // Shift queues behind the live order (G then Shift+click attack-moves
     // next); plain click replaces everything.
     let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    for (slot, (entity, _, order)) in slots.into_iter().zip(units) {
+    for (slot, (entity, _, order, _)) in slots.into_iter().zip(units) {
         let destination = UnitOrder::AttackMove { destination: slot };
         if additive && is_busy(order, &mut queues, entity) {
             enqueue_order(&mut commands, &mut queues, entity, destination);

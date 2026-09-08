@@ -760,9 +760,14 @@ fn resolve_behaviour(
                 // routes past the threshold) so the planner keeps a fresh
                 // route; guards keep theirs pointed at the ward to resume
                 // the follow the moment the engagement ends.
+                // Body-aware repair: the chase anchor must fit this hull,
+                // otherwise the planner would reject it and strand the chase.
+                let body_radius = body.map_or(0.5, |b| b.0);
                 let anchor = if gameplay.is_some() && !in_range {
-                    target_position(&grid, target.0)
-                        .map(|p| nav.as_ref().map_or(p, |nav| nav.clear_point(p.with_y(0.0))))
+                    target_position(&grid, target.0).map(|p| {
+                        nav.as_ref()
+                            .map_or(p, |nav| nav.clear_point_for(p.with_y(0.0), body_radius))
+                    })
                 } else {
                     match order {
                         UnitOrder::Attack { .. } => target_position(&grid, target.0),
@@ -834,10 +839,11 @@ fn chase_targets(
             continue;
         };
         let mut aim = target_position;
+        let body_radius = crate::units::archetype(*kind).radius;
         if gameplay.is_some()
-            && nav
-                .as_ref()
-                .is_some_and(|nav| !nav.segment_clear(transform.translation, target_position))
+            && nav.as_ref().is_some_and(|nav| {
+                !nav.segment_clear_for(transform.translation, target_position, body_radius)
+            })
             && let Some(mut route) = route
         {
             while route.next < route.points.len()
@@ -867,7 +873,7 @@ fn chase_targets(
             let forward = transform.rotation * Vec3::NEG_Z;
             let alignment = forward.xz().dot(offset.xz().normalize_or_zero()).max(0.0);
             let step = movement.speed * (0.35 + 0.65 * alignment) * dt;
-            crate::movement::steer(&mut transform, offset, step.min(distance));
+            crate::movement::steer_for(&mut transform, offset, step.min(distance), body_radius);
         }
     }
 }

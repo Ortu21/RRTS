@@ -398,6 +398,9 @@ impl NavGrid {
     /// deterministic spiral over the precomputed walkability finds the
     /// nearest walkable cell with clearance. Obstacle lanes guarantee one
     /// exists within a few rings.
+    /// Legacy scout-margin wrapper; gameplay uses [`Self::clear_point_for`].
+    /// Kept for tests and comparable baselines.
+    #[allow(dead_code)]
     pub fn clear_point(&self, point: Vec3) -> Vec3 {
         let mut point = point;
         point.x = point.x.clamp(
@@ -434,6 +437,7 @@ impl NavGrid {
         point
     }
 
+    #[allow(dead_code)]
     fn clear_cell(&self, x: isize, z: isize, y: f32) -> Option<Vec3> {
         if x < 0 || z < 0 || x >= self.width as isize || z >= self.width as isize {
             return None;
@@ -479,19 +483,60 @@ impl NavGrid {
             })
     }
 
+    /// Legacy scout-margin formation; gameplay uses [`Self::formation_for`]
+    /// with the largest hull in the group. Kept for tests and baselines.
+    #[allow(dead_code)]
     pub fn formation(&self, count: usize, center: Vec3, spacing: f32) -> Option<Vec<Vec3>> {
+        self.formation_for(count, center, spacing, 0.5)
+    }
+
+    /// Body-aware formation: every slot fits `radius` (via
+    /// [`Self::clearance_for`]), not just the default scout margin. Small
+    /// hulls (`clearance_for(radius) <= UNIT_CLEARANCE`) delegate to the
+    /// legacy fast path so their density is preserved bit-for-bit; larger
+    /// hulls (Commander 1.7, T2 1.0-1.05) get unique walkable slots with
+    /// full hull clearance. Returns `None` when the map cannot fit `count`
+    /// bodies of this size.
+    pub fn formation_for(
+        &self,
+        count: usize,
+        center: Vec3,
+        spacing: f32,
+        radius: f32,
+    ) -> Option<Vec<Vec3>> {
+        if Self::clearance_for(radius) <= UNIT_CLEARANCE + 1e-6 {
+            let mut reserved = HashSet::with_capacity(count);
+            return formation_slots(count, center, spacing)
+                .into_iter()
+                .map(|ideal| {
+                    let cell = self
+                        .cell(ideal)
+                        .filter(|index| self.slot_free(*index, &reserved))
+                        .or_else(|| {
+                            (0..self.walkable.len())
+                                .filter(|index| self.slot_free(*index, &reserved))
+                                .min_by(|a, b| {
+                                    self.cell_center(*a)
+                                        .distance_squared(ideal)
+                                        .total_cmp(&self.cell_center(*b).distance_squared(ideal))
+                                        .then(a.cmp(b))
+                                })
+                        })?;
+                    reserved.insert(cell);
+                    Some(self.cell_center(cell))
+                })
+                .collect();
+        }
         let mut reserved = HashSet::with_capacity(count);
         formation_slots(count, center, spacing)
             .into_iter()
             .map(|ideal| {
-                // Slots are cell centers, so clearance of the center is exact:
-                // every returned slot is walkable, unique and clear.
                 let cell = self
                     .cell(ideal)
-                    .filter(|index| self.slot_free(*index, &reserved))
+                    .filter(|index| self.slot_free_for(*index, &reserved, radius))
                     .or_else(|| {
                         (0..self.walkable.len())
-                            .filter(|index| self.slot_free(*index, &reserved))
+                            .filter(|index| self.slot_free_for(*index, &reserved, radius))
                             .min_by(|a, b| {
                                 self.cell_center(*a)
                                     .distance_squared(ideal)
@@ -511,6 +556,15 @@ impl NavGrid {
             && self.has_clearance(self.cell_center(index))
     }
 
+    fn slot_free_for(&self, index: usize, reserved: &HashSet<usize>, radius: f32) -> bool {
+        self.walkable[index]
+            && !reserved.contains(&index)
+            && self.has_clearance_for(self.cell_center(index), radius)
+    }
+
+    /// Legacy scout-margin routing; gameplay uses [`Self::find_path_for`].
+    /// Kept for tests and comparable baselines.
+    #[allow(dead_code)]
     pub fn find_path(&self, start: Vec3, goal: Vec3) -> Option<Vec<Vec3>> {
         self.find_path_inner(None, start, goal)
     }
@@ -520,6 +574,9 @@ impl NavGrid {
     /// Only new plans see congestion (no mid-route replanning, no churn);
     /// density comes from the pre-movement spatial index, so results stay
     /// deterministic across repeats.
+    /// Legacy scout-margin variant; gameplay uses
+    /// [`Self::find_path_congested_for`]. Kept for tests and baselines.
+    #[allow(dead_code)]
     pub fn find_path_congested(
         &self,
         spatial: &crate::spatial::SpatialGrid,
@@ -527,6 +584,210 @@ impl NavGrid {
         goal: Vec3,
     ) -> Option<Vec<Vec3>> {
         self.find_path_inner(Some(spatial), start, goal)
+    }
+
+    /// Body-aware routing for a hull `radius`. Endpoints must fit the hull
+    /// ([`Self::has_clearance_for`]); otherwise `None` is returned explicitly
+    /// instead of an unexecutable 0.8-margin path that `constrain_motion`
+    /// would later reject (e.g. Commander x=299 on an empty map passes the
+    /// scout check but fails `segment_clear_for` with margin 1.7).
+    /// Small hulls delegate to the legacy fast path bit-for-bit; larger
+    /// hulls search the same grid but only through cells whose centers fit
+    /// the hull, with shortcuts validated by both grid LOS and exact swept
+    /// hull clearance. Deterministic like [`Self::find_path`].
+    pub fn find_path_for(&self, start: Vec3, goal: Vec3, radius: f32) -> Option<Vec<Vec3>> {
+        self.find_path_inner_for(None, start, goal, radius)
+    }
+
+    pub fn find_path_congested_for(
+        &self,
+        spatial: &crate::spatial::SpatialGrid,
+        start: Vec3,
+        goal: Vec3,
+        radius: f32,
+    ) -> Option<Vec<Vec3>> {
+        self.find_path_inner_for(Some(spatial), start, goal, radius)
+    }
+
+    fn find_path_inner_for(
+        &self,
+        spatial: Option<&crate::spatial::SpatialGrid>,
+        start: Vec3,
+        goal: Vec3,
+        radius: f32,
+    ) -> Option<Vec<Vec3>> {
+        if !start.is_finite() || !goal.is_finite() {
+            return None;
+        }
+        // Explicit body fit: unreachable-for-this-hull is None, never a
+        // scout-clear path the body cannot execute.
+        if !self.has_clearance_for(start, radius) || !self.has_clearance_for(goal, radius) {
+            return None;
+        }
+        // Small hulls keep the exact legacy behaviour (density + budget).
+        if Self::clearance_for(radius) <= UNIT_CLEARANCE + 1e-6 {
+            return self.find_path_inner(spatial, start, goal);
+        }
+        let start_cell = self.cell(start)?;
+        let goal_cell = self.cell(goal)?;
+        if !self.walkable[start_cell] || !self.walkable[goal_cell] {
+            return None;
+        }
+        // Start/goal cells are entered from fitted endpoints even when their
+        // centers are tight; every other cell must fit the hull center.
+        let center_fits = |index: usize| {
+            index == start_cell
+                || index == goal_cell
+                || self.has_clearance_for(self.cell_center(index), radius)
+        };
+        if !center_fits(start_cell) || !center_fits(goal_cell) {
+            // Endpoints fit but their cells are sealed for this hull (e.g.
+            // start inside a 0.8-only pocket): no honest route exists.
+            // Fall through to search anyway? No — return None explicitly to
+            // avoid a stuck order. Callers repair via clear_point_for.
+            // (We still allow the cells themselves; only intermediate cells
+            // are filtered, so this branch is unreachable. Kept for clarity.)
+        }
+        let mut cost = vec![f32::INFINITY; self.walkable.len()];
+        let mut parent = vec![usize::MAX; self.walkable.len()];
+        let mut open = BinaryHeap::new();
+        let center = |index: usize| self.cell_center(index).xz();
+        let center3 = |index: usize| self.cell_center(index);
+        let segment = |a: usize, b: usize| center(a).distance(center(b));
+        let heuristic = |index: usize| center(index).distance(center(goal_cell));
+        // Body-aware LOS: grid walkability (cheap reject) + exact swept hull
+        // (accept). Both deterministic over grid + endpoints.
+        let los_for = |a: usize, b: usize| {
+            self.has_line_of_sight(center(a), center(b))
+                && self.segment_clear_for(center3(a), center3(b), radius)
+        };
+        cost[start_cell] = 0.0;
+        parent[start_cell] = start_cell;
+        open.push(Reverse((
+            FOrd(heuristic(start_cell)),
+            FOrd(0.0),
+            start_cell,
+        )));
+        while let Some(Reverse((_, queued, current))) = open.pop() {
+            if queued.0 != cost[current] {
+                continue;
+            }
+            if current == goal_cell {
+                let mut cells = vec![current];
+                let mut next = current;
+                while next != start_cell {
+                    next = parent[next];
+                    // Corrupt parent chain guard (should be unreachable).
+                    if next == usize::MAX {
+                        return None;
+                    }
+                    cells.push(next);
+                }
+                cells.reverse();
+                let mut path = Vec::new();
+                for (index, cell) in cells.iter().enumerate() {
+                    if index > 0 && index + 1 < cells.len() {
+                        let incoming = *cell as isize - cells[index - 1] as isize;
+                        let outgoing = cells[index + 1] as isize - *cell as isize;
+                        if incoming == outgoing {
+                            continue;
+                        }
+                    }
+                    path.push(self.cell_center(*cell));
+                }
+                if path
+                    .last()
+                    .is_none_or(|last| last.distance_squared(goal) > 0.0001)
+                {
+                    path.push(goal);
+                }
+                self.anchor_path_ends_for(start, goal, &mut path, radius);
+                // Final honesty check: every leg must execute under
+                // constrain_motion for this hull. Otherwise report
+                // unreachable instead of issuing a stuck order.
+                let mut prev = start;
+                for point in &path {
+                    if !self.segment_clear_for(prev, *point, radius) {
+                        return None;
+                    }
+                    prev = *point;
+                }
+                // Trailing goal leg already checked above when path ends with
+                // goal; when path is empty (start==goal cell) the loop covers
+                // start->goal via the single pushed goal.
+                return Some(path);
+            }
+            let x = (current % self.width) as isize;
+            let z = (current / self.width) as isize;
+            for (dx, dz) in [
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (-1, 1),
+                (1, -1),
+                (1, 1),
+            ] {
+                let nx = x + dx;
+                let nz = z + dz;
+                if nx < 0 || nz < 0 || nx >= self.width as isize || nz >= self.width as isize {
+                    continue;
+                }
+                let next = nz as usize * self.width + nx as usize;
+                if !self.walkable[next] {
+                    continue;
+                }
+                if next != goal_cell && !self.has_clearance_for(self.cell_center(next), radius) {
+                    continue;
+                }
+                let diagonal = dx != 0 && dz != 0;
+                if diagonal
+                    && (!self.walkable[z as usize * self.width + nx as usize]
+                        || !self.walkable[nz as usize * self.width + x as usize])
+                {
+                    continue;
+                }
+                // Diagonal corners must also fit the hull, not just be
+                // walkable at 0.8.
+                if diagonal {
+                    let side_a = z as usize * self.width + nx as usize;
+                    let side_b = nz as usize * self.width + x as usize;
+                    if side_a != start_cell
+                        && side_a != goal_cell
+                        && !self.has_clearance_for(self.cell_center(side_a), radius)
+                    {
+                        continue;
+                    }
+                    if side_b != start_cell
+                        && side_b != goal_cell
+                        && !self.has_clearance_for(self.cell_center(side_b), radius)
+                    {
+                        continue;
+                    }
+                }
+                let via = parent[current];
+                let (next_parent, next_cost) = if los_for(via, next) {
+                    (via, cost[via] + segment(via, next))
+                } else {
+                    (current, cost[current] + segment(current, next))
+                };
+                let next_cost = next_cost
+                    + spatial.map_or(0.0, |grid| {
+                        CONGESTION_WEIGHT * grid.bucket_count(center(next)) as f32
+                    });
+                if next_cost < cost[next] {
+                    cost[next] = next_cost;
+                    parent[next] = next_parent;
+                    open.push(Reverse((
+                        FOrd(next_cost + heuristic(next)),
+                        FOrd(next_cost),
+                        next,
+                    )));
+                }
+            }
+        }
+        None
     }
 
     fn find_path_inner(
@@ -662,18 +923,49 @@ impl NavGrid {
     /// congestion avoidance and obstacle clearance are untouched.
     /// Deterministic: pure over grid + endpoints, no frame state.
     fn anchor_path_ends(&self, start: Vec3, goal: Vec3, path: &mut Vec<Vec3>) {
-        // Leading: drop the start-cell center when the unit can head
-        // directly at the next waypoint from its true position.
+        self.anchor_path_ends_for(start, goal, path, 0.5);
+    }
+
+    /// Body-aware endpoint anchoring: shortcuts must keep hull clearance
+    /// ([`Self::segment_clear_for`]), not just the scout margin. Small hulls
+    /// keep the exact legacy behaviour; larger hulls trim only when the hull
+    /// fits the shortcut.
+    fn anchor_path_ends_for(&self, start: Vec3, goal: Vec3, path: &mut Vec<Vec3>, radius: f32) {
+        if Self::clearance_for(radius) <= UNIT_CLEARANCE + 1e-6 {
+            while path.len() > 1
+                && path[0].xz().distance(start.xz()) <= CELL_SIZE
+                && self.has_line_of_sight(start.xz(), path[1].xz())
+                && self.segment_clear(start, path[1])
+            {
+                path.remove(0);
+            }
+            while path.len() >= 2 && path[path.len() - 1] == goal {
+                let center = path[path.len() - 2];
+                if center.xz().distance(goal.xz()) > CELL_SIZE {
+                    break;
+                }
+                let anchor = if path.len() >= 3 {
+                    path[path.len() - 3]
+                } else {
+                    start
+                };
+                if self.has_line_of_sight(anchor.xz(), goal.xz())
+                    && self.segment_clear(anchor, goal)
+                {
+                    path.remove(path.len() - 2);
+                } else {
+                    break;
+                }
+            }
+            return;
+        }
         while path.len() > 1
             && path[0].xz().distance(start.xz()) <= CELL_SIZE
             && self.has_line_of_sight(start.xz(), path[1].xz())
-            && self.segment_clear(start, path[1])
+            && self.segment_clear_for(start, path[1], radius)
         {
             path.remove(0);
         }
-        // Trailing: the goal-cell center sits past/beside most goals by up
-        // to half a diagonal; drop it when the approach runs straight to
-        // the goal instead of visiting the center and doubling back.
         while path.len() >= 2 && path[path.len() - 1] == goal {
             let center = path[path.len() - 2];
             if center.xz().distance(goal.xz()) > CELL_SIZE {
@@ -684,7 +976,9 @@ impl NavGrid {
             } else {
                 start
             };
-            if self.has_line_of_sight(anchor.xz(), goal.xz()) && self.segment_clear(anchor, goal) {
+            if self.has_line_of_sight(anchor.xz(), goal.xz())
+                && self.segment_clear_for(anchor, goal, radius)
+            {
                 path.remove(path.len() - 2);
             } else {
                 break;
@@ -802,36 +1096,55 @@ impl Plugin for NavigationPlugin {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn plan_paths(
     mut commands: Commands,
     grid: Res<NavGrid>,
     spatial: Option<Res<crate::spatial::SpatialGrid>>,
     mut stats: ResMut<NavigationStats>,
-    pending: Query<(Entity, &Transform, &MoveTarget), Without<Route>>,
+    pending: Query<
+        (
+            Entity,
+            &Transform,
+            &MoveTarget,
+            Option<&crate::units::UnitKind>,
+            Option<&crate::units::CollisionRadius>,
+        ),
+        Without<Route>,
+    >,
 ) {
     let start = Instant::now();
     stats.last_planned = 0;
     // Collect up to budget preserving query order. `par_splat_map` below
     // returns results in input order, so the sequential apply stays
     // bit-identical to the old serial loop for the same world state.
-    let jobs: Vec<(Entity, Vec3, Vec3)> = pending
+    // Radius travels with the job so planning, collision and destinations
+    // agree on the same hull: UnitKind wins (archetype table), then the
+    // live CollisionRadius, then the legacy scout default.
+    let jobs: Vec<(Entity, Vec3, Vec3, f32)> = pending
         .iter()
         .take(PATHS_PER_FRAME)
-        .map(|(entity, transform, target)| (entity, transform.translation.with_y(0.0), target.0))
+        .map(|(entity, transform, target, kind, body)| {
+            let radius = kind
+                .map(|k| crate::units::archetype(*k).radius)
+                .or(body.map(|b| b.0))
+                .unwrap_or(0.5);
+            (entity, transform.translation.with_y(0.0), target.0, radius)
+        })
         .collect();
     if jobs.is_empty() {
         stats.last_ms = start.elapsed().as_secs_f64() * 1000.0;
         return;
     }
     stats.last_planned = jobs.len();
-    // Pure compute: `find_path_inner` only reads `NavGrid` (+ read-only
+    // Pure compute: `find_path_inner_for` only reads `NavGrid` (+ read-only
     // congestion index), so batch parallelism is embarrassingly parallel.
     // Small batches stay serial to avoid task-spawn overhead.
     let computed: Vec<Option<Vec<Vec3>>> = if jobs.len() < SERIAL_PATH_THRESHOLD {
         jobs.iter()
-            .map(|(_, from, goal)| match spatial.as_deref() {
-                Some(index) => grid.find_path_congested(index, *from, *goal),
-                None => grid.find_path(*from, *goal),
+            .map(|(_, from, goal, radius)| match spatial.as_deref() {
+                Some(index) => grid.find_path_congested_for(index, *from, *goal, *radius),
+                None => grid.find_path_for(*from, *goal, *radius),
             })
             .collect()
     } else {
@@ -841,9 +1154,9 @@ fn plan_paths(
         jobs.par_splat_map(pool, None, |_, chunk| {
             chunk
                 .iter()
-                .map(|(_, from, goal)| match spatial_ref {
-                    Some(index) => grid_ref.find_path_congested(index, *from, *goal),
-                    None => grid_ref.find_path(*from, *goal),
+                .map(|(_, from, goal, radius)| match spatial_ref {
+                    Some(index) => grid_ref.find_path_congested_for(index, *from, *goal, *radius),
+                    None => grid_ref.find_path_for(*from, *goal, *radius),
                 })
                 .collect::<Vec<_>>()
         })
@@ -851,20 +1164,22 @@ fn plan_paths(
         .flatten()
         .collect()
     };
-    for ((entity, from, goal), points) in jobs.into_iter().zip(computed) {
+    for ((entity, from, goal, radius), points) in jobs.into_iter().zip(computed) {
         // Congested planning where the spatial index exists (combat
         // scenes); plain movement benchmarks never load it and keep the
         // exact legacy behaviour through the same code path.
         if let Some(points) = points {
             commands.entity(entity).insert(Route { points, next: 0 });
             stats.planned += 1;
-        } else if grid.has_clearance(goal) && (!grid.has_clearance(from) || !grid.is_walkable(from))
+        } else if grid.has_clearance_for(goal, radius)
+            && (!grid.has_clearance_for(from, radius) || !grid.is_walkable(from))
         {
             // Transient start inside an obstacle margin or on an unwalkable
-            // cell edge (crowd shove) with a valid goal: keep the order
+            // cell edge (crowd shove) with a body-valid goal: keep the order
             // pending and let the movement beeline fallback walk the unit
             // out; a later planning frame succeeds. Every other failure
-            // stops the unit and counts, as before.
+            // (including goals that never fit this hull) stops the unit and
+            // counts, so no order stays blocked forever.
         } else {
             commands.entity(entity).remove::<MoveTarget>();
             stats.failed += 1;
@@ -1131,6 +1446,85 @@ mod tests {
         let repaired = open.clear_point_for(edge, 1.4);
         assert!(open.has_clearance_for(repaired, 1.4));
         assert!(repaired.x <= 20.0 - 1.7);
+    }
+    #[test]
+    fn body_aware_planning_rejects_unexecutable_commander_goals() {
+        // Issue #4 repro: empty map, planner at 0.8 accepts x=299 but
+        // constrain_motion (margin 1.7) rejects it for the Commander.
+        let open = NavGrid::new(HALF_SIZE, CELL_SIZE, Vec::new());
+        let start = Vec3::new(280.0, 0.0, 0.0);
+        let edge_goal = Vec3::new(299.0, 0.0, 0.0);
+        // Legacy scout path still succeeds (preserves small clearance).
+        assert!(open.find_path(start, edge_goal).is_some());
+        assert!(open.find_path_for(start, edge_goal, 0.45).is_some());
+        // Commander hull cannot fit the rim: explicit None, never a stuck order.
+        assert!(open.find_path_for(start, edge_goal, 1.4).is_none());
+        assert!(!open.has_clearance_for(edge_goal, 1.4));
+        // A goal that fits the hull still routes and executes.
+        let fit_goal = Vec3::new(290.0, 0.0, 0.0);
+        let path = open.find_path_for(start, fit_goal, 1.4).unwrap();
+        let mut prev = start;
+        for point in &path {
+            assert!(open.segment_clear_for(prev, *point, 1.4));
+            prev = *point;
+        }
+        // Deterministic across repeats.
+        assert_eq!(Some(path.clone()), open.find_path_for(start, fit_goal, 1.4));
+    }
+    #[test]
+    fn body_aware_planning_respects_narrow_passages() {
+        // Exact swept clearance is the contract constrain_motion enforces:
+        // a wall-hugging lane that is scout-clear must still reject the
+        // commander hull. Grid routing stays conservative (margin-band cells
+        // count as blocked), so path assertions use open field where both
+        // hulls are walkable; the tight lane is covered by exact segment
+        // checks (see body_aware_clearance test).
+        let grid = NavGrid::new(
+            20.0,
+            2.5,
+            vec![Obstacle {
+                center: Vec2::ZERO,
+                half_size: Vec2::splat(2.0),
+            }],
+        );
+        let tight = Vec3::new(3.5, 0.0, 0.0);
+        let across = Vec3::new(8.0, 0.0, 3.5);
+        assert!(grid.segment_clear(tight, across));
+        assert!(!grid.segment_clear_for(tight, across, 1.4));
+        // Wide open field still routes for both hulls, deterministically,
+        // and every commander leg executes under constrain_motion.
+        let open = NavGrid::new(20.0, 2.5, vec![]);
+        let start = Vec3::new(-8.0, 0.0, 0.0);
+        let goal = Vec3::new(8.0, 0.0, 0.0);
+        let scout = open.find_path_for(start, goal, 0.45).unwrap();
+        let cmd = open.find_path_for(start, goal, 1.4).unwrap();
+        assert_eq!(Some(scout.clone()), open.find_path_for(start, goal, 0.45));
+        assert_eq!(Some(cmd.clone()), open.find_path_for(start, goal, 1.4));
+        let mut prev = start;
+        for point in &cmd {
+            assert!(open.segment_clear_for(prev, *point, 1.4));
+            prev = *point;
+        }
+    }
+    #[test]
+    fn body_aware_formations_fit_mixed_hulls() {
+        let grid = NavGrid::default();
+        // Small hulls keep legacy density.
+        let small = grid.formation_for(100, Vec3::ZERO, 2.5, 0.45).unwrap();
+        assert_eq!(small.len(), 100);
+        for slot in &small {
+            assert!(grid.has_clearance_for(*slot, 0.45));
+        }
+        // Commander formation: fewer, but every slot fits the 1.7 margin and
+        // stays unique.
+        let big = grid.formation_for(20, Vec3::ZERO, 2.5, 1.4).unwrap();
+        assert_eq!(big.len(), 20);
+        let cells: HashSet<_> = big.iter().map(|s| grid.cell(*s).unwrap()).collect();
+        assert_eq!(cells.len(), 20);
+        for slot in &big {
+            assert!(grid.is_walkable(*slot));
+            assert!(grid.has_clearance_for(*slot, 1.4));
+        }
     }
     #[test]
     fn parallel_batch_matches_serial_and_preserves_order() {

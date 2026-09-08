@@ -269,7 +269,10 @@ impl Config {
         Ok(Some(config))
     }
 }
-pub const HELP: &str = "Rust RTS v0.0.14 benchmark and profiler\n\
+pub const HELP: &str = concat!(
+    "Rust RTS v",
+    env!("CARGO_PKG_VERSION"),
+    " benchmark and profiler\n\
   cargo run                                      Economy playground\n\
   cargo run -- --ai skirmish                       You (blue) vs AI (red turtle)\n\
   cargo run -- --ai both                           Demo 1v1: AI blue (rusher) vs AI red (turtle)\n\
@@ -293,7 +296,8 @@ Options: --workload idle|crossing|crowd|skirmish|guard|ai-test, --units-per-team
          --ai off|test|skirmish|both, --ai-team 0|1|2 (2=both),\n\
          --ai-personality turtle|rusher (red), --ai-personality2 turtle|rusher (blue),\n\
          --output <new-directory>. --skirmish remains an alias.\n\
-Performance values are descriptive only; only correctness can fail a run.";
+Performance values are descriptive only; only correctness can fail a run."
+);
 
 #[cfg(test)]
 mod tests {

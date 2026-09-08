@@ -344,12 +344,19 @@ fn finish_sites(
         }
     }
 }
+#[allow(clippy::type_complexity)]
 fn sync_occupancy(
     mut commands: Commands,
     mut occupancy: ResMut<Occupancy>,
     mut grid: ResMut<NavGrid>,
     buildings: Query<(Entity, &Transform, &BuildingKind), With<Building>>,
-    routes: Query<(Entity, &Transform, &Route)>,
+    routes: Query<(
+        Entity,
+        &Transform,
+        &Route,
+        Option<&crate::units::UnitKind>,
+        Option<&crate::units::CollisionRadius>,
+    )>,
 ) {
     let mut current: Vec<_> = buildings
         .iter()
@@ -380,10 +387,18 @@ fn sync_occupancy(
     occupancy.entries = current;
     // Only routes intersecting changed occupancy are discarded; the existing
     // planner still caps work per frame. No permanent global revision replan.
-    for (entity, transform, route) in &routes {
+    // Body-aware: a route that was scout-clear may still be blocked for a
+    // large hull, so validate with the same hull the planner used.
+    for (entity, transform, route, kind, body) in &routes {
+        let radius = kind
+            .map(|k| crate::units::archetype(*k).radius)
+            .or(body.map(|b| b.0));
         let mut previous = transform.translation;
         if route.points.iter().skip(route.next).any(|point| {
-            let blocked = !grid.segment_clear(previous, *point);
+            let blocked = match radius {
+                Some(r) => !grid.segment_clear_for(previous, *point, r),
+                None => !grid.segment_clear(previous, *point),
+            };
             previous = *point;
             blocked
         }) {
@@ -391,11 +406,18 @@ fn sync_occupancy(
         }
     }
 }
-fn remember_motion(mut commands: Commands, units: Query<(Entity, &Transform), With<Unit>>) {
-    for (entity, transform) in &units {
-        commands
-            .entity(entity)
-            .insert(BeforeMotion(transform.translation));
+fn remember_motion(
+    mut commands: Commands,
+    mut units: Query<(Entity, &Transform, Option<&mut BeforeMotion>), With<Unit>>,
+) {
+    for (entity, transform, before) in &mut units {
+        if let Some(mut before) = before {
+            before.0 = transform.translation;
+        } else {
+            commands
+                .entity(entity)
+                .insert(BeforeMotion(transform.translation));
+        }
     }
 }
 /// Swept collision stops route fallback, chase and avoidance from tunnelling
@@ -406,6 +428,12 @@ fn constrain_motion(
 ) {
     for (previous, mut transform, radius) in &mut units {
         let next = transform.translation;
+        // Stationary units never tunnel: skip the swept rect scans entirely.
+        // Exact equality is intentional — any real displacement (even sub-mm
+        // from avoidance/chase) still takes the full body-aware check below.
+        if previous.0 == next {
+            continue;
+        }
         if grid.segment_clear_for(previous.0, next, radius.0) {
             continue;
         }

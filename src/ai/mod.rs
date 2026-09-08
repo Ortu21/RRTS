@@ -45,6 +45,14 @@ pub use strategy::Personality;
 /// Cadence: snapshot come il fog (4Hz), strategia lenta (1Hz) come da
 /// GameAIPro (Utility a bassa frequenza, micro ad alta).
 pub const SNAPSHOT_PERIOD: f32 = 0.25;
+
+/// Match-relative snapshot cadence. It is a resource so `R` can reset both
+/// the accumulator and the tick together with the rest of the AI state.
+#[derive(Resource, Default, Debug)]
+pub struct AiClock {
+    pub(crate) accumulator: f32,
+    pub(crate) tick: u64,
+}
 pub const STRATEGY_PERIOD: f32 = 1.0;
 /// 0.0.20 — micro a 4Hz (solo Retreat/Focus/Hold/Screen), budget 2 ordini:
 /// correzioni di rotta rapide senza churn del planner macro.
@@ -204,11 +212,13 @@ impl Plugin for AiPlugin {
             .init_resource::<AiSnapshots>()
             .init_resource::<AiState>()
             .init_resource::<EnemyMemory>()
+            .init_resource::<AiClock>()
             .add_systems(
                 Update,
                 (snapshot::refresh_snapshots, ai_tick, micro_tick)
                     .chain()
                     .after(MovementSystems)
+                    .after(crate::fog::FogSystems)
                     .run_if(ai_active),
             );
     }
@@ -566,7 +576,18 @@ mod tests {
             .init_asset::<StandardMaterial>();
         app.finish();
         app.cleanup();
-        for _ in 0..600 {
+        app.update();
+        for snapshot in app.world().resource::<AiSnapshots>().0.values() {
+            assert!(
+                snapshot.visible_enemies.is_empty(),
+                "the first AI snapshot must respect fog"
+            );
+            assert!(
+                snapshot.memory.is_empty(),
+                "bootstrap must not memorize enemies outside sight"
+            );
+        }
+        for _ in 1..600 {
             app.update();
         }
         let world = app.world_mut();

@@ -1327,7 +1327,7 @@ mod tests {
                 UnitKind::HeavyTank,
             ))
             .id();
-        // Warmup activates fog (first 0.25s are open), then 1s blind.
+        // Fog rasters immediately, then the test advances through 1s blind.
         for _ in 0..20 {
             app.update();
         }

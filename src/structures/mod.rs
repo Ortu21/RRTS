@@ -47,6 +47,8 @@ pub struct Placement {
 #[derive(Resource, Default)]
 struct Occupancy {
     entries: Vec<(Entity, Obstacle)>,
+    #[cfg(test)]
+    rebuilds: u64,
 }
 #[derive(Component)]
 struct BeforeMotion(Vec3);
@@ -349,7 +351,14 @@ fn sync_occupancy(
     mut commands: Commands,
     mut occupancy: ResMut<Occupancy>,
     mut grid: ResMut<NavGrid>,
-    buildings: Query<(Entity, &Transform, &BuildingKind), With<Building>>,
+    changed_buildings: Query<
+        (Entity, &Transform, &BuildingKind),
+        (
+            With<Building>,
+            Or<(Added<Building>, Changed<Transform>, Changed<BuildingKind>)>,
+        ),
+    >,
+    mut removed_buildings: RemovedComponents<Building>,
     routes: Query<(
         Entity,
         &Transform,
@@ -358,33 +367,54 @@ fn sync_occupancy(
         Option<&crate::units::CollisionRadius>,
     )>,
 ) {
-    let mut current: Vec<_> = buildings
-        .iter()
-        .map(|(e, t, k)| {
-            (
-                e,
-                Obstacle {
-                    center: t.translation.xz(),
-                    half_size: k.stats().half,
-                },
-            )
-        })
-        .collect();
-    current.sort_by_key(|(e, _)| e.to_bits());
-    if current.len() == occupancy.entries.len()
-        && current
-            .iter()
-            .zip(&occupancy.entries)
-            .all(|(a, b)| a.0 == b.0 && a.1.center == b.1.center && a.1.half_size == b.1.half_size)
-    {
+    let previous_count = occupancy.entries.len();
+    let mut changed = false;
+
+    for (entity, transform, kind) in &changed_buildings {
+        let obstacle = Obstacle {
+            center: transform.translation.xz(),
+            half_size: kind.stats().half,
+        };
+        match occupancy
+            .entries
+            .binary_search_by_key(&entity.to_bits(), |(entry, _)| entry.to_bits())
+        {
+            Ok(index) => {
+                if occupancy.entries[index].1 != obstacle {
+                    occupancy.entries[index].1 = obstacle;
+                    changed = true;
+                }
+            }
+            Err(index) => {
+                occupancy.entries.insert(index, (entity, obstacle));
+                changed = true;
+            }
+        }
+    }
+    for entity in removed_buildings.read() {
+        if let Ok(index) = occupancy
+            .entries
+            .binary_search_by_key(&entity.to_bits(), |(entry, _)| entry.to_bits())
+        {
+            occupancy.entries.remove(index);
+            changed = true;
+        }
+    }
+    if !changed {
         return;
     }
-    let previous_count = occupancy.entries.len();
+    #[cfg(test)]
+    {
+        occupancy.rebuilds += 1;
+    }
     grid.replace_dynamic(
         previous_count,
-        &current.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+        &occupancy
+            .entries
+            .iter()
+            .map(|(_, obstacle)| *obstacle)
+            .collect::<Vec<_>>(),
     );
-    occupancy.entries = current;
     // Only routes intersecting changed occupancy are discarded; the existing
     // planner still caps work per frame. No permanent global revision replan.
     // Body-aware: a route that was scout-clear may still be blocked for a

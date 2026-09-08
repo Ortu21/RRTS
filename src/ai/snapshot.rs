@@ -49,12 +49,17 @@ pub struct AiBuilding {
 /// snapshot (4Hz). Ordinati per età crescente (i più freschi prima).
 #[derive(Clone, Debug)]
 pub struct AiMemory {
+    /// Stable identity retained from `EnemyMemory`; synthetic snapshots may
+    /// omit it when they only model a remembered position.
+    pub entity_bits: Option<u64>,
     pub pos: Vec3,
     pub age_ticks: u64,
     pub kind: Option<UnitKind>,
     pub hp: f32,
     pub building: bool,
 }
+
+type MemoryView = (u64, Vec3, u64, Option<UnitKind>, f32, bool);
 
 impl AiMemory {
     /// 0.0.19 — confidence Walsh: `1/(1+age/60)`, stesso K di
@@ -149,6 +154,23 @@ impl AiSnapshot {
             .collect()
     }
 
+    /// Contacts that are no longer live in this snapshot. Identity-based
+    /// filtering prevents live + memory double counting without assuming
+    /// that every synthetic age-zero memory also has a live counterpart.
+    pub fn remembered_troop_memory(&self, max_age: u64) -> Vec<&AiMemory> {
+        self.memory
+            .iter()
+            .filter(|m| !m.building && m.age_ticks <= max_age)
+            .filter(|m| {
+                m.entity_bits.is_none_or(|bits| {
+                    self.visible_enemies
+                        .iter()
+                        .all(|enemy| enemy.entity.to_bits() != bits)
+                })
+            })
+            .collect()
+    }
+
     /// 0.0.16 — baricentro dei ricordi freschi non-edifici (meta attacco /
     /// conferma scout). Stessa matematica di `memory::remembered_centroid`
     /// ma su `AiMemory` (snapshot) invece che su `Contact`: i due restano
@@ -213,8 +235,8 @@ pub fn is_visible_to(map: Option<&VisibilityMap>, team: u8, pos: Vec3) -> bool {
     match map {
         None => true,
         Some(m) => {
-            // Open fallback while the team has no fog data yet (first ticks,
-            // harnesses without viewers): same rule as fog::can_target.
+            // Open fallback for harnesses without the fog plugin or without
+            // any viewers: same rule as fog::can_target.
             if !m.0.contains_key(&team) {
                 return true;
             }
@@ -288,7 +310,7 @@ pub fn build_snapshot(
         ),
     >,
     map: Option<&VisibilityMap>,
-    memory: &[(Vec3, u64, Option<UnitKind>, f32, bool)],
+    memory: &[MemoryView],
     deposits: &[crate::structures::MetalDeposit],
 ) -> AiSnapshot {
     let mut my_units: Vec<AiUnit> = units
@@ -405,10 +427,11 @@ fn sample_explored_cells(map: Option<&VisibilityMap>, team: u8) -> Vec<bool> {
 
 /// Vista memoria per lo snapshot: età calcolata, freschi prima, poi per
 /// posizione (deterministico).
-fn to_ai_memory(memory: &[(Vec3, u64, Option<UnitKind>, f32, bool)]) -> Vec<AiMemory> {
+fn to_ai_memory(memory: &[MemoryView]) -> Vec<AiMemory> {
     let mut out: Vec<AiMemory> = memory
         .iter()
-        .map(|(pos, age, kind, hp, building)| AiMemory {
+        .map(|(entity_bits, pos, age, kind, hp, building)| AiMemory {
+            entity_bits: Some(*entity_bits),
             pos: *pos,
             age_ticks: *age,
             kind: *kind,
@@ -430,15 +453,14 @@ fn to_ai_memory(memory: &[(Vec3, u64, Option<UnitKind>, f32, bool)]) -> Vec<AiMe
 /// Loop in ordine di team = deterministico.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn refresh_snapshots(
-    mut acc: Local<f32>,
     time: Res<Time>,
+    mut clock: ResMut<super::AiClock>,
     config: Res<super::AiConfig>,
     map: Option<Res<VisibilityMap>>,
     economy: Option<Res<Economy>>,
     mut snapshots: ResMut<super::AiSnapshots>,
     mut memory: ResMut<super::EnemyMemory>,
     deposits: Option<Res<crate::structures::MetalDeposits>>,
-    mut tick: Local<u64>,
     units: Query<(Entity, &Transform, &Team, &UnitKind, &UnitOrder, &Health), With<Unit>>,
     enemy_units: Query<(Entity, &Transform, &Team, &UnitKind, &Health), With<Unit>>,
     buildings: Query<
@@ -453,13 +475,14 @@ pub fn refresh_snapshots(
         With<Building>,
     >,
 ) {
-    *acc += time.delta_secs();
+    clock.accumulator += time.delta_secs();
     let has_any = snapshots.0.values().any(|s| s.tick > 0);
-    if *acc < super::SNAPSHOT_PERIOD && has_any {
+    if clock.accumulator < super::SNAPSHOT_PERIOD && has_any {
         return;
     }
-    *acc = 0.0;
-    *tick += 1;
+    clock.accumulator = 0.0;
+    clock.tick += 1;
+    let tick = clock.tick;
 
     let flat_units: Vec<_> = units
         .iter()
@@ -508,16 +531,25 @@ pub fn refresh_snapshots(
         );
         observed.sort_by_key(|(bits, _, _, _, _)| *bits);
         let team_memory = memory.0.entry(brain.team).or_default();
-        super::memory::update_memory(team_memory, *tick, &observed);
-        let mem_view: Vec<(Vec3, u64, Option<UnitKind>, f32, bool)> = team_memory
+        super::memory::update_memory(team_memory, tick, &observed);
+        let mem_view: Vec<MemoryView> = team_memory
             .iter()
-            .map(|c| (c.pos, tick.saturating_sub(c.tick), c.kind, c.hp, c.building))
+            .map(|c| {
+                (
+                    c.entity_bits,
+                    c.pos,
+                    tick.saturating_sub(c.tick),
+                    c.kind,
+                    c.hp,
+                    c.building,
+                )
+            })
             .collect();
         snapshots.0.insert(
             brain.team,
             build_snapshot(
                 brain.team,
-                *tick,
+                tick,
                 &flat_units,
                 &flat_enemies,
                 &flat_buildings,
@@ -659,6 +691,7 @@ mod tests {
             ..Default::default()
         };
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(0.0, 0.0, 0.0),
             age_ticks: 5,
             kind: Some(UnitKind::HeavyTank),
@@ -666,6 +699,7 @@ mod tests {
             building: false,
         });
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(10.0, 0.0, 0.0),
             age_ticks: 10,
             kind: Some(UnitKind::HeavyTank),
@@ -674,6 +708,7 @@ mod tests {
         });
         // Edifici esclusi dai freschi-truppa.
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(99.0, 0.0, 99.0),
             age_ticks: 1,
             kind: None,
@@ -691,6 +726,7 @@ mod tests {
             ..Default::default()
         };
         only_buildings.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::ZERO,
             age_ticks: 1,
             kind: None,
@@ -709,6 +745,7 @@ mod tests {
             ..Default::default()
         };
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(200.0, 0.0, 200.0),
             age_ticks: 5,
             kind: None,
@@ -716,6 +753,7 @@ mod tests {
             building: true,
         });
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(210.0, 0.0, 210.0),
             age_ticks: 200,
             kind: None,
@@ -723,6 +761,7 @@ mod tests {
             building: true,
         });
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(0.0, 0.0, 0.0),
             age_ticks: 5,
             kind: Some(UnitKind::HeavyTank),

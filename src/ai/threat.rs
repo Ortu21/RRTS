@@ -137,10 +137,7 @@ pub fn build_threat(snapshot: &AiSnapshot) -> ThreatMap {
             map.cells[idx] += w;
         }
     }
-    for m in &snapshot.memory {
-        if m.building || m.age_ticks > MEMORY_FRESH_TICKS {
-            continue;
-        }
+    for m in snapshot.remembered_troop_memory(MEMORY_FRESH_TICKS) {
         let Some(kind) = m.kind else { continue };
         let w = threat_unit_weight(kind, m.hp, m.age_ticks) * THREAT_MEMORY_DISCOUNT;
         if w > 0.0 {
@@ -232,6 +229,7 @@ mod tests {
             health: 170.0,
         });
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(-80.0, 0.0, 20.0),
             age_ticks: 10,
             kind: Some(UnitKind::HeavyTank),
@@ -240,6 +238,7 @@ mod tests {
         });
         // Ricordo vecchio oltre TTL fresca: ignorato.
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(0.0, 0.0, 100.0),
             age_ticks: MEMORY_FRESH_TICKS + 1,
             kind: Some(UnitKind::HeavyTank),
@@ -257,5 +256,28 @@ mod tests {
         assert_eq!(a.query(Vec3::new(0.0, 0.0, 100.0)), 0.0);
         // Ma il ricordo fresco sì.
         assert!(a.query(Vec3::new(-80.0, 0.0, 20.0)) > 0.0);
+    }
+
+    #[test]
+    fn live_contact_is_not_counted_again_from_memory() {
+        use super::super::snapshot::{AiEnemy, AiMemory};
+        let entity = Entity::from_bits(77);
+        let mut snap = AiSnapshot::default();
+        snap.visible_enemies.push(AiEnemy {
+            entity,
+            pos: Vec3::ZERO,
+            kind: UnitKind::HeavyTank,
+            health: 170.0,
+        });
+        snap.memory.push(AiMemory {
+            entity_bits: Some(entity.to_bits()),
+            pos: Vec3::ZERO,
+            age_ticks: 0,
+            kind: Some(UnitKind::HeavyTank),
+            hp: 170.0,
+            building: false,
+        });
+        let expected = threat_unit_weight(UnitKind::HeavyTank, 170.0, 0);
+        assert!((build_threat(&snap).max() - expected).abs() < 0.001);
     }
 }

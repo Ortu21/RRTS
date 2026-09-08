@@ -220,7 +220,7 @@ pub(crate) fn build_match_app_with_configs(teams: Vec<AiTeamConfig>, seed: u64) 
         .init_asset::<StandardMaterial>();
     app.finish();
     app.cleanup();
-    // Attiva fog (i primi 0.25s sono open), come l'harness.
+    // Warmup della simulazione; il primo raster fog è immediato.
     for _ in 0..20 {
         app.update();
     }

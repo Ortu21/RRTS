@@ -7,7 +7,7 @@
 use crate::{
     combat::Health,
     economy::Economy,
-    fog::VisibilityMap,
+    fog::{FogClock, VisibilityMap},
     navigation::NavGrid,
     orders::PendingOrder,
     scenario::Scenario,
@@ -74,6 +74,12 @@ pub fn decide_winner(alive_blue: usize, alive_red: usize, seen: bool) -> MatchRe
 struct GameOverBanner;
 
 pub struct GameOverPlugin;
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct RestartClocks<'w> {
+    fog: Option<ResMut<'w, FogClock>>,
+    ai: Option<ResMut<'w, crate::ai::AiClock>>,
+}
 impl Plugin for GameOverPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MatchResult>()
@@ -167,6 +173,7 @@ fn restart_on_r(
     mut ids: ResMut<UnitIds>,
     mut economy: ResMut<Economy>,
     mut visibility: ResMut<VisibilityMap>,
+    mut clocks: RestartClocks,
     mut snapshots: Option<ResMut<crate::ai::AiSnapshots>>,
     mut ai_state: Option<ResMut<crate::ai::AiState>>,
     mut memory: Option<ResMut<crate::ai::EnemyMemory>>,
@@ -187,6 +194,9 @@ fn restart_on_r(
     // spariscono da soli via `sync_occupancy` nei frame successivi.
     *economy = Economy::default();
     *visibility = VisibilityMap::default();
+    if let Some(clock) = clocks.fog.as_deref_mut() {
+        *clock = FogClock::default();
+    }
     // Reset AI solo se il plugin AI è attivo (in partita normale senza AI
     // le risorse non esistono: `Option<ResMut>` evita il panic "Resource
     // does not exist" che bloccava `cargo run` liscio).
@@ -198,6 +208,9 @@ fn restart_on_r(
     }
     if let Some(memory) = memory.as_deref_mut() {
         *memory = crate::ai::EnemyMemory::default();
+    }
+    if let Some(clock) = clocks.ai.as_deref_mut() {
+        *clock = crate::ai::AiClock::default();
     }
     *placement = Placement::default();
     *pending = PendingOrder::None;
@@ -287,5 +300,42 @@ mod tests {
         for _ in 0..5 {
             app.update();
         }
+    }
+
+    #[test]
+    fn restart_resets_match_relative_ai_clock() {
+        use bevy::window::PrimaryWindow;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Scenario::Playground)
+            .insert_resource(MatchResult {
+                over: true,
+                winner: Some(0),
+                draw: false,
+            })
+            .init_resource::<NavGrid>()
+            .init_resource::<UnitIds>()
+            .init_resource::<Economy>()
+            .init_resource::<VisibilityMap>()
+            .init_resource::<FogClock>()
+            .init_resource::<crate::ai::AiSnapshots>()
+            .init_resource::<crate::ai::AiState>()
+            .init_resource::<crate::ai::EnemyMemory>()
+            .init_resource::<crate::ai::AiClock>()
+            .init_resource::<Placement>()
+            .init_resource::<PendingOrder>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_plugins(GameOverPlugin);
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app.world_mut().resource_mut::<crate::ai::AiClock>().tick = 999;
+        app.finish();
+        app.cleanup();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.update();
+
+        assert_eq!(app.world().resource::<crate::ai::AiClock>().tick, 0);
+        assert!(!app.world().resource::<MatchResult>().over);
     }
 }

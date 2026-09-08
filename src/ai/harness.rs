@@ -52,7 +52,7 @@ fn build_app(personality: &str, team: u8) -> App {
         .init_asset::<StandardMaterial>();
     app.finish();
     app.cleanup();
-    // Attiva fog (i primi 0.25s sono open): come combat_fog_app nei test.
+    // Warmup della simulazione; il primo raster fog è ora immediato.
     for _ in 0..20 {
         app.update();
     }

@@ -383,6 +383,7 @@ mod tests {
         // Contatto perso (vista live vuota) > frontiera: conferma come 0.0.14.
         let mut snap = empty_snapshot(1);
         snap.memory.push(super::super::snapshot::AiMemory {
+            entity_bits: None,
             pos: Vec3::new(123.0, 0.0, 45.0),
             age_ticks: 10,
             kind: Some(UnitKind::HeavyTank),
@@ -404,6 +405,7 @@ mod tests {
         let (seen, threat) = threat_with_tank_at(hot_center);
         let mut snap = seen;
         snap.memory.push(super::super::snapshot::AiMemory {
+            entity_bits: None,
             pos: hot_center,
             age_ticks: 5,
             kind: Some(UnitKind::HeavyTank),
@@ -482,6 +484,7 @@ mod tests {
         // Con conferma: primo conferma, secondo frontiera libera.
         let mut snap = empty_snapshot(1);
         snap.memory.push(super::super::snapshot::AiMemory {
+            entity_bits: None,
             pos: Vec3::new(123.0, 0.0, 45.0),
             age_ticks: 10,
             kind: Some(UnitKind::HeavyTank),

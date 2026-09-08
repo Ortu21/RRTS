@@ -168,6 +168,7 @@ mod tests {
         snap.tick = tick;
         for i in 0..n {
             snap.memory.push(super::super::snapshot::AiMemory {
+                entity_bits: None,
                 pos: Vec3::new(i as f32 * 5.0, 0.0, 0.0),
                 age_ticks: age,
                 kind: Some(UnitKind::HeavyTank),
@@ -222,6 +223,7 @@ mod tests {
         let mut snap = troop_snapshot(1, 4, 10, 300);
         // Ricordo vecchio = primo contatto a tick 100 (< 240 = precoce).
         snap.memory.push(super::super::snapshot::AiMemory {
+            entity_bits: None,
             pos: Vec3::new(99.0, 0.0, 99.0),
             age_ticks: 200,
             kind: Some(UnitKind::LightTank),
@@ -283,6 +285,7 @@ mod tests {
         for i in 0..3 {
             let mut snap = troop_snapshot(1, 3 + i, 5, 200 + i as u64 * 10);
             snap.memory.push(super::super::snapshot::AiMemory {
+                entity_bits: None,
                 pos: Vec3::ZERO,
                 age_ticks: 150 + i as u64 * 10,
                 kind: Some(UnitKind::HeavyTank),

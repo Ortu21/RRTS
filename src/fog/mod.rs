@@ -63,6 +63,22 @@ pub const FOG_ALPHA: f32 = 0.42;
 /// Overlay height: above terrain (0.0) and grid lines (0.01), below hulls.
 pub const FOG_OVERLAY_Y: f32 = 0.06;
 
+/// Resettable cadence + revision for the authoritative fog raster.
+///
+/// `initialized=false` makes the first Update (and the first Update after a
+/// match restart) raster immediately instead of exposing the open fallback
+/// for one quarter second.  Consumers use `revision` to skip full-world work
+/// between the 4 Hz fog ticks.
+#[derive(Resource, Default, Debug)]
+pub struct FogClock {
+    accumulator: f32,
+    initialized: bool,
+    revision: u64,
+}
+
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FogSystems;
+
 pub struct FogPlugin {
     /// False in headless harnesses: data + concealment still run, only the
     /// overlay mesh is skipped.
@@ -72,12 +88,13 @@ impl Plugin for FogPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<VisibilityMap>()
             .init_resource::<ViewState>()
-            .add_systems(Update, update_fog.after(MovementSystems));
+            .init_resource::<FogClock>()
+            .add_systems(Update, update_fog.after(MovementSystems).in_set(FogSystems));
         if self.render {
             app.add_systems(Startup, setup_overlay)
-                .add_systems(Update, (refresh_overlay, conceal_unseen).after(update_fog));
+                .add_systems(Update, (refresh_overlay, conceal_unseen).after(FogSystems));
         } else {
-            app.add_systems(Update, conceal_unseen.after(update_fog));
+            app.add_systems(Update, conceal_unseen.after(FogSystems));
         }
     }
 }
@@ -198,7 +215,7 @@ fn reveal(map: &mut VisibilityMap, team: u8, at: Vec3, range: f32) {
 #[allow(clippy::type_complexity)]
 fn update_fog(
     time: Res<Time>,
-    mut acc: Local<f32>,
+    mut clock: ResMut<FogClock>,
     units: Query<(&Transform, &Team, &UnitKind, &Health), With<Unit>>,
     buildings: Query<
         (
@@ -211,11 +228,13 @@ fn update_fog(
     >,
     mut map: ResMut<VisibilityMap>,
 ) {
-    *acc += time.delta_secs();
-    if *acc < FOG_PERIOD {
+    clock.accumulator += time.delta_secs();
+    if clock.initialized && clock.accumulator < FOG_PERIOD {
         return;
     }
-    *acc = 0.0;
+    clock.accumulator = 0.0;
+    clock.initialized = true;
+    clock.revision = clock.revision.wrapping_add(1);
     for fog in map.0.values_mut() {
         fog.ensure();
         fog.visible.fill(false);
@@ -250,29 +269,73 @@ fn conceal_unseen(
     mut commands: Commands,
     map: Res<VisibilityMap>,
     view: Res<ViewState>,
+    clock: Res<FogClock>,
+    mut last_revision: Local<Option<u64>>,
+    added: Query<Entity, Or<(Added<Unit>, Added<Building>)>>,
     mut hidden: Query<
         (Entity, &Transform, &Team, Option<&mut Visibility>),
         Or<(With<Unit>, With<Building>)>,
     >,
 ) {
-    for (entity, transform, team, visibility) in &mut hidden {
-        let seen =
-            team.0 == view.team || !view.fog_on || map.visible(view.team, transform.translation);
-        let want = if seen {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        match visibility {
-            Some(mut current) => {
-                if *current != want {
-                    *current = want;
-                }
+    let full_refresh = *last_revision != Some(clock.revision) || view.is_changed();
+    if full_refresh {
+        for (entity, transform, team, visibility) in &mut hidden {
+            apply_concealment(
+                &mut commands,
+                &map,
+                &view,
+                entity,
+                transform,
+                team,
+                visibility,
+            );
+        }
+        *last_revision = Some(clock.revision);
+        return;
+    }
+
+    // Buildings/units spawned between fog ticks still receive the right state
+    // immediately. Moving contacts are revisited on the next authoritative
+    // fog tick, matching the cadence of the visibility data itself.
+    for entity in &added {
+        if let Ok((entity, transform, team, visibility)) = hidden.get_mut(entity) {
+            apply_concealment(
+                &mut commands,
+                &map,
+                &view,
+                entity,
+                transform,
+                team,
+                visibility,
+            );
+        }
+    }
+}
+
+fn apply_concealment(
+    commands: &mut Commands,
+    map: &VisibilityMap,
+    view: &ViewState,
+    entity: Entity,
+    transform: &Transform,
+    team: &Team,
+    visibility: Option<Mut<Visibility>>,
+) {
+    let seen = team.0 == view.team || !view.fog_on || map.visible(view.team, transform.translation);
+    let want = if seen {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    match visibility {
+        Some(mut current) => {
+            if *current != want {
+                *current = want;
             }
-            None => {
-                if want == Visibility::Hidden {
-                    commands.entity(entity).insert(Visibility::Hidden);
-                }
+        }
+        None => {
+            if want == Visibility::Hidden {
+                commands.entity(entity).insert(Visibility::Hidden);
             }
         }
     }
@@ -413,6 +476,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<VisibilityMap>()
             .init_resource::<ViewState>()
+            .init_resource::<FogClock>()
             .add_systems(Update, conceal_unseen);
         let mut entities = Vec::new();
         for team in [0, 1] {
@@ -450,6 +514,105 @@ mod tests {
                 Some(&Visibility::Inherited)
             );
         }
+    }
+
+    #[test]
+    fn first_update_rasters_fog_without_an_open_window() {
+        use crate::combat::Health;
+        use crate::units::archetype;
+        use bevy::time::TimeUpdateStrategy;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / 60.0,
+            )))
+            .add_plugins(FogPlugin { render: false });
+        let commander = archetype(UnitKind::Commander);
+        for (id, team, position) in [
+            (1, 0, Vec3::new(-260.0, 0.0, -260.0)),
+            (2, 1, Vec3::new(260.0, 0.0, 260.0)),
+        ] {
+            app.world_mut().spawn((
+                Unit(id),
+                Team(team),
+                UnitKind::Commander,
+                Transform::from_translation(position),
+                Health {
+                    current: commander.max_health,
+                    max: commander.max_health,
+                },
+            ));
+        }
+        app.finish();
+        app.cleanup();
+        app.update();
+
+        let map = app.world().resource::<VisibilityMap>();
+        assert!(map.0.contains_key(&0));
+        assert!(map.visible(0, Vec3::new(-260.0, 0.0, -260.0)));
+        assert!(!map.visible(0, Vec3::new(260.0, 0.0, 260.0)));
+        assert_eq!(app.world().resource::<FogClock>().revision, 1);
+    }
+
+    #[test]
+    fn concealment_skips_idle_frames_but_handles_new_entities() {
+        let mut app = App::new();
+        let mut map = revealed(0, Vec3::ZERO, 20.0);
+        // Keep the viewed team registered even if the helper changes later.
+        map.0.entry(0).or_default().ensure();
+        app.insert_resource(map)
+            .init_resource::<ViewState>()
+            .init_resource::<FogClock>()
+            .add_systems(Update, conceal_unseen);
+        app.world_mut().resource_mut::<FogClock>().revision = 1;
+        let enemy = app
+            .world_mut()
+            .spawn((
+                Team(1),
+                Unit(1),
+                Transform::from_translation(Vec3::X * 100.0),
+                Visibility::Inherited,
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(enemy),
+            Some(&Visibility::Hidden)
+        );
+
+        // Moving without a fog raster does not trigger a full scan.
+        app.world_mut()
+            .get_mut::<Transform>(enemy)
+            .unwrap()
+            .translation = Vec3::ZERO;
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(enemy),
+            Some(&Visibility::Hidden)
+        );
+        app.world_mut().resource_mut::<FogClock>().revision += 1;
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(enemy),
+            Some(&Visibility::Inherited)
+        );
+
+        // A new contact is concealed immediately even between raster ticks.
+        let added = app
+            .world_mut()
+            .spawn((
+                Team(1),
+                Unit(2),
+                Transform::from_translation(Vec3::X * 100.0),
+                Visibility::Inherited,
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(added),
+            Some(&Visibility::Hidden)
+        );
     }
 
     fn overlay_app() -> (App, Handle<Mesh>) {

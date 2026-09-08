@@ -395,7 +395,7 @@ fn foe_mix(snapshot: &AiSnapshot) -> Vec<(UnitKind, f32)> {
             .and_modify(|(_, hp)| *hp += e.health)
             .or_insert((e.kind, e.health));
     }
-    for m in snapshot.fresh_troop_memory(MEMORY_FRESH_TICKS) {
+    for m in snapshot.remembered_troop_memory(MEMORY_FRESH_TICKS) {
         if let Some(kind) = m.kind {
             acc.entry(kind.index())
                 .and_modify(|(_, hp)| *hp += m.hp)
@@ -450,7 +450,7 @@ fn estimate_forces(snapshot: &AiSnapshot) -> ForcePair {
         .iter()
         .map(|e| (e.kind, e.health))
         .collect();
-    for m in snapshot.fresh_troop_memory(MEMORY_FRESH_TICKS) {
+    for m in snapshot.remembered_troop_memory(MEMORY_FRESH_TICKS) {
         if let Some(kind) = m.kind {
             foe_list.push((kind, m.hp * age_decay(m.age_ticks) * THREAT_MEMORY_DISCOUNT));
         }
@@ -1741,6 +1741,7 @@ mod tests {
         // ricordo fresco età 0 deve coincidere col max della threat map.
         let mut snap = empty_snapshot(1);
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(50.0, 0.0, -30.0),
             age_ticks: 0,
             kind: Some(UnitKind::HeavyTank),
@@ -1751,6 +1752,45 @@ mod tests {
         let map = super::super::threat::build_threat(&snap);
         assert!(power > 0.0);
         assert!((power - map.max()).abs() < 0.001);
+    }
+
+    #[test]
+    fn force_and_mix_deduplicate_live_memory_by_entity() {
+        use super::super::snapshot::{AiEnemy, AiMemory};
+        let live = Entity::from_bits(501);
+        let remembered = Entity::from_bits(502);
+        let mut snap = empty_snapshot(1);
+        snap.visible_enemies.push(AiEnemy {
+            entity: live,
+            pos: Vec3::ZERO,
+            kind: UnitKind::HeavyTank,
+            health: 170.0,
+        });
+        snap.memory.extend([
+            AiMemory {
+                entity_bits: Some(live.to_bits()),
+                pos: Vec3::ZERO,
+                age_ticks: 0,
+                kind: Some(UnitKind::HeavyTank),
+                hp: 170.0,
+                building: false,
+            },
+            AiMemory {
+                entity_bits: Some(remembered.to_bits()),
+                pos: Vec3::X * 20.0,
+                age_ticks: 10,
+                kind: Some(UnitKind::LightTank),
+                hp: 100.0,
+                building: false,
+            },
+        ]);
+
+        let mix = foe_mix(&snap);
+        assert_eq!(
+            mix.iter().find(|(kind, _)| *kind == UnitKind::HeavyTank),
+            Some(&(UnitKind::HeavyTank, 170.0))
+        );
+        assert_eq!(estimate_forces(&snap).1.len(), 2);
     }
 
     #[test]
@@ -2007,6 +2047,7 @@ mod tests {
         assert_ne!(blind, moved);
         // Ricordo fresco: lo scout va a confermare lì (come 0.0.14).
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(50.0, 0.0, -30.0),
             age_ticks: 10,
             kind: Some(UnitKind::HeavyTank),
@@ -2040,6 +2081,7 @@ mod tests {
         let base_seen = Vec3::new(200.0, 0.0, 180.0);
         assert!((base_seen - static_target).length() > 50.0);
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: base_seen,
             age_ticks: 10,
             kind: None,
@@ -2176,6 +2218,7 @@ mod tests {
         snap.tick = 200;
         for i in 0..3 {
             snap.memory.push(AiMemory {
+                entity_bits: None,
                 pos: Vec3::new(i as f32 * 5.0, 0.0, 0.0),
                 age_ticks: 5,
                 kind: Some(UnitKind::HeavyTank),
@@ -2184,6 +2227,7 @@ mod tests {
             });
         }
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::ZERO,
             age_ticks: 150,
             kind: Some(UnitKind::HeavyTank),
@@ -2298,6 +2342,7 @@ mod tests {
     fn give_fresh_eyes(snap: &mut AiSnapshot) {
         use super::super::snapshot::AiMemory;
         snap.memory.push(AiMemory {
+            entity_bits: None,
             pos: Vec3::new(50.0, 0.0, -30.0),
             age_ticks: 5,
             kind: Some(UnitKind::HeavyTank),

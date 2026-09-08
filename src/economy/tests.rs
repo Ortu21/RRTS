@@ -106,6 +106,24 @@ fn fair_allocation_does_not_freeze_metal_only_recovery() {
     close(forward[1], reverse[0]);
 }
 #[test]
+fn metal_yield_multiplies_spot_income() {
+    // G1: il Metal eredita il mult dallo spot (centro ×2 → 10/s).
+    // Spawn diretti senza componente: 5/s invariati (back-compat).
+    let mut app = app(0.05);
+    let hot = building(&mut app, 0, BuildingKind::Metal, Vec3::ZERO, true);
+    app.world_mut()
+        .commands()
+        .entity(hot)
+        .insert(crate::structures::MetalYield(2.0));
+    app.world_mut().flush();
+    building(&mut app, 1, BuildingKind::Metal, Vec3::X * 25.0, true);
+    for _ in 0..20 {
+        app.update();
+    }
+    close(app.world().resource::<Economy>().0[&0].income[0], 10.0);
+    close(app.world().resource::<Economy>().0[&1].income[0], 5.0);
+}
+#[test]
 fn proportional_stall_resume_exact_costs_and_inactive_sites() {
     let mut app = app(0.05);
     let site = building(&mut app, 0, BuildingKind::Metal, Vec3::ZERO, false);

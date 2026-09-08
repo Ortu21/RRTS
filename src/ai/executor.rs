@@ -59,19 +59,44 @@ pub fn execute_movement_and_build(
                 }
                 candidates.sort_by_key(|(e, _)| e.to_bits());
                 let (builder_entity, builder_pos) = candidates[0];
-                let Some(spot) = find_build_spot(
-                    grid,
-                    team,
-                    *kind,
-                    scenario,
-                    builder_pos,
-                    buildings,
-                    builders_live,
-                    unit_footprints,
-                ) else {
+                // G1 — Metal solo su spot (regola hard, come il ghost player);
+                // altri edifici sulla spirale classica. Lo spot eredita il
+                // mult del deposito (centro ×2).
+                let Some(spot) = (if *kind == BuildingKind::Metal {
+                    let metals: Vec<Vec3> = buildings
+                        .iter()
+                        .filter(|(_, k, _, _)| *k == BuildingKind::Metal)
+                        .map(|(_, _, p, _)| *p)
+                        .collect();
+                    super::strategy::find_metal_spot(
+                        grid,
+                        &snapshot.deposits,
+                        &metals,
+                        builder_pos,
+                        unit_footprints,
+                    )
+                } else {
+                    find_build_spot(
+                        grid,
+                        team,
+                        *kind,
+                        scenario,
+                        builder_pos,
+                        buildings,
+                        builders_live,
+                        unit_footprints,
+                    )
+                }) else {
                     continue;
                 };
                 let site = spawn_building(commands, Team(team), *kind, spot, false);
+                crate::structures::apply_deposit_yield(
+                    commands,
+                    site,
+                    *kind,
+                    &snapshot.deposits,
+                    spot,
+                );
                 queue_build(&mut commands.entity(builder_entity), site);
                 builds += 1;
             }

@@ -181,8 +181,7 @@ checksum/winrate.
 - ≤16 param: nuovi dati via Resource/ParamSet, funzioni pure fuori dai sistemi.
 - No nuove dip: `cargo tree -i ron` prima di aggiungerlo; fallback json.
 
-## Stato implementazione
-- [x] 0.0.16 spec (questo file)
+## Stato implementazione- [x] 0.0.16 spec (questo file)
 - [x] 0.0.16 code (threat shadow + explored_pct + memory API + metriche)
   - `cargo test` 145 verdi, `clippy -D warnings` verde, `fmt` verde.
   - `ai-test` PASS deterministico (checksum identici tra repeat) + nuovo
@@ -217,4 +216,11 @@ checksum/winrate.
     scenari + probe ticks-capped (minuti). Quick/full full-cap = nightly/
     release, mai in analisi interattive. Guardrail winrate-vs-rush-scripted:
     non misurabile senza match lunghi → pending al primo run nightly.
-- [ ] 0.0.18, 0.0.19, 0.0.20, 0.0.21 (solo spec finché approvate)
+- [x] G1 Metal spots (branch feat/metal-spots): 3 home/lato + mid + centro ×2,
+  regola hard unica player/AI, ghost con magnete+highlight, marker oro,
+  income × mult, AI Metal su spot. 161 test verdi, clippy/fmt puliti,
+  ai-test PASS deterministico, scenari all_pass True (persino scout-nav-clean).
+  Nota: micro-duel/siege cambiano esito vs baseline (6 vs 7 kill) pur senza
+  cervelli — repeats bit-identici, contract ok, causa non isolata (duelli
+  knife-edge; identità cross-versione mai promessa). Non inseguire oltre.
+- [ ] G2 spawn E/O + 0.0.18, 0.0.19, 0.0.20, 0.0.21 (spec finché approvate)

@@ -69,6 +69,9 @@ pub struct AiSnapshot {
     pub active_site: Option<Entity>,
     /// Ricordi nemici (anche non più visibili), freschi prima.
     pub memory: Vec<AiMemory>,
+    /// G1 — depositi metallo (terreno pubblico, uguali per ogni team).
+    /// La regola Metal li legge da qui: niente nuove query nei sistemi.
+    pub deposits: Vec<crate::structures::MetalDeposit>,
     /// 0.0.16 — frazione mappa esplorata dal team (0..1), da `VisibilityMap`.
     /// Solo osservazione in shadow: `decide()` non la legge ancora.
     pub explored_pct: f32,
@@ -224,6 +227,7 @@ pub fn build_snapshot(
     >,
     map: Option<&VisibilityMap>,
     memory: &[(Vec3, u64, Option<UnitKind>, f32, bool)],
+    deposits: &[crate::structures::MetalDeposit],
 ) -> AiSnapshot {
     let mut my_units: Vec<AiUnit> = units
         .iter()
@@ -302,6 +306,7 @@ pub fn build_snapshot(
         active_site,
         memory: to_ai_memory(memory),
         explored_pct,
+        deposits: deposits.to_vec(),
         stock,
         income,
         demand,
@@ -342,6 +347,7 @@ pub fn refresh_snapshots(
     economy: Option<Res<Economy>>,
     mut snapshots: ResMut<super::AiSnapshots>,
     mut memory: ResMut<super::EnemyMemory>,
+    deposits: Option<Res<crate::structures::MetalDeposits>>,
     mut tick: Local<u64>,
     units: Query<(Entity, &Transform, &Team, &UnitKind, &UnitOrder, &Health), With<Unit>>,
     enemy_units: Query<(Entity, &Transform, &Team, &UnitKind, &Health), With<Unit>>,
@@ -393,6 +399,10 @@ pub fn refresh_snapshots(
             eco.insert(*team, (account.stock, account.income, account.demand));
         }
     }
+    // G1: depositi condivisi (terreno); app senza StructuresPlugin vedono
+    // mondo vuoto = regola Metal chiusa, mai panic.
+    let empty_deposits = crate::structures::MetalDeposits::default();
+    let deposits = deposits.as_deref().unwrap_or(&empty_deposits);
     for brain in config.sorted_teams() {
         // Stessi contatti visibili di build_snapshot: memoria mai divergente.
         let (vis_units, vis_sites) =
@@ -424,6 +434,7 @@ pub fn refresh_snapshots(
                 &eco,
                 map.as_deref(),
                 &mem_view,
+                &deposits.0,
             ),
         );
     }
@@ -486,12 +497,22 @@ mod tests {
         )];
         let buildings: Vec<(Entity, u8, BuildingKind, Vec3, bool, f32)> = vec![];
         let eco = BTreeMap::new();
-        let snap = build_snapshot(1, 1, &units, &enemies, &buildings, &eco, Some(&map), &[]);
+        let snap = build_snapshot(
+            1,
+            1,
+            &units,
+            &enemies,
+            &buildings,
+            &eco,
+            Some(&map),
+            &[],
+            &[],
+        );
         assert_eq!(snap.my_units.len(), 1);
         // Gated map with no reveal: enemy hidden (honest AI).
         assert!(snap.visible_enemies.is_empty());
         // Open map: same enemy visible.
-        let open = build_snapshot(1, 1, &units, &enemies, &buildings, &eco, None, &[]);
+        let open = build_snapshot(1, 1, &units, &enemies, &buildings, &eco, None, &[], &[]);
         assert_eq!(open.visible_enemies.len(), 1);
     }
 
@@ -519,16 +540,28 @@ mod tests {
                 50.0,
             ),
         ];
-        let snap = build_snapshot(1, 5, &units, &[], &[], &BTreeMap::new(), None, &[]);
+        let snap = build_snapshot(1, 5, &units, &[], &[], &BTreeMap::new(), None, &[], &[]);
         assert_eq!(snap.my_units[0].entity, b);
         assert_eq!(snap.my_units[1].entity, a);
+        assert!(snap.deposits.is_empty());
+    }
+
+    #[test]
+    fn deposits_ride_the_snapshot() {
+        use crate::structures::MetalDeposit;
+        let deps = vec![MetalDeposit {
+            pos: Vec3::new(30.0, 0.0, 0.0),
+            mult: 1.0,
+        }];
+        let snap = build_snapshot(1, 5, &[], &[], &[], &BTreeMap::new(), None, &[], &deps);
+        assert_eq!(snap.deposits, deps);
     }
 
     #[test]
     fn explored_pct_defaults_zero_without_fog_and_helpers_match_memory() {
         use super::AiMemory;
         // Senza fog: 0% esplorato, niente panico.
-        let snap = build_snapshot(1, 5, &[], &[], &[], &BTreeMap::new(), None, &[]);
+        let snap = build_snapshot(1, 5, &[], &[], &[], &BTreeMap::new(), None, &[], &[]);
         assert!((snap.explored_pct - 0.0).abs() < 1e-6);
         // Helper freschi/centroide allineati a `memory::remembered_centroid`.
         let mut snap = AiSnapshot {

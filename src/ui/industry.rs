@@ -2,8 +2,8 @@
 use crate::{
     camera::RtsCamera,
     combat::Health,
-    economy::{Economy, balance::*},
-    orders::{PendingOrder, UnitOrder},
+    economy::balance::*,
+    orders::PendingOrder,
     picking::ground_position,
     production::Factory,
     selection::{Selected, SelectionSystems},
@@ -13,17 +13,33 @@ use crate::{
 };
 use bevy::{prelude::*, transform::TransformSystems, window::PrimaryWindow};
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct MapInput {
     pub blocked: bool,
     captured: bool,
+    pub commands_allowed: bool,
+}
+impl Default for MapInput {
+    fn default() -> Self {
+        Self {
+            blocked: false,
+            captured: false,
+            commands_allowed: true,
+        }
+    }
+}
+impl MapInput {
+    pub fn cancel_gesture(&mut self) {
+        self.captured = false;
+        self.blocked = true;
+    }
 }
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MapInputSystems;
 #[derive(Component)]
 pub struct BlocksMap;
 pub fn map_input_allowed(input: Res<MapInput>) -> bool {
-    !input.blocked
+    !input.blocked && input.commands_allowed
 }
 #[derive(Component, Clone, Copy)]
 enum Action {
@@ -31,15 +47,12 @@ enum Action {
     Produce(UnitKind),
     Cancel(usize),
     CancelSite,
-    ViewTeam(u8),
-    ToggleFog,
+    Command(u8),
 }
 /// Marker on the three BASE CONSTRUCTION buttons: shown only while a builder
 /// of the viewed team (Commander/Engineer) is selected — click builder, menu appears.
 #[derive(Component)]
 struct BuildButton;
-#[derive(Component)]
-struct ResourceText;
 #[derive(Component)]
 struct BaseText;
 #[derive(Component)]
@@ -50,24 +63,13 @@ struct QueueLabel(usize);
 struct FactoryPanel;
 #[derive(Component)]
 struct SiteButton;
-/// Dynamic labels of the VIEW / FOG buttons (text follows `ViewState`).
-#[derive(Component)]
-struct ViewTeamLabel(u8);
-#[derive(Component)]
-struct FogLabel;
 pub struct IndustryUiPlugin;
 impl Plugin for IndustryUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ViewState>()
-            .add_systems(Startup, setup)
             .add_systems(
                 PostUpdate,
-                (
-                    capture_pointer,
-                    actions,
-                    set_factory_rally,
-                    placement_and_rally,
-                )
+                (actions, set_factory_rally, placement_and_rally)
                     .chain()
                     .in_set(MapInputSystems)
                     .after(TransformSystems::Propagate)
@@ -77,14 +79,6 @@ impl Plugin for IndustryUiPlugin {
                 PostUpdate,
                 (update_text, structures::draw_rallies).after(SelectionSystems),
             );
-    }
-}
-fn panel() -> Node {
-    Node {
-        flex_direction: FlexDirection::Column,
-        row_gap: px(5),
-        padding: UiRect::all(px(12)),
-        ..default()
     }
 }
 fn font(size: f32) -> TextFont {
@@ -113,98 +107,168 @@ fn button(parent: &mut ChildSpawnerCommands, action: Action, label: String) {
         p.spawn((Text::new(label), font(14.0)));
     });
 }
-fn setup(mut commands: Commands) {
-    commands
-        .spawn((
-            BlocksMap,
-            Interaction::None,
-            Node {
-                position_type: PositionType::Absolute,
-                top: px(0),
-                left: px(0),
-                right: px(0),
-                height: px(62),
-                ..panel()
-            },
-            BackgroundColor(Color::srgb(0.04, 0.07, 0.09)),
-        ))
+pub fn spawn_dock(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn(Node {
+            flex_grow: 1.0,
+            min_height: px(0),
+            column_gap: px(12),
+            ..default()
+        })
         .with_children(|p| {
-            p.spawn((ResourceText, Text::new("Economy starting..."), font(16.0)));
-        });
-    commands.spawn((BlocksMap, Interaction::None, Node { position_type: PositionType::Absolute, top: px(68), right: px(8), width: px(310), ..panel() }, BackgroundColor(Color::srgba(0.04, 0.07, 0.09, 0.96))))
-        .with_children(|p| {
-            p.spawn((Text::new("BASE CONSTRUCTION"), font(18.0)));
-            p.spawn((BaseText, Text::default(), font(13.0)));
-            for kind in BuildingKind::ALL {
-                let s = kind.stats();
-                button(p, Action::Build(kind), format!("{}   {}M {}E / {:.0}s", s.name, s.cost.resources[0], s.cost.resources[1], s.cost.work / BASE_POWER));
-            }
-            p.spawn((ContextText, Text::new("Select a building"), font(14.0)));
-            p.spawn((SiteButton, Node { display: Display::None, ..panel() })).with_children(|p| button(p, Action::CancelSite, "Cancel site (NO REFUND)".into()));
-            p.spawn((FactoryPanel, Node { display: Display::None, ..panel() })).with_children(|p| {
-                for kind in UnitKind::PRODUCIBLE { let c = unit_cost(kind); button(p, Action::Produce(kind), format!("+ {}   {}M {}E / {:.0}s", archetype(kind).name, c.resources[0], c.resources[1], c.work / FACTORY_POWER)); }
-                p.spawn((Text::new("Queue: click row to cancel.\nSpent resources are NOT refunded.\nRight-click ground: rally point"), font(12.0)));
-                for i in 0..MAX_QUEUE {
-                    p.spawn((Button, BlocksMap, Action::Cancel(i), Node { display: Display::None, padding: UiRect::axes(px(6), px(3)), ..default() }, BackgroundColor(Color::srgb(0.18, 0.18, 0.21))))
-                        .with_children(|p| { p.spawn((QueueLabel(i), Text::default(), font(13.0))); });
-                }
-            });
-            // Team impersonation + fog spectator toggle. Builders of the
-            // viewed team task from this same panel (see update_text).
-            p.spawn((Text::new("VIEW & FOG"), font(18.0)));
-            for team in [0u8, 1u8] {
-                p.spawn((
-                    Button,
-                    BlocksMap,
-                    Action::ViewTeam(team),
-                    Node {
-                        padding: UiRect::all(px(7)),
-                        min_height: px(30),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.14, 0.23, 0.29)),
-                ))
-                .with_children(|p| {
-                    p.spawn((ViewTeamLabel(team), Text::default(), font(14.0)));
-                });
-            }
             p.spawn((
-                Button,
                 BlocksMap,
-                Action::ToggleFog,
+                Interaction::None,
                 Node {
-                    padding: UiRect::all(px(7)),
-                    min_height: px(30),
-                    ..default()
+                    width: px(210),
+                    flex_shrink: 0.0,
+                    overflow: Overflow::scroll_y(),
+                    ..super::shell::column()
                 },
-                BackgroundColor(Color::srgb(0.14, 0.23, 0.29)),
+                ScrollPosition::default(),
             ))
             .with_children(|p| {
-                p.spawn((FogLabel, Text::default(), font(14.0)));
+                p.spawn((super::shell::Label::Selection, Text::default(), font(14.0)));
+            });
+            p.spawn((
+                BlocksMap,
+                Interaction::None,
+                Node {
+                    flex_grow: 1.0,
+                    flex_basis: px(0),
+                    min_width: px(0),
+                    overflow: Overflow::scroll_y(),
+                    ..super::shell::column()
+                },
+                ScrollPosition::default(),
+            ))
+            .with_children(|p| {
+                p.spawn((BaseText, Text::default(), font(13.0)));
+                p.spawn(Node {
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: px(5),
+                    row_gap: px(5),
+                    ..default()
+                })
+                .with_children(|p| {
+                    for kind in BuildingKind::ALL {
+                        let s = kind.stats();
+                        button(
+                            p,
+                            Action::Build(kind),
+                            format!(
+                                "{}\n{}M {}E",
+                                s.name, s.cost.resources[0], s.cost.resources[1]
+                            ),
+                        );
+                    }
+                    for (i, name) in [
+                        "Attack-move [G]",
+                        "Patrol [P]",
+                        "Guard [T]",
+                        "Hold [H]",
+                        "Stop [X]",
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        button(p, Action::Command(i as u8), name.into());
+                    }
+                });
+                p.spawn((
+                    SiteButton,
+                    Node {
+                        display: Display::None,
+                        ..default()
+                    },
+                ))
+                .with_children(|p| button(p, Action::CancelSite, "Cancel site | no refund".into()));
+                p.spawn((
+                    FactoryPanel,
+                    Node {
+                        display: Display::None,
+                        flex_wrap: FlexWrap::Wrap,
+                        column_gap: px(5),
+                        row_gap: px(5),
+                        ..default()
+                    },
+                ))
+                .with_children(|p| {
+                    for kind in UnitKind::PRODUCIBLE {
+                        let c = unit_cost(kind);
+                        button(
+                            p,
+                            Action::Produce(kind),
+                            format!(
+                                "{}\n{}M {}E",
+                                archetype(kind).name,
+                                c.resources[0],
+                                c.resources[1]
+                            ),
+                        );
+                    }
+                });
+            });
+            p.spawn((
+                QueuePanel,
+                BlocksMap,
+                Interaction::None,
+                Node {
+                    width: px(180),
+                    flex_shrink: 0.0,
+                    overflow: Overflow::scroll_y(),
+                    ..super::shell::column()
+                },
+                ScrollPosition::default(),
+            ))
+            .with_children(|p| {
+                p.spawn((Text::new("PRODUCTION QUEUE"), font(13.0)));
+                for i in 0..MAX_QUEUE {
+                    p.spawn((
+                        Button,
+                        BlocksMap,
+                        Action::Cancel(i),
+                        Node {
+                            display: Display::None,
+                            padding: UiRect::all(px(5)),
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                        BackgroundColor(super::shell::BUTTON),
+                    ))
+                    .with_children(|p| {
+                        p.spawn((QueueLabel(i), Text::default(), font(13.0)));
+                    });
+                }
             });
         });
+    parent.spawn((ContextText, Text::default(), font(13.0)));
 }
-fn capture_pointer(
+#[derive(Component)]
+struct QueuePanel;
+pub fn capture_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
-    mut placement: ResMut<Placement>,
+    mut placement: Option<ResMut<Placement>>,
     interactions: Query<&Interaction, With<BlocksMap>>,
     mut input: ResMut<MapInput>,
     match_result: Option<Res<crate::game_over::MatchResult>>,
+    control: Option<Res<crate::view::SessionControl>>,
 ) {
-    // Partita finita: solo R (restart) resta attivo — preview scartato e tutto muto.
-    if match_result.is_some_and(|r| r.over) {
+    input.commands_allowed = !match_result.is_some_and(|r| r.over)
+        && control.as_deref().is_none_or(|c| c.player_team().is_some());
+    if !input.commands_allowed
+        && let Some(placement) = placement.as_deref_mut()
+    {
         placement.kind = None;
         placement.builders.clear();
-        input.blocked = true;
-        input.captured = false;
-        return;
     }
     let pointer = interactions.iter().any(|i| *i != Interaction::None);
     if pointer && (mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Right))
     {
         input.captured = true;
     }
-    input.blocked = pointer || input.captured || placement.kind.is_some();
+    input.blocked =
+        pointer || input.captured || placement.as_deref().is_some_and(|p| p.kind.is_some());
     if !mouse.pressed(MouseButton::Left) && !mouse.pressed(MouseButton::Right) {
         input.captured = false;
     }
@@ -215,13 +279,16 @@ fn actions(
     buttons: Query<(&Interaction, &Action), (Changed<Interaction>, With<Button>)>,
     selected: Query<(Entity, &Team, Has<Construction>), (With<Selected>, With<Building>)>,
     selected_builders: Query<(Entity, &Team), (With<Selected>, With<Unit>, With<Builder>)>,
-    all_selected: Query<Entity, With<Selected>>,
     mut factories: Query<&mut Factory>,
     mut placement: ResMut<Placement>,
     mut pending: ResMut<PendingOrder>,
     mut input: ResMut<MapInput>,
-    mut view: ResMut<ViewState>,
+    view: Res<ViewState>,
+    selected_units: Query<Entity, (With<Selected>, With<Unit>)>,
 ) {
+    if !input.commands_allowed {
+        return;
+    }
     let selected = selected
         .iter()
         .filter(|(_, t, _)| t.0 == view.team)
@@ -241,32 +308,25 @@ fn actions(
         }
         input.blocked = true;
         match *action {
-            Action::ViewTeam(team) => {
-                if view.team != team {
-                    view.team = team;
-                    // Stale selection belongs to the other team: clear it so
-                    // orders can never leak across teams on view switch.
-                    for entity in &all_selected {
-                        commands.entity(entity).remove::<Selected>();
-                    }
-                    placement.kind = None;
-                    placement.builders.clear();
-                    placement.message = format!(
-                        "Now playing as {} — select its builders to construct",
-                        ViewState::team_name(team)
-                    );
-                    *pending = PendingOrder::None;
+            Action::Command(command) => {
+                if selected_units.is_empty() {
+                    continue;
                 }
-                continue;
-            }
-            Action::ToggleFog => {
-                view.fog_on = !view.fog_on;
-                placement.message = if view.fog_on {
-                    "Fog ON — honest view of your team".into()
-                } else {
-                    "Fog OFF — spectator: everything visible".into()
-                };
-                continue;
+                match command {
+                    0 => *pending = PendingOrder::AttackMove,
+                    1 => *pending = PendingOrder::Patrol,
+                    2 => *pending = PendingOrder::Guard,
+                    _ => {
+                        *pending = PendingOrder::None;
+                        for e in &selected_units {
+                            if command == 3 {
+                                crate::orders::queue_hold(&mut commands.entity(e));
+                            } else {
+                                crate::orders::queue_stop(&mut commands.entity(e));
+                            }
+                        }
+                    }
+                }
             }
             Action::Build(kind) => {
                 if tasked.is_empty() {
@@ -287,8 +347,9 @@ fn actions(
             Action::Produce(kind) => {
                 if let Some((e, _, false)) = selected
                     && let Ok(mut factory) = factories.get_mut(e)
+                    && !factory.enqueue(kind)
                 {
-                    factory.enqueue(kind);
+                    placement.message = "Queue full or unit unavailable for this factory.".into();
                 }
             }
             Action::Cancel(index) => {
@@ -389,7 +450,7 @@ fn placement_and_rally(
     deposits: Option<Res<crate::structures::MetalDeposits>>,
     mut gizmos: Gizmos,
 ) {
-    if !window.focused {
+    if !window.focused || !input.commands_allowed {
         placement.kind = None;
         placement.builders.clear();
         return;
@@ -587,6 +648,7 @@ fn set_factory_rally(
     mut factories: Query<(&Team, &mut Factory), (With<Selected>, Without<Construction>)>,
 ) {
     if !window.focused
+        || !input.commands_allowed
         || input.blocked
         || *pending != PendingOrder::None
         || !selected_units.is_empty()
@@ -610,254 +672,148 @@ fn set_factory_rally(
         }
     }
 }
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn update_text(
-    economy: Res<Economy>,
-    placement: Res<Placement>,
-    view: Res<ViewState>,
-    selected: Query<
-        (
-            Entity,
-            &Team,
-            &BuildingKind,
-            &Health,
-            Option<&Construction>,
-            Option<&Factory>,
-        ),
-        With<Selected>,
-    >,
-    sites: Query<&Team, With<Construction>>,
-    builders: Query<(Entity, &Team, &Builder, &Health), (With<Unit>, With<Builder>)>,
-    selected_builders: Query<
-        (Entity, &Team, &UnitKind, &Health, &Builder, &UnitOrder),
-        (With<Selected>, With<Unit>, With<Builder>),
-    >,
-    build_targets: Query<&Construction, With<Building>>,
-    mut resources: Single<&mut Text, With<ResourceText>>,
-    mut base: Single<&mut Text, (With<BaseText>, Without<ResourceText>)>,
-    mut context: Single<&mut Text, (With<ContextText>, Without<BaseText>, Without<ResourceText>)>,
-    mut labels: Query<
-        (&QueueLabel, &mut Text),
-        (
-            Without<ContextText>,
-            Without<BaseText>,
-            Without<ResourceText>,
-        ),
-    >,
-    mut factory_panel: Single<&mut Node, With<FactoryPanel>>,
-    mut site_button: Single<&mut Node, (With<SiteButton>, Without<FactoryPanel>)>,
-    mut queue_buttons: Query<
-        (&Action, &mut Node, &Interaction, &mut BackgroundColor),
-        (With<Button>, Without<FactoryPanel>, Without<SiteButton>),
-    >,
-    // VIEW + FOG in un'unica query (Bevy accetta max 16 param per sistema).
-    // I Without escludono gli altri possessori di Text: senza, Bevy va in
-    // panic B0001 (&mut Text ambiguo) al primo frame grafico.
-    mut view_buttons: Query<
-        (&mut Text, Option<&ViewTeamLabel>, Option<&FogLabel>),
-        (
-            Or<(With<ViewTeamLabel>, With<FogLabel>)>,
-            Without<QueueLabel>,
-            Without<ResourceText>,
-            Without<BaseText>,
-            Without<ContextText>,
-        ),
-    >,
-) {
-    if let Some(account) = economy.0.get(&view.team) {
-        let lines: Vec<_> = ["METAL", "ENERGY"]
-            .iter()
-            .enumerate()
-            .map(|(r, name)| {
-                let state = if account.stock[r] >= account.capacity[r] - 0.01 {
-                    "[STORAGE FULL]"
-                } else if account.demand[r] > account.consumption[r] + 0.01 {
-                    "[SHORTAGE]"
-                } else {
-                    ""
-                };
-                format!(
-                    "{name}  {:.0}/{:.0}     +{:.1}/s   -{:.1}/s   net {:+.1}/s  {state}",
-                    account.stock[r],
-                    account.capacity[r],
-                    account.income[r],
-                    account.consumption[r],
-                    account.income[r] - account.consumption[r]
-                )
-            })
-            .collect();
-        resources.set_if_neq(Text::new(lines.join("\n")));
-    }
-    // Builders work anywhere with valid ground; each trickles power only
-    // within its own radius of the site (see economy::site_power). Here show
-    // live builder count — per-site speed lives in the selection panel.
-    let alive: usize = builders
-        .iter()
-        .filter(|(_, t, _, h)| t.0 == view.team && h.current > 0.0)
+fn update_text(world: &mut World) {
+    let view = *world.resource::<ViewState>();
+    let allowed = world.resource::<MapInput>().commands_allowed;
+    let selected_units = world
+        .query_filtered::<Entity, (With<Selected>, With<Unit>)>()
+        .iter(world)
         .count();
-    let tasked_selected: usize = selected_builders
-        .iter()
-        .filter(|(_, t, _, _, _, _)| t.0 == view.team)
+    let builder_count = world
+        .query_filtered::<&Team, (With<Selected>, With<Builder>)>()
+        .iter(world)
+        .filter(|t| t.0 == view.team)
         .count();
-    let availability = if sites.iter().any(|t| t.0 == view.team) {
-        format!("BUSY: one site already active / builders alive: {alive}")
-    } else if alive == 0 {
-        "STALLED: no builders alive — protect Commander / build Engineer".into()
-    } else if tasked_selected == 0 {
-        format!("Builders alive: {alive} — select Commander / Engineer to build")
-    } else {
-        format!("READY: {tasked_selected} builder(s) tasked — pick a structure, click ground")
-    };
-    base.set_if_neq(Text::new(format!("{availability}\n{}", placement.message)));
-    let selected = selected.iter().min_by_key(|row| row.0.to_bits());
-    let mut factory = None;
-    let mut site_selected = false;
-    let description = if let Some((_, team, kind, health, site, industry)) = selected {
-        site_selected = site.is_some() && team.0 == view.team;
-        factory = industry.filter(|_| site.is_none() && team.0 == view.team);
-        let activity = if let Some(site) = site {
-            format!(
-                "Construction {:.1}% / {:.1} work/s\n{}",
-                site.0.fraction() * 100.0,
-                site.0.speed,
-                site.0.status()
-            )
-        } else if let Some(f) = industry {
-            if f.blocked {
-                "OUTPUT BLOCKED: free exit / rally route".into()
-            } else if let Some(job) = f.queue.front() {
-                format!(
-                    "{} {:.1}% / {:.1} work/s\n{}",
-                    archetype(job.kind).name,
-                    job.project.fraction() * 100.0,
-                    job.project.speed,
-                    job.project.status()
-                )
+    let building = world
+        .query_filtered::<(Entity, &Team), (With<Selected>, With<Building>)>()
+        .iter(world)
+        .filter(|(_, t)| t.0 == view.team)
+        .map(|(e, _)| e)
+        .min_by_key(|e| e.to_bits());
+    let inspected = world
+        .get_resource::<super::debug::Inspected>()
+        .and_then(|i| i.0);
+    let entity = building.or(inspected);
+    let factory = entity
+        .filter(|e| {
+            world
+                .get::<Team>(*e)
+                .is_some_and(|t| view.permits_private_data(t.0))
+        })
+        .and_then(|e| world.get::<Factory>(e))
+        .cloned();
+    let own = entity.is_some_and(|e| world.get::<Team>(e).is_some_and(|t| t.0 == view.team));
+    let editable = own && allowed && building.is_some();
+    let site = entity.is_some_and(|e| world.get::<Construction>(e).is_some());
+    let busy = world
+        .query_filtered::<&Team, With<Construction>>()
+        .iter(world)
+        .any(|t| t.0 == view.team);
+    let base = if !allowed {
+        "READ ONLY | inspect the match".to_string()
+    } else if builder_count > 0 {
+        format!(
+            "CONSTRUCTION | {builder_count} builders{}",
+            if busy {
+                " | active site already exists"
             } else {
-                "Factory idle".into()
+                ""
             }
-        } else {
-            format!(
-                "Online: +{}M/s +{}E/s",
-                kind.stats().income[0],
-                kind.stats().income[1]
-            )
-        };
-        format!(
-            "\n{} / team {}\nHealth {:.0}/{:.0}\n{activity}",
-            kind.stats().name,
-            team.0,
-            health.current,
-            health.max
         )
-    } else if let Some((_, team, kind, health, builder, order)) =
-        selected_builders.iter().min_by_key(|row| row.0.to_bits())
+    } else if factory.is_some() {
+        "PRODUCTION | choose a unit".to_string()
+    } else if selected_units > 0 {
+        "ORDERS | right-click destination / target".to_string()
+    } else {
+        "Select your Commander to start building.".to_string()
+    };
+    let pending = *world.resource::<PendingOrder>();
+    let placement = world.resource::<Placement>();
+    let context = match pending {
+        PendingOrder::AttackMove => "ATTACK-MOVE | click destination | Esc cancels".into(),
+        PendingOrder::Patrol => "PATROL | click waypoints | Esc finishes".into(),
+        PendingOrder::Guard => "GUARD | click an ally | Esc cancels".into(),
+        PendingOrder::None if !placement.message.is_empty() && allowed => placement.message.clone(),
+        _ if factory.is_some() && editable => {
+            "Right-click ground: rally | click queue row: cancel (no refund)".into()
+        }
+        _ => "F1 help | F3 debug".into(),
+    };
+    for (mut text, base_marker, context_marker, queue) in world
+        .query::<(
+            &mut Text,
+            Option<&BaseText>,
+            Option<&ContextText>,
+            Option<&QueueLabel>,
+        )>()
+        .iter_mut(world)
     {
-        // Commander / Engineer selected: guns, build power/radius and the
-        // live build task. Right-click a site to (re)task, any other order
-        // pauses.
-        let guns = if kind.is_commander() {
-            "Guns: mitra 20m + missili 34m"
+        if base_marker.is_some() {
+            text.set_if_neq(Text::new(base.clone()));
+        }
+        if context_marker.is_some() {
+            text.set_if_neq(Text::new(context.clone()));
+        }
+        if let Some(q) = queue {
+            let value =
+                factory
+                    .as_ref()
+                    .and_then(|f| f.queue.get(q.0))
+                    .map_or(String::new(), |job| {
+                        format!(
+                            "{}. {}{}",
+                            q.0 + 1,
+                            archetype(job.kind).name,
+                            if q.0 == 0 { " | active" } else { "" }
+                        )
+                    });
+            text.set_if_neq(Text::new(value));
+        }
+    }
+    for (mut node, factory_marker, site_marker, queue_marker) in world
+        .query::<(
+            &mut Node,
+            Option<&FactoryPanel>,
+            Option<&SiteButton>,
+            Option<&QueuePanel>,
+        )>()
+        .iter_mut(world)
+    {
+        let show = if factory_marker.is_some() {
+            Some(editable && factory.is_some() && !site)
+        } else if site_marker.is_some() {
+            Some(editable && site)
+        } else if queue_marker.is_some() {
+            Some(factory.is_some())
         } else {
-            "Unarmed builder"
+            None
         };
-        let task = match order {
-            UnitOrder::Build { site } => match build_targets.get(*site) {
-                Ok(construction) => format!(
-                    "Building: {:.0}% / {:.1} work/s\n{}",
-                    construction.0.fraction() * 100.0,
-                    construction.0.speed,
-                    construction.0.status()
-                ),
-                Err(_) => "Build task done".to_string(),
-            },
-            UnitOrder::Guard { .. } => "Assisting (guarding builder)".to_string(),
-            _ => "No build task — place via BASE CONSTRUCTION or right-click a site".to_string(),
-        };
-        format!(
-            "\n{} / team {}\nHealth {:.0}/{:.0}\n{guns}\nBuild: {:.1} work/s / radius {:.0}\n{task}",
-            archetype(*kind).name,
-            team.0,
-            health.current,
-            health.max,
-            builder.power,
-            builder.radius
-        )
-    } else {
-        "\nSelect a building or builder to inspect it.".into()
-    };
-    context.set_if_neq(Text::new(description));
-    factory_panel.display = if factory.is_some() {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    site_button.display = if site_selected {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    for (label, mut text) in &mut labels {
-        let value = factory
-            .and_then(|f| f.queue.get(label.0))
-            .map_or(String::new(), |job| {
-                format!(
-                    "{}: {} {}   [cancel]",
-                    label.0 + 1,
-                    archetype(job.kind).name,
-                    if label.0 == 0 { "ACTIVE" } else { "waiting" }
-                )
-            });
-        text.set_if_neq(Text::new(value));
+        if let Some(show) = show {
+            node.display = if show { Display::Flex } else { Display::None };
+        }
     }
-    for (action, mut node, interaction, mut color) in &mut queue_buttons {
-        if let Action::Cancel(index) = action {
-            node.display = if factory.is_some_and(|f| f.queue.len() > *index) {
-                Display::Flex
-            } else {
-                Display::None
-            };
-        }
-        // Tier gate: T2 units show only on a selected LabT2 (the enqueue
-        // itself also refuses, this just keeps the menu honest).
-        if let Action::Produce(kind) = action {
-            node.display = if factory.is_some_and(|f| archetype(*kind).tier <= f.tier) {
-                Display::Flex
-            } else {
-                Display::None
-            };
-        }
-        // Contextual builder menu: structure buttons appear only while a
-        // builder of the viewed team is selected — click builder, menu appears.
-        if matches!(action, Action::Build(_)) {
-            node.display = if tasked_selected > 0 {
-                Display::Flex
-            } else {
-                Display::None
-            };
-        }
-        color.0 = match interaction {
-            Interaction::Pressed => Color::srgb(0.28, 0.48, 0.52),
-            Interaction::Hovered => Color::srgb(0.21, 0.34, 0.39),
-            Interaction::None => Color::srgb(0.14, 0.23, 0.29),
+    for (action, mut node, interaction, mut color) in world
+        .query::<(&Action, &mut Node, &Interaction, &mut BackgroundColor)>()
+        .iter_mut(world)
+    {
+        let show = match action {
+            Action::Build(_) => allowed && builder_count > 0,
+            Action::Produce(kind) => {
+                editable
+                    && factory
+                        .as_ref()
+                        .is_some_and(|f| archetype(*kind).tier <= f.tier)
+            }
+            Action::Cancel(i) => factory.as_ref().is_some_and(|f| f.queue.get(*i).is_some()),
+            Action::CancelSite => editable && site,
+            Action::Command(_) => allowed && selected_units > 0,
         };
-    }
-    // VIEW / FOG buttons follow ViewState: active team highlighted.
-    for (mut text, view_marker, fog_marker) in &mut view_buttons {
-        if let Some(marker) = view_marker {
-            let active = marker.0 == view.team;
-            text.set_if_neq(Text::new(format!(
-                "{} {}{}",
-                if active { ">" } else { " " },
-                ViewState::team_name(marker.0),
-                if active { " (you)" } else { "" }
-            )));
-        } else if fog_marker.is_some() {
-            text.set_if_neq(Text::new(format!(
-                "Fog: {}",
-                if view.fog_on { "ON" } else { "OFF" }
-            )));
-        }
+        node.display = if show { Display::Flex } else { Display::None };
+        color.0 = if *interaction != Interaction::None {
+            Color::srgb(0.21, 0.34, 0.39)
+        } else {
+            super::shell::BUTTON
+        };
     }
 }
 
@@ -871,16 +827,14 @@ mod tests {
         orders::PendingOrder,
         scenario::Scenario,
     };
-    use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, window::PrimaryWindow};
+    use bevy::window::PrimaryWindow;
 
     /// Regression test B0001: avvia davvero l'intero plugin grafico UI.
     /// Query `&mut Text` ambigue fanno panic al primo frame (solo l'app vera
     /// le eseguiva: `cargo test` da solo non le toccava mai).
-    #[test]
-    fn industry_plugin_boots_and_ticks_without_access_conflicts() {
+    fn ui_app() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
-            .add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_plugins(bevy::asset::AssetPlugin::default())
             .add_plugins(bevy::gizmos::GizmoPlugin)
             .add_plugins(bevy::input::InputPlugin)
@@ -891,9 +845,18 @@ mod tests {
             .init_resource::<NavigationStats>()
             .init_resource::<NavGrid>()
             .init_resource::<MapInput>()
+            .init_resource::<crate::spatial::SpatialGrid>()
+            .init_asset::<StandardMaterial>()
             .init_asset::<Mesh>()
             .init_asset::<bevy::render::mesh::skinning::SkinnedMeshInverseBindposes>()
-            .add_plugins((CameraPlugin, IndustryUiPlugin));
+            .insert_resource(crate::view::SessionControl::default())
+            .add_plugins((
+                CameraPlugin,
+                crate::ui::UiPlugin,
+                IndustryUiPlugin,
+                crate::selection::SelectionPlugin,
+                crate::orders::OrderPlugin,
+            ));
         // Finestra fittizia per i Single<&Window>: basta l'entità.
         app.world_mut().spawn((Window::default(), PrimaryWindow));
         app.finish();
@@ -903,6 +866,11 @@ mod tests {
         for _ in 0..5 {
             app.update();
         }
+        app
+    }
+    #[test]
+    fn industry_plugin_boots_and_ticks_without_access_conflicts() {
+        let mut app = ui_app();
         // I pulsanti VIEW/FOG esistono con le label iniziali (team blu, fog ON).
         let view = app.world().resource::<ViewState>();
         assert_eq!(view.team, 0);
@@ -914,6 +882,138 @@ mod tests {
             .map(|t| t.0.clone())
             .collect();
         assert!(labels.iter().any(|t| t.contains("BLUE")));
-        assert!(labels.iter().any(|t| t.contains("Fog: ON")));
+        assert!(labels.iter().any(|t| t.contains("Full view")));
+    }
+    #[test]
+    fn spectator_cannot_mutate_units_factories_or_sites_through_ui_or_keys() {
+        let mut app = ui_app();
+        let window = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        let unit = app
+            .world_mut()
+            .spawn((
+                Selected,
+                Unit(0),
+                Team(0),
+                UnitKind::Commander,
+                Builder {
+                    power: 10.0,
+                    radius: 26.0,
+                },
+                Health {
+                    current: 100.0,
+                    max: 100.0,
+                },
+                Transform::default(),
+                crate::orders::UnitOrder::Idle,
+            ))
+            .id();
+        let mut factory = Factory::default();
+        factory.enqueue(UnitKind::Scout);
+        let factory = app
+            .world_mut()
+            .spawn((
+                Selected,
+                Building,
+                Team(0),
+                BuildingKind::Factory,
+                Health {
+                    current: 100.0,
+                    max: 100.0,
+                },
+                Transform::default(),
+                factory,
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<crate::view::SessionControl>()
+            .transfer(0, crate::view::Controller::Bot);
+        app.update();
+        // Deliberately retain Selected to prove permissions are enforced even
+        // when a stale selection survives an external input producer.
+        app.world_mut().entity_mut(unit).insert(Selected);
+        app.world_mut().entity_mut(factory).insert(Selected);
+        for action in [
+            Action::Build(BuildingKind::Solar),
+            Action::Produce(UnitKind::Scout),
+            Action::Cancel(0),
+            Action::Command(3),
+            Action::Command(4),
+        ] {
+            let button = app
+                .world_mut()
+                .spawn((Button, action, Interaction::Pressed))
+                .id();
+            app.update();
+            app.world_mut().despawn(button);
+        }
+        for key in [
+            KeyCode::KeyG,
+            KeyCode::KeyP,
+            KeyCode::KeyT,
+            KeyCode::KeyH,
+            KeyCode::KeyX,
+        ] {
+            app.world_mut()
+                .write_message(bevy::input::keyboard::KeyboardInput {
+                    key_code: key,
+                    logical_key: bevy::input::keyboard::Key::Unidentified(
+                        bevy::input::keyboard::NativeKey::Unidentified,
+                    ),
+                    state: bevy::input::ButtonState::Pressed,
+                    text: None,
+                    repeat: false,
+                    window,
+                });
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .reset_all();
+        }
+        assert_eq!(
+            *app.world().get::<crate::orders::UnitOrder>(unit).unwrap(),
+            crate::orders::UnitOrder::Idle
+        );
+        assert_eq!(app.world().resource::<PendingOrder>(), &PendingOrder::None);
+        assert!(app.world().resource::<Placement>().kind.is_none());
+        assert_eq!(app.world().get::<Factory>(factory).unwrap().queue.len(), 1);
+        assert!(app.world().get::<Factory>(factory).unwrap().rally.is_none());
+    }
+    #[test]
+    fn ui_pointer_capture_lasts_through_release() {
+        let mut app = ui_app();
+        let panel = app
+            .world_mut()
+            .spawn((BlocksMap, Interaction::Hovered))
+            .id();
+        let window = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        app.world_mut()
+            .write_message(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: bevy::input::ButtonState::Pressed,
+                window,
+            });
+        app.update();
+        assert!(app.world().resource::<MapInput>().blocked);
+        *app.world_mut().get_mut::<Interaction>(panel).unwrap() = Interaction::None;
+        app.update();
+        assert!(app.world().resource::<MapInput>().blocked);
+        app.world_mut()
+            .write_message(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: bevy::input::ButtonState::Released,
+                window,
+            });
+        app.update();
+        assert!(app.world().resource::<MapInput>().blocked);
+        app.update();
+        assert!(!app.world().resource::<MapInput>().blocked);
     }
 }

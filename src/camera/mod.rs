@@ -6,11 +6,15 @@ use bevy::{
 
 use crate::{scenario::Scenario, world::GROUND_HALF_SIZE};
 
+#[derive(Resource, Default)]
+pub struct CameraFocus(pub Option<Vec3>);
+
 pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_camera)
+        app.init_resource::<CameraFocus>()
+            .add_systems(Startup, setup_camera)
             .add_systems(Update, control_camera);
     }
 }
@@ -29,10 +33,15 @@ impl RtsCamera {
     }
 }
 
-fn setup_camera(mut commands: Commands, scenario: Res<Scenario>) {
+fn setup_camera(
+    mut commands: Commands,
+    scenario: Res<Scenario>,
+    view: Option<Res<crate::view::ViewState>>,
+) {
     let controller = RtsCamera {
         focus: if matches!(*scenario, Scenario::Playground) {
-            scenario.center(0) + Vec3::new(0.0, 0.0, 12.0)
+            scenario.center(view.as_deref().map_or(0, |v| v.team as usize))
+                + Vec3::new(0.0, 0.0, 12.0)
         } else {
             Vec3::ZERO
         },
@@ -46,14 +55,18 @@ fn setup_camera(mut commands: Commands, scenario: Res<Scenario>) {
     commands.spawn((Camera3d::default(), controller.transform(), controller));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn control_camera(
     keys: Res<ButtonInput<KeyCode>>,
     mut wheel: MessageReader<MouseWheel>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut camera: Single<(&mut RtsCamera, &mut Transform)>,
+    input: Option<Res<crate::ui::industry::MapInput>>,
+    interactions: Query<&Interaction, With<crate::ui::industry::BlocksMap>>,
+    mut focus: ResMut<CameraFocus>,
 ) {
-    let scroll: f32 = wheel
+    let mut scroll: f32 = wheel
         .read()
         .map(|event| match event.unit {
             MouseScrollUnit::Line => event.y,
@@ -64,6 +77,12 @@ fn control_camera(
         return;
     }
     let (controller, transform) = &mut *camera;
+    if let Some(point) = focus.0.take() {
+        controller.focus = point;
+    }
+    if input.is_some_and(|i| i.blocked) || interactions.iter().any(|i| *i != Interaction::None) {
+        scroll = 0.0;
+    }
     let axis = |positive: &[KeyCode], negative: &[KeyCode]| {
         f32::from(keys.any_pressed(positive.iter().copied()))
             - f32::from(keys.any_pressed(negative.iter().copied()))

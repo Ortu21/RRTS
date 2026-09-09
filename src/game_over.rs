@@ -86,7 +86,10 @@ impl Plugin for GameOverPlugin {
             .init_resource::<ViewState>()
             .add_systems(Startup, setup_banner)
             .add_systems(Update, check_match_end)
-            .add_systems(PostUpdate, (update_banner, restart_on_r).chain());
+            .add_systems(
+                PostUpdate,
+                (update_banner, restart_on_r, reset_ui_after_restart).chain(),
+            );
     }
 }
 
@@ -96,14 +99,14 @@ fn setup_banner(mut commands: Commands) {
         Interaction::None,
         Text::new(""),
         TextFont {
-            font_size: FontSize::Px(34.0),
+            font_size: FontSize::Px(24.0),
             ..default()
         },
         TextColor(Color::srgb(1.0, 0.85, 0.3)),
         TextLayout::justify(Justify::Center),
         Node {
             position_type: PositionType::Absolute,
-            top: px(180),
+            top: px(210),
             left: px(0),
             right: px(0),
             display: Display::None,
@@ -227,6 +230,26 @@ fn restart_on_r(
     }
     // Il banner si nasconde al prossimo check (over=false da qui).
     commands.insert_resource(MatchResult::default());
+}
+
+fn reset_ui_after_restart(world: &mut World, mut was_over: Local<bool>) {
+    let over = world.resource::<MatchResult>().over;
+    let restarted = *was_over && !over;
+    *was_over = over;
+    if !restarted {
+        return;
+    }
+    crate::ui::shell::clear_transients(world);
+    let now = world.resource::<Time<Virtual>>().elapsed_secs();
+    if let Some(mut shell) = world.get_resource_mut::<crate::ui::shell::ShellState>() {
+        shell.match_started = now;
+    }
+    if let Some(mut speed) = world.get_resource_mut::<crate::ai::debug::AiSpeed>() {
+        speed.reset();
+    }
+    if let Some(mut time) = world.get_resource_mut::<Time<Virtual>>() {
+        time.set_relative_speed(1.0);
+    }
 }
 
 #[cfg(test)]

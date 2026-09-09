@@ -14,6 +14,7 @@ impl Plugin for SelectionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DragSelection>()
             .init_resource::<ViewState>()
+            .init_resource::<crate::ui::debug::Inspected>()
             .add_systems(Startup, setup_rectangle)
             .add_systems(
                 PostUpdate,
@@ -78,12 +79,11 @@ fn select_units(
     pending: Res<PendingOrder>,
     input: Res<crate::ui::industry::MapInput>,
     view: Res<ViewState>,
+    control: Option<Res<crate::view::SessionControl>>,
+    mut inspected: ResMut<crate::ui::debug::Inspected>,
 ) {
-    if input.blocked {
-        drag.start = None;
-        return;
-    }
     if keys.just_pressed(KeyCode::Escape) {
+        inspected.0 = None;
         for (entity, _, _, selected, _, _) in &units {
             if selected {
                 commands.entity(entity).remove::<Selected>();
@@ -94,6 +94,15 @@ fn select_units(
         drag.start = None;
         return;
     }
+    if input.blocked {
+        drag.start = None;
+        return;
+    }
+    let can_select = |team: u8| {
+        control
+            .as_deref()
+            .map_or(team == view.team, |c| c.can_command(team))
+    };
     // While an order is being targeted, left clicks belong to the order
     // system (which runs first): selection stays frozen, no stale drag.
     if *pending != PendingOrder::None {
@@ -132,9 +141,6 @@ fn select_units(
                     .iter()
                     // Fog: concealed enemies are not clickable.
                     .filter(|(_, _, _, _, _, vis)| vis.is_none_or(|v| *v != Visibility::Hidden))
-                    .filter(|(_, _, team, _, footprint, _)| {
-                        team.0 == view.team || footprint.is_some()
-                    })
                     .filter_map(|(entity, transform, _, _, footprint, _)| {
                         ray_box_distance(
                             &ray,
@@ -147,16 +153,23 @@ fn select_units(
                     .map(|(entity, _)| entity)
             })
     };
-    for (entity, transform, team, selected, footprint, _) in &units {
+    if !drag.dragging {
+        inspected.0 = clicked;
+    }
+    for (entity, transform, team, selected, footprint, vis) in &units {
         let hit = if drag.dragging {
-            team.0 == view.team
+            can_select(team.0)
+                && vis.is_none_or(|v| *v != Visibility::Hidden)
                 && footprint.is_none()
                 && camera
                     .world_to_viewport(camera_transform, transform.translation())
                     .is_ok_and(|point| bounds.contains(point))
         } else {
-            clicked == Some(entity)
+            clicked == Some(entity) && can_select(team.0)
         };
+        if hit && drag.dragging {
+            inspected.0 = Some(entity);
+        }
         if hit && !selected {
             commands.entity(entity).insert(Selected);
         } else if !hit && selected && !additive {
@@ -195,5 +208,11 @@ fn show_rings(
         if *visibility != next {
             *visibility = next;
         }
+    }
+}
+
+pub fn cancel_drag(world: &mut World) {
+    if let Some(mut drag) = world.get_resource_mut::<DragSelection>() {
+        *drag = default();
     }
 }

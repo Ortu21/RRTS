@@ -257,7 +257,22 @@ checksum/winrate.
     8/8 PASS deterministici.
 - [x] Debito Punto 5 minimo: TTA gate (niente Build scaling se `tta` INF) +
   test `planner_waits_when_broke_e2e`.
-- [ ] Debito futuro (specificato, non codice): utility scoring vero (Graham/
-  Lewis/Hanlon-Watts), threat multilayer range-aware (Mark/Zielinski/Lewis),
-  opponent con isteresi + scout information-gain (Welsh/Walsh/Zielinski),
-  threat cache perf, TrueSkill/hot-reload (mai).
+- [x] 0.0.22 utility full (branch `feat/0.0.22-utility-full`, spec
+  `docs/ai/022-utility-full.md`): scorer `0..1` puri per ogni macro parallela
+  (`build/enqueue/scout/defense_urgency` + `UtilityScores` in `utility.rs`),
+  4 pesi `w_build/w_enqueue/w_scout/w_defense` in `Personality/.ron` (default
+  1.0), gate `UTILITY_GATE=0.05` in `decide()`, check `utility-sane` nel
+  director. Estende il TTA-gate anche ai build programmati (second Solar /
+  factory expansion): prima emessi senza check abbordabilità.
+  - `cargo test` 268 verdi (11 utility + 2 wiring pesi), `clippy -D warnings`
+    verde, `fmt` verde, `ron_roundtrip` verde (4 `.ron` con pesi).
+  - `ai-test` 1800t×2: checksum `0xcdc063b96cb87d34` bit-identici a `dev`
+    (FAIL pre-esistenti a tick corti: factory oltre 1800t, identici a baseline).
+  - `ai-scenarios` all_pass True: 8/9 checksum identici, unico delta voluto in
+    `commander-snipe` (`0xd75b…` → `0xf9c7…`, sempre PASS, base 87.9%→88.9%:
+    build programmati non abbordabili skippati, più stock per la difesa).
+  - League quick/full full-cap = nightly (policy sessione: solo probe
+    ticks-capped in interattiva).
+- [ ] Debito futuro (specificato, non codice): threat multilayer range-aware
+  (Mark/Zielinski/Lewis), opponent con isteresi + scout information-gain
+  (Welsh/Walsh/Zielinski), threat cache perf, TrueSkill/hot-reload (mai).

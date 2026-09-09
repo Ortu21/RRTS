@@ -69,6 +69,15 @@ pub struct Personality {
     /// dado). 2.0 = mai (baseline prevedibili). Il capitale non si rischia
     /// per ondate ordinarie: muore lui = game over.
     pub commander_commit_prob: f32,
+    /// 0.0.22 — pesi utility full (Graham/Lewis/DA:I): ogni scorer macro
+    /// (`build/enqueue/scout/defense` in `utility.rs`) è moltiplicato per il
+    /// suo peso e gated a `UTILITY_GATE`. Default 1.0 = comportamento
+    /// bit-identico (solo gli zeri veri saltano). Tuning futuro senza toccare
+    /// il core.
+    pub w_build: f32,
+    pub w_enqueue: f32,
+    pub w_scout: f32,
+    pub w_defense: f32,
 }
 
 impl Personality {
@@ -97,6 +106,10 @@ impl Personality {
         attack_at_tick: u64::MAX,
         scout_threat_weight: 1.2,
         commander_commit_prob: 0.95,
+        w_build: 1.0,
+        w_enqueue: 1.0,
+        w_scout: 1.0,
+        w_defense: 1.0,
     };
     pub const RUSHER: Self = Self {
         name: "rusher",
@@ -123,6 +136,10 @@ impl Personality {
         attack_at_tick: u64::MAX,
         scout_threat_weight: 0.5,
         commander_commit_prob: 0.9,
+        w_build: 1.0,
+        w_enqueue: 1.0,
+        w_scout: 1.0,
+        w_defense: 1.0,
     };
     /// Baseline eco-only per la league: costruisce economia fino ai cap, non
     /// attacca mai (soglia impossibile), nessun micro aggressivo. Sacco da
@@ -152,6 +169,10 @@ impl Personality {
         attack_at_tick: u64::MAX,
         scout_threat_weight: 1.0,
         commander_commit_prob: 2.0,
+        w_build: 1.0,
+        w_enqueue: 1.0,
+        w_scout: 1.0,
+        w_defense: 1.0,
     };
     /// Baseline rush-scripted per la league: bootstrap + solo HeavyTank,
     /// ondata a tempo fisso comunque vada, niente ritirate né focus.
@@ -181,6 +202,10 @@ impl Personality {
         attack_at_tick: 480, // 120s: l'ondata parte a tempo, comunque vada
         scout_threat_weight: 0.5,
         commander_commit_prob: 2.0,
+        w_build: 1.0,
+        w_enqueue: 1.0,
+        w_scout: 1.0,
+        w_defense: 1.0,
     };
 
     pub fn from_name(name: &str) -> Self {
@@ -227,6 +252,10 @@ impl Personality {
             attack_at_tick: def.attack_at_tick,
             scout_threat_weight: def.scout_threat_weight,
             commander_commit_prob: def.commander_commit_prob,
+            w_build: def.w_build,
+            w_enqueue: def.w_enqueue,
+            w_scout: def.w_scout,
+            w_defense: def.w_defense,
         })
     }
 }
@@ -256,6 +285,10 @@ pub struct PersonalityDef {
     pub attack_at_tick: u64,
     pub scout_threat_weight: f32,
     pub commander_commit_prob: f32,
+    pub w_build: f32,
+    pub w_enqueue: f32,
+    pub w_scout: f32,
+    pub w_defense: f32,
 }
 
 impl From<&Personality> for PersonalityDef {
@@ -281,6 +314,10 @@ impl From<&Personality> for PersonalityDef {
             attack_at_tick: p.attack_at_tick,
             scout_threat_weight: p.scout_threat_weight,
             commander_commit_prob: p.commander_commit_prob,
+            w_build: p.w_build,
+            w_enqueue: p.w_enqueue,
+            w_scout: p.w_scout,
+            w_defense: p.w_defense,
         }
     }
 }
@@ -934,16 +971,45 @@ pub fn decide(
             None
         };
         if let Some(kind) = kind {
-            for _ in 0..idle_builders {
-                intents.push(AiIntent::Build(kind));
+            // 0.0.22 — gate utility (Graham/Lewis): bootstrap = 1.0, scaling =
+            // bottleneck × abbordabilità. A pesi default passa sempre quando
+            // il vecchio codice emetteva (solo gli zeri veri saltano).
+            let bootstrap_needed = metal == 0 || solar == 0 || factory == 0;
+            let bottleneck_or_programmed = metal_starved
+                || energy_starved
+                || kind == BuildingKind::Factory
+                || kind == BuildingKind::LabT2
+                || (personality.second_solar && kind == BuildingKind::Solar);
+            let u = super::utility::build_urgency(
+                bootstrap_needed,
+                bottleneck_or_programmed,
+                affordable || bootstrap_needed,
+                true,
+                if bootstrap_needed {
+                    0.0
+                } else {
+                    plan.time_to_afford_secs
+                },
+            );
+            if u * personality.w_build > super::utility::UTILITY_GATE {
+                for _ in 0..idle_builders {
+                    intents.push(AiIntent::Build(kind));
+                }
             }
         }
     }
+    // 0.0.22 — minaccia base una volta per tick (riusata da difesa utility
+    // e tattica ondate): threat map 32×32 dallo snapshot onesto.
+    let threatened_early = base_under_threat(snapshot, scenario);
     // Difesa statica: torrette vicino alla base (l'executor cerca lo spot in
     // spirale dal centro). Conta anche i siti: niente doppie richieste.
+    // 0.0.22 — gated da `defense_urgency × w_defense` (default passa sempre
+    // quando il vecchio codice emetteva).
     if personality.max_turrets > 0
         && snapshot.complete_building(BuildingKind::Factory) > 0
         && snapshot.count_building(BuildingKind::Turret) < personality.max_turrets
+        && super::utility::defense_urgency(true, threatened_early) * personality.w_defense
+            > super::utility::UTILITY_GATE
     {
         intents.push(AiIntent::Build(BuildingKind::Turret));
     }
@@ -955,6 +1021,8 @@ pub fn decide(
         && snapshot.count_building(BuildingKind::Lance) < personality.max_lance
         && snapshot.income[0] >= LABT2_MIN_METAL_INCOME
         && snapshot.income[1] >= LABT2_MIN_ENERGY_INCOME
+        && super::utility::defense_urgency(true, threatened_early) * personality.w_defense
+            > super::utility::UTILITY_GATE
     {
         intents.push(AiIntent::Build(BuildingKind::Lance));
     }
@@ -964,6 +1032,8 @@ pub fn decide(
     if personality.max_walls > 0
         && snapshot.complete_building(BuildingKind::Turret) > 0
         && snapshot.count_building(BuildingKind::Wall) < personality.max_walls
+        && super::utility::defense_urgency(true, threatened_early) * personality.w_defense
+            > super::utility::UTILITY_GATE
     {
         intents.push(AiIntent::Build(BuildingKind::Wall));
     }
@@ -1050,12 +1120,21 @@ pub fn decide(
             }
         };
         // Accoda solo se producibile (mai Commander).
+        // 0.0.22 — gate utility: capacità libera × peso (default passa sempre
+        // quando il vecchio codice emetteva: code libere = urgenza > gate).
         if UnitKind::PRODUCIBLE.contains(&kind) {
-            queued_all.push(kind);
-            intents.push(AiIntent::Enqueue {
-                factory: view.entity,
-                kind,
-            });
+            let u = super::utility::enqueue_urgency(view.queue_len, MAX_QUEUE, view.blocked);
+            if u * personality.w_enqueue > super::utility::UTILITY_GATE {
+                queued_all.push(kind);
+                intents.push(AiIntent::Enqueue {
+                    factory: view.entity,
+                    kind,
+                });
+            } else {
+                // Capacità zero: la coda conta comunque per i deficit (evita
+                // di riproporre lo stesso kind ogni tick).
+                queued_all.push(kind);
+            }
         }
     }
 
@@ -1074,7 +1153,7 @@ pub fn decide(
     // il sim non vede l'ingaggio ma marciare resta giusto se dominanti).
     let win_prob =
         super::combat::predict_outcome_at_range(&my_list, &foe_list, engagement_range(snapshot));
-    let threatened = base_under_threat(snapshot, scenario);
+    let threatened = threatened_early;
     // Alla cieca (mai visto il nemico: `win_prob` è 1.0 a vuoto) serve la massa
     // critica di prima: soglia effettiva +2, in curva invece che in ramo morto.
     // Saturating: soglie "mai" (usize::MAX delle baseline) non vanno in overflow.
@@ -1144,6 +1223,17 @@ pub fn decide(
                             > super::scout::SCOUT_THREAT_THRESHOLD))
             })
             .count();
+        // 0.0.22 — gate utility (occhi + novelty): alla cieca = alto, con
+        // occhi + mappa piena = basso ma > 0 (default passa sempre quando ci
+        // sono scout liberi, come prima).
+        let u = super::utility::scout_urgency(
+            free_scouts,
+            has_fresh_eyes(snapshot),
+            snapshot.explored_pct,
+        );
+        if u * personality.w_scout <= super::utility::UTILITY_GATE {
+            return intents;
+        }
         let n = free_scouts.min(super::scout::MAX_SCOUTS);
         if n > 0 {
             for destination in
@@ -3594,6 +3684,82 @@ mod tests {
         // 0.0.21 — strict: ignoti sono errore, mai fallback silenzioso.
         assert!(Personality::try_from_name("gandalf").is_err());
         assert!(Personality::try_from_name("turtle").is_ok());
+    }
+
+    #[test]
+    fn utility_weights_gate_build_and_defense() {
+        // 0.0.22 — pesi a 0 sopprimono, a 1.0 emettono come prima (continuità).
+        let mut snap = empty_snapshot(1);
+        idle_commander(&mut snap);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
+        assert!(intents.iter().any(|i| matches!(i, AiIntent::Build(_))));
+        let muted = Personality {
+            w_build: 0.0,
+            w_defense: 0.0,
+            ..Personality::TURTLE
+        };
+        let intents = decide(&snap, &muted, Scenario::Playground, &[], 0);
+        assert!(
+            !intents.iter().any(|i| matches!(i, AiIntent::Build(_))),
+            "w_build=0 deve sopprimere il bootstrap: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn utility_weights_gate_enqueue_and_scout() {
+        // Enqueue: factory libera + mix rusher = emette a peso 1, tace a 0.
+        let snap = armed_snapshot(
+            1,
+            &[
+                (UnitKind::Scout, 60.0, UnitOrder::Idle),
+                (UnitKind::Scout, 60.0, UnitOrder::Idle),
+            ],
+        );
+        let free = fac(1, 0, false, 1, &[]);
+        let on = decide(
+            &snap,
+            &Personality::RUSHER,
+            Scenario::Playground,
+            std::slice::from_ref(&free),
+            0,
+        );
+        assert!(on.iter().any(|i| matches!(i, AiIntent::Enqueue { .. })));
+        let muted = Personality {
+            w_enqueue: 0.0,
+            ..Personality::RUSHER
+        };
+        let off = decide(&snap, &muted, Scenario::Playground, &[free], 0);
+        assert!(
+            !off.iter().any(|i| matches!(i, AiIntent::Enqueue { .. })),
+            "w_enqueue=0 deve sopprimere: {off:?}"
+        );
+        // Scout: 1 scout libero, cieco = emette a peso 1, tace a 0.
+        let mut scout_snap = empty_snapshot(1);
+        scout_snap.my_units.push(super::super::snapshot::AiUnit {
+            entity: Entity::from_bits(42),
+            pos: Vec3::ZERO,
+            kind: UnitKind::Scout,
+            order: UnitOrder::Idle,
+            health: 60.0,
+            max_health: 60.0,
+        });
+        let on = decide(
+            &scout_snap,
+            &Personality::RUSHER,
+            Scenario::Playground,
+            &[],
+            0,
+        );
+        assert!(on.iter().any(|i| matches!(i, AiIntent::Scout { .. })));
+        let muted = Personality {
+            w_scout: 0.0,
+            ..Personality::RUSHER
+        };
+        let off = decide(&scout_snap, &muted, Scenario::Playground, &[], 0);
+        assert!(
+            !off.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
+            "w_scout=0 deve sopprimere: {off:?}"
+        );
     }
 
     #[test]

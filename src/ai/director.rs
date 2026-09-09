@@ -276,6 +276,56 @@ pub fn evaluate_balance(world: &mut World, team: u8) -> Vec<CheckResult> {
         pass: diff_ok,
         detail: "easy<medium<hard, income 1.0".to_owned(),
     });
+    // 0.0.22 — utility-sane: scorer macro 0..1 finiti (Graham/Lewis/DA:I).
+    // Solo osservazione sana: valori alti/bassi sono informazione, NaN/fuori
+    // range sono errore.
+    let utility_sane = world
+        .get_resource::<super::AiSnapshots>()
+        .and_then(|s| s.0.get(&team))
+        .map(|snap| {
+            let win_prob = super::strategy::win_prob_of(snap);
+            let attack = super::utility::attack_opportunity(
+                win_prob,
+                snap.army().len(),
+                super::strategy::Personality::TURTLE.army_threshold,
+                false,
+            );
+            let plan = super::planner::plan_build(snap.stock, snap.income, snap.demand);
+            let build = super::utility::build_urgency(
+                false,
+                plan.bottleneck.is_some(),
+                plan.time_to_afford_secs.is_finite(),
+                true,
+                plan.time_to_afford_secs,
+            );
+            let scores = super::utility::UtilityScores {
+                attack,
+                build,
+                enqueue: super::utility::enqueue_urgency(0, 12, false),
+                scout: super::utility::scout_urgency(
+                    1,
+                    super::strategy::has_fresh_eyes(snap),
+                    snap.explored_pct,
+                ),
+                defense: super::utility::defense_urgency(true, false),
+            };
+            (scores.sane(), scores)
+        });
+    match utility_sane {
+        Some((sane, scores)) => checks.push(CheckResult {
+            name: "utility-sane",
+            pass: sane,
+            detail: format!(
+                "atk={:.2} bld={:.2} enq={:.2} sct={:.2} def={:.2}",
+                scores.attack, scores.build, scores.enqueue, scores.scout, scores.defense
+            ),
+        }),
+        None => checks.push(CheckResult {
+            name: "utility-sane",
+            pass: true,
+            detail: "no snapshot (harness senza AI)".to_owned(),
+        }),
+    }
     checks
 }
 

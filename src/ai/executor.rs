@@ -332,16 +332,21 @@ pub fn execute_movement_and_build(
                     if unit_orders >= max_unit_orders {
                         break;
                     }
-                    let (pos, already_home) = units
+                    let (pos, order) = units
                         .iter()
                         .find(|(e, _, _, _)| *e == entity)
-                        .map(|(_, p, _, order)| {
-                            (
-                                *p,
-                                matches!(order, UnitOrder::Move { destination } if destination.xz().distance(anchor.xz()) < 30.0),
-                            )
-                        })
-                        .unwrap_or((slot, false));
+                        .map(|(_, p, _, o)| (*p, o.clone()))
+                        .unwrap_or((slot, UnitOrder::Idle));
+                    // Isteresi sullo slot assegnato (come Hold/Screen): chi
+                    // marcia già verso il suo slot non viene riordinato né
+                    // rivalidato — senza, ogni ferito genera 4 repath/s per
+                    // tutta la marcia (saturazione planner nei finali lunghi).
+                    if let UnitOrder::Move { destination: d } = &order
+                        && (slot - *d).length_squared() < 100.0
+                    {
+                        continue;
+                    }
+                    let already_home = matches!(order, UnitOrder::Move { destination } if destination.xz().distance(anchor.xz()) < 30.0);
                     if already_home {
                         continue;
                     }
@@ -450,5 +455,63 @@ mod tests {
         assert_eq!(orders, 2, "budget micro = 2 ordini");
         assert_eq!(builds, 0);
         assert_eq!(crate::ai::MICRO_BUDGET, 2);
+    }
+
+    #[test]
+    fn retreat_does_not_reorder_units_already_marching_to_slot() {
+        // Guard anti-churn: chi marcia già verso il suo slot non viene
+        // riordinato né rivalidato (prima: 4 repath/s per ferito per tutta
+        // la marcia → saturazione planner nei finali lunghi).
+        use crate::units::archetype;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.finish();
+        app.cleanup();
+        let radius = archetype(UnitKind::HeavyTank).radius;
+        let grid = open_grid();
+        let home = crate::scenario::Scenario::Playground.center(1);
+        let mut entities = Vec::new();
+        for _ in 0..2 {
+            entities.push(app.world_mut().spawn_empty().id());
+        }
+        let mut sorted = entities.clone();
+        sorted.sort_by_key(|e| e.to_bits());
+        let slots = grid
+            .formation_for(sorted.len(), home, 2.5, radius.max(0.5))
+            .unwrap_or_else(|| vec![home; sorted.len()]);
+        // Stesse unità, già in Move verso i loro slot: zero ordini.
+        let units: Vec<(Entity, Vec3, UnitKind, UnitOrder)> = sorted
+            .iter()
+            .zip(slots.iter())
+            .map(|(e, s)| {
+                (
+                    *e,
+                    Vec3::ZERO,
+                    UnitKind::HeavyTank,
+                    UnitOrder::Move { destination: *s },
+                )
+            })
+            .collect();
+        let low: Vec<Entity> = sorted.clone();
+        let snap = AiSnapshot {
+            team: 1,
+            ..Default::default()
+        };
+        let intents = vec![AiIntent::Retreat { units: low }];
+        let mut commands = app.world_mut().commands();
+        let (orders, _, _) = execute_movement_and_build(
+            &mut commands,
+            &snap,
+            &intents,
+            1,
+            8,
+            &grid,
+            crate::scenario::Scenario::Playground,
+            &units,
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(orders, 0, "niente riordini verso lo stesso slot");
     }
 }

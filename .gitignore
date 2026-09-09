@@ -6,3 +6,6 @@ Thumbs.db
 *.swp
 *.tmp
 /benchmark-results/
+# History AI: i report completi con sample (decine di MB) restano locali;
+# si versionano solo Elo priors (ratings.json) e indice (history.md).
+benchmarks/history/ai/*/ai-suite-*.json

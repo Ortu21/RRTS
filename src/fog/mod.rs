@@ -41,9 +41,9 @@ use crate::{
     combat::Health,
     movement::MovementSystems,
     navigation::HALF_SIZE,
+    session::ViewState,
     structures::Building,
     units::{Team, Unit, UnitKind, archetype::sight_range},
-    view::ViewState,
 };
 use bevy::prelude::*;
 use std::collections::BTreeMap;

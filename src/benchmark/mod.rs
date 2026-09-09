@@ -1,3 +1,9 @@
+//! Benchmark e misura: CLI, run headless/grafici, report, profiler.
+//!
+//! Solo misura e orchestrazione workload (`idle/crowd/skirmish/ai-test/...`).
+//! Niente logica gameplay: gli scenari usano gli stessi plugin del gioco.
+//! Headless = costo CPU simulazione; grafico = + rendering; trace = diagnostica.
+
 pub mod cli;
 pub mod profile;
 // Riusati dalla AI suite (stesso formato metadata/history dei benchmark).

@@ -1,3 +1,8 @@
+//! Formazioni: slot deterministici attorno a un centro.
+//!
+//! Funzioni pure (`formation_slots`, `skirmish_slots`): niente query Bevy.
+//! Usate da `navigation` (planning) e `orders` (assegnazione slot unici).
+
 use bevy::prelude::*;
 
 pub fn formation_slots(count: usize, center: Vec3, spacing: f32) -> Vec<Vec3> {

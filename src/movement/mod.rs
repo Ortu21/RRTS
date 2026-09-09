@@ -1,3 +1,8 @@
+//! Locomozione: consuma `Route` senza overshoot, separazione locale soft.
+//!
+//! Legge `MoveTarget` + `Route` (da `navigation`), scrive `Transform`.
+//! Niente decisioni: ordini in `orders`, targeting in `combat`.
+
 use crate::{
     combat::{AttackTarget, Chasing, HoldFire},
     navigation::{HALF_SIZE, PlanPaths, Route, UNIT_CLEARANCE},
@@ -192,6 +197,7 @@ pub fn steer_for(transform: &mut Transform, wish_dir: Vec3, max_step: f32, radiu
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::{
         navigation::{
             CELL_SIZE, HALF_SIZE, NavGrid, NavigationPlugin, NavigationStats, PATHS_PER_FRAME,

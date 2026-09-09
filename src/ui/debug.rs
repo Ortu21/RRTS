@@ -1,8 +1,8 @@
 //! Opt-in presentation diagnostics. Never used by simulation decisions.
 use crate::{
     selection::Selected,
+    session::ViewState,
     units::{Team, Unit},
-    view::ViewState,
 };
 use bevy::prelude::*;
 

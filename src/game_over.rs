@@ -11,9 +11,9 @@ use crate::{
     navigation::NavGrid,
     orders::PendingOrder,
     scenario::Scenario,
+    session::ViewState,
     structures::{Building, Placement},
     units::{Commander, Team, Unit, UnitIds, UnitKind, spawn_combat_unit},
-    view::ViewState,
 };
 use bevy::{prelude::*, window::PrimaryWindow};
 

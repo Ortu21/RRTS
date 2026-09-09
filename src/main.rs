@@ -1,28 +1,17 @@
-mod ai;
-mod benchmark;
-mod camera;
-mod combat;
-mod economy;
-mod fog;
-mod formation;
-mod game_over;
-mod movement;
-mod navigation;
-mod orders;
-mod picking;
-mod production;
-mod scenario;
-mod selection;
-mod spatial;
-mod structures;
-mod ui;
-mod units;
-mod view;
-mod world;
+//! Binario RRTS: solo composizione.
+//!
+//! Tutta la logica vive in `rust_rts` (`src/lib.rs`). Qui resta parsing CLI,
+//! scelta `Scenario` e assemblaggio `App` Bevy. Niente sistemi o query qui.
 
-use benchmark::cli::{Config, HELP, Workload};
 use bevy::prelude::*;
-use scenario::Scenario;
+use rust_rts::{
+    ai, benchmark, camera, combat, economy, fog, game_over, movement, navigation, orders,
+    production, replay, selection, session, spatial, structures, ui, units, world,
+};
+use rust_rts::{
+    benchmark::cli::{Config, HELP, Workload},
+    scenario::Scenario,
+};
 
 fn main() -> std::process::ExitCode {
     let config = match Config::parse(std::env::args().skip(1)) {
@@ -145,6 +134,7 @@ fn main() -> std::process::ExitCode {
         .add_plugins((
             navigation::NavigationPlugin,
             spatial::SpatialPlugin,
+            replay::ReplayPlugin,
             world::WorldPlugin,
             camera::CameraPlugin,
             units::UnitPlugin { visuals: true },
@@ -155,7 +145,7 @@ fn main() -> std::process::ExitCode {
             ui::UiPlugin,
         ));
     if !config.benchmark {
-        let control = view::SessionControl::from_cli(&config.ai, config.ai_team);
+        let control = session::SessionControl::from_cli(&config.ai, config.ai_team);
         let team = control.player_team().unwrap_or(0);
         let spectator = control.player_team().is_none();
         // Keep both personalities available for later handoffs, independently
@@ -176,7 +166,7 @@ fn main() -> std::process::ExitCode {
             },
         );
         app.insert_resource(control)
-            .insert_resource(view::ViewState {
+            .insert_resource(session::ViewState {
                 team,
                 fog_on: !spectator,
             })

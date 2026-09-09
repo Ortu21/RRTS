@@ -4,6 +4,10 @@ version = "0.0.14"
 edition = "2024"
 rust-version = "1.95"
 
+[lib]
+name = "rust_rts"
+path = "src/lib.rs"
+
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["3d", "ui"] }
 ron = "0.12"

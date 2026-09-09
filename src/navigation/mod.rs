@@ -1,3 +1,9 @@
+//! Navigazione: griglia 240x240 su 600x600m, Theta* any-angle + LOS.
+//!
+//! Owner di `NavGrid` (`CELL_SIZE=2.5`, `PATHS_PER_FRAME=128`), clearance scafo,
+//! costi congestione da `spatial`. Destinazioni/formazioni/clamp usano lo stesso scafo.
+//! Vedi `ARCHITECTURE.md` per budget e garanzie determinismo.
+
 use crate::{formation::formation_slots, movement::MoveTarget};
 use bevy::{
     prelude::*,

@@ -1,3 +1,8 @@
+//! Scenario: Playground vs Benchmark/Skirmish. Solo dati setup.
+//!
+//! `center`/`attack_target` = spawn e mete marching. `per_team`/`teams` = size.
+//! Niente sistemi: i plugin leggono questa `Resource`.
+
 use bevy::prelude::*;
 
 #[derive(Resource, Clone, Copy, Default)]

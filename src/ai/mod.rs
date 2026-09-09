@@ -184,6 +184,54 @@ pub fn note_wave_fired(last_wave_id: u64, tick: u64) -> (u64, bool) {
     (id.max(last_wave_id), id > last_wave_id)
 }
 
+/// Vista piatta edifici, ordinata per posizione (determinismo).
+/// Estratta perché identica in `ai_tick` e `micro_tick`: una sola copia da mantenere.
+#[allow(clippy::type_complexity)]
+pub(crate) fn collect_flat_buildings(
+    buildings: &Query<
+        (
+            Entity,
+            &Team,
+            &crate::economy::balance::BuildingKind,
+            &Transform,
+            &Health,
+        ),
+        (With<Building>,),
+    >,
+    building_sites: &Query<
+        (
+            Entity,
+            &Team,
+            &crate::economy::balance::BuildingKind,
+            &Transform,
+        ),
+        (With<Building>, With<Construction>),
+    >,
+) -> Vec<(Team, crate::economy::balance::BuildingKind, Vec3, bool)> {
+    let mut flat: Vec<(Team, crate::economy::balance::BuildingKind, Vec3, bool)> = Vec::new();
+    for (e, team, kind, transform, _) in buildings.iter() {
+        let site = building_sites.get(e).is_ok();
+        flat.push((*team, *kind, transform.translation, site));
+    }
+    flat.sort_by_key(|(_, _, pos, _)| (pos.x.to_bits(), pos.z.to_bits()));
+    flat
+}
+
+/// Truppe vive di un team, ordinate per `Entity` (determinismo).
+#[allow(clippy::type_complexity)]
+pub(crate) fn collect_flat_units(
+    units: &Query<(Entity, &Transform, &Team, &UnitKind, &UnitOrder, &Health), With<Unit>>,
+    team: u8,
+) -> Vec<(Entity, Vec3, UnitKind, UnitOrder)> {
+    let mut flat: Vec<(Entity, Vec3, UnitKind, UnitOrder)> = units
+        .iter()
+        .filter(|(_, _, t, _, _, hp)| t.0 == team && hp.current > 0.0)
+        .map(|(e, t, _, kind, order, _)| (e, t.translation, *kind, order.clone()))
+        .collect();
+    flat.sort_by_key(|(e, _, _, _)| e.to_bits());
+    flat
+}
+
 impl AiState {
     pub fn stats_mut(&mut self, team: u8) -> &mut AiTeamStats {
         self.per_team.entry(team).or_default()
@@ -240,7 +288,7 @@ impl Plugin for AiPlugin {
 
 fn ai_active(
     config: Res<AiConfig>,
-    control: Option<Res<crate::view::SessionControl>>,
+    control: Option<Res<crate::session::SessionControl>>,
     debug: Option<Res<crate::ui::debug::DebugSettings>>,
 ) -> bool {
     use crate::ui::debug::DebugTool;
@@ -248,7 +296,7 @@ fn ai_active(
         && !config.teams.is_empty()
         && (control
             .as_deref()
-            .is_none_or(|c| c.teams.contains(&crate::view::Controller::Bot))
+            .is_none_or(|c| c.teams.contains(&crate::session::Controller::Bot))
             || debug.as_deref().is_some_and(|d| {
                 [
                     DebugTool::Decisions,
@@ -269,7 +317,7 @@ fn ai_tick(
     mut commands: Commands,
     time: Res<Time>,
     config: Res<AiConfig>,
-    control: Option<Res<crate::view::SessionControl>>,
+    control: Option<Res<crate::session::SessionControl>>,
     snapshots: Res<AiSnapshots>,
     match_result: Option<Res<crate::game_over::MatchResult>>,
     scenario: Res<crate::scenario::Scenario>,
@@ -314,13 +362,7 @@ fn ai_tick(
     }
 
     // Viste condivise (lette una volta, filtrate per team nel loop).
-    let mut flat_buildings: Vec<(Team, crate::economy::balance::BuildingKind, Vec3, bool)> =
-        Vec::new();
-    for (e, team, kind, transform, _) in buildings.iter() {
-        let site = building_sites.get(e).is_ok();
-        flat_buildings.push((*team, *kind, transform.translation, site));
-    }
-    flat_buildings.sort_by_key(|(_, _, pos, _)| (pos.x.to_bits(), pos.z.to_bits()));
+    let flat_buildings = collect_flat_buildings(&buildings, &building_sites);
 
     let live_builders: Vec<(Team, Vec3, f32)> = builders
         .iter()
@@ -336,7 +378,7 @@ fn ai_tick(
     let mut all_intent_labels: Vec<String> = Vec::new();
 
     for brain in config.sorted_teams() {
-        if !crate::view::bot_controls(control.as_deref(), brain.team) {
+        if !crate::session::bot_controls(control.as_deref(), brain.team) {
             continue;
         }
         let Some(snapshot) = snapshots.0.get(&brain.team) else {
@@ -423,12 +465,7 @@ fn ai_tick(
         }
 
         // Truppe del team.
-        let mut flat_units: Vec<(Entity, Vec3, UnitKind, UnitOrder)> = units
-            .iter()
-            .filter(|(_, _, team, _, _, hp)| team.0 == brain.team && hp.current > 0.0)
-            .map(|(e, t, _, kind, order, _)| (e, t.translation, *kind, order.clone()))
-            .collect();
-        flat_units.sort_by_key(|(e, _, _, _)| e.to_bits());
+        let flat_units = collect_flat_units(&units, brain.team);
 
         let (orders, builds, enqueue_targets) = executor::execute_movement_and_build(
             &mut commands,
@@ -483,7 +520,7 @@ fn micro_tick(
     time: Res<Time>,
     mut acc: Local<f32>,
     config: Res<AiConfig>,
-    control: Option<Res<crate::view::SessionControl>>,
+    control: Option<Res<crate::session::SessionControl>>,
     snapshots: Res<AiSnapshots>,
     match_result: Option<Res<crate::game_over::MatchResult>>,
     scenario: Res<crate::scenario::Scenario>,
@@ -520,13 +557,7 @@ fn micro_tick(
         return;
     }
 
-    let mut flat_buildings: Vec<(Team, crate::economy::balance::BuildingKind, Vec3, bool)> =
-        Vec::new();
-    for (e, team, kind, transform, _) in buildings.iter() {
-        let site = building_sites.get(e).is_ok();
-        flat_buildings.push((*team, *kind, transform.translation, site));
-    }
-    flat_buildings.sort_by_key(|(_, _, pos, _)| (pos.x.to_bits(), pos.z.to_bits()));
+    let flat_buildings = collect_flat_buildings(&buildings, &building_sites);
 
     // Il micro non costruisce: niente builders/footprints/factories.
     let no_builders: Vec<(Team, Vec3, f32)> = Vec::new();
@@ -534,7 +565,7 @@ fn micro_tick(
 
     let mut micro_labels: Vec<String> = Vec::new();
     for brain in config.sorted_teams() {
-        if !crate::view::bot_controls(control.as_deref(), brain.team) {
+        if !crate::session::bot_controls(control.as_deref(), brain.team) {
             continue;
         }
         let Some(snapshot) = snapshots.0.get(&brain.team) else {
@@ -550,12 +581,7 @@ fn micro_tick(
         if intents.is_empty() {
             continue;
         }
-        let mut flat_units: Vec<(Entity, Vec3, UnitKind, UnitOrder)> = units
-            .iter()
-            .filter(|(_, _, team, _, _, hp)| team.0 == brain.team && hp.current > 0.0)
-            .map(|(e, t, _, kind, order, _)| (e, t.translation, *kind, order.clone()))
-            .collect();
-        flat_units.sort_by_key(|(e, _, _, _)| e.to_bits());
+        let flat_units = collect_flat_units(&units, brain.team);
 
         let (orders, _, _) = executor::execute_movement_and_build(
             &mut commands,
@@ -597,6 +623,41 @@ mod tests {
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
 
+    /// Harness condiviso: Playground 1v1 rusher-vs-turtle, tick fisso 1/60.
+    /// Una sola copia del setup `App` (prima duplicata in ogni test).
+    fn playground_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / 60.0,
+            )))
+            .insert_resource(Scenario::Playground)
+            .insert_resource(AiConfig::versus(
+                Personality::RUSHER,
+                Personality::TURTLE,
+                AiMode::Test,
+            ))
+            .add_plugins((
+                NavigationPlugin,
+                SpatialPlugin,
+                crate::replay::ReplayPlugin,
+                UnitPlugin { visuals: false },
+                MovementPlugin,
+                CombatPlugin,
+                EconomyPlugin,
+                StructuresPlugin { visuals: false },
+                ProductionPlugin,
+                FogPlugin { render: false },
+                AiPlugin,
+            ))
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>();
+        app.finish();
+        app.cleanup();
+        app
+    }
+
     /// Punto 1 — il contatore onde scatta solo al passaggio di periodo:
     /// riemissioni `force_attack` dentro lo stesso periodo non contano.
     #[test]
@@ -616,34 +677,7 @@ mod tests {
     /// barare (snapshot isolati per team). Veloce: 600 tick bastano per i siti.
     #[test]
     fn dual_ai_both_commanders_expand_without_panic() {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                1.0 / 60.0,
-            )))
-            .insert_resource(Scenario::Playground)
-            .insert_resource(AiConfig::versus(
-                Personality::RUSHER,
-                Personality::TURTLE,
-                AiMode::Test,
-            ))
-            .add_plugins((
-                NavigationPlugin,
-                SpatialPlugin,
-                UnitPlugin { visuals: false },
-                MovementPlugin,
-                CombatPlugin,
-                EconomyPlugin,
-                StructuresPlugin { visuals: false },
-                ProductionPlugin,
-                FogPlugin { render: false },
-                AiPlugin,
-            ))
-            .add_plugins(bevy::asset::AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_asset::<StandardMaterial>();
-        app.finish();
-        app.cleanup();
+        let mut app = playground_app();
         app.update();
         for snapshot in app.world().resource::<AiSnapshots>().0.values() {
             assert!(
@@ -688,42 +722,15 @@ mod tests {
     }
     #[test]
     fn handoff_suspends_macro_and_micro_and_resumes_bot() {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                1.0 / 60.0,
-            )))
-            .insert_resource(Scenario::Playground)
-            .insert_resource(AiConfig::versus(
-                Personality::RUSHER,
-                Personality::TURTLE,
-                AiMode::Test,
-            ))
-            .add_plugins((
-                NavigationPlugin,
-                SpatialPlugin,
-                UnitPlugin { visuals: false },
-                MovementPlugin,
-                CombatPlugin,
-                EconomyPlugin,
-                StructuresPlugin { visuals: false },
-                ProductionPlugin,
-                FogPlugin { render: false },
-                AiPlugin,
-            ))
-            .add_plugins(bevy::asset::AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_asset::<StandardMaterial>();
-        app.finish();
-        app.cleanup();
+        let mut app = playground_app();
 
-        app.insert_resource(crate::view::SessionControl::from_cli("both", 2));
+        app.insert_resource(crate::session::SessionControl::from_cli("both", 2));
         for _ in 0..120 {
             app.update();
         }
         app.world_mut()
-            .resource_mut::<crate::view::SessionControl>()
-            .transfer(0, crate::view::Controller::Human);
+            .resource_mut::<crate::session::SessionControl>()
+            .transfer(0, crate::session::Controller::Human);
         let before = app
             .world()
             .resource::<AiState>()
@@ -756,8 +763,8 @@ mod tests {
             )
         );
         app.world_mut()
-            .resource_mut::<crate::view::SessionControl>()
-            .transfer(0, crate::view::Controller::Bot);
+            .resource_mut::<crate::session::SessionControl>()
+            .transfer(0, crate::session::Controller::Bot);
         for _ in 0..300 {
             app.update();
         }

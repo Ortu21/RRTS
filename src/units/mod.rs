@@ -1,3 +1,8 @@
+//! Unità: spawning gameplay vs entità visive + `UnitKind`/`archetype`.
+//!
+//! Solo dati e spawn. Logica ordini in `orders`, movimento in `movement`,
+//! combattimento in `combat`. `archetype` = stats pure per tabella.
+
 use crate::{
     camera::RtsCamera,
     combat::{

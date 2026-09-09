@@ -1,3 +1,8 @@
+//! Camera RTS: pan/zoom/rotazione + focus. Solo presentazione.
+//!
+//! Legge `Scenario` per il centro e `session::ViewState` per il team osservato.
+//! Niente ordini o visibilità qui: quelli vivono in `selection`/`orders`/`fog`.
+
 use bevy::{
     input::mouse::{MouseScrollUnit, MouseWheel},
     prelude::*,
@@ -36,11 +41,11 @@ impl RtsCamera {
 fn setup_camera(
     mut commands: Commands,
     scenario: Res<Scenario>,
-    view: Option<Res<crate::view::ViewState>>,
+    view_state: Option<Res<crate::session::ViewState>>,
 ) {
     let controller = RtsCamera {
         focus: if matches!(*scenario, Scenario::Playground) {
-            scenario.center(view.as_deref().map_or(0, |v| v.team as usize))
+            scenario.center(view_state.as_deref().map_or(0, |v| v.team as usize))
                 + Vec3::new(0.0, 0.0, 12.0)
         } else {
             Vec3::ZERO

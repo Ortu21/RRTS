@@ -26,6 +26,47 @@ pub fn effective_dps(kind: UnitKind) -> f32 {
     dps
 }
 
+/// Fase A step 1 — gittata massima d'ingaggio (primaria e secondaria):
+/// oltre non si colpisce. Pura. (Nessun chiamante oltre i test: il cablaggio
+/// nel predittore è lo step 2, con calibrazione sui dati torneo.)
+#[allow(dead_code)]
+pub fn max_range(kind: UnitKind) -> f32 {
+    let stats = crate::units::archetype(kind);
+    if !stats.armed {
+        return 0.0;
+    }
+    let mut range = stats.range;
+    if let Some(sec) = crate::units::archetype::secondary_stats(kind) {
+        range = range.max(sec.range);
+    }
+    range
+}
+
+/// Fase A step 1 — DPS erogabile a distanza `dist` (gating fisico: fuori
+/// gittata il cannone non colpisce, dentro rende pieno). Primaria e
+/// secondaria valutate sulle rispettive gittate. Pura e deterministica.
+/// (Statico: l'avvicinamento durante l'orizzonte è step 2.)
+#[allow(dead_code)]
+pub fn dps_at_range(kind: UnitKind, dist: f32) -> f32 {
+    if !dist.is_finite() || dist < 0.0 {
+        return 0.0;
+    }
+    let stats = crate::units::archetype(kind);
+    if !stats.armed {
+        return 0.0;
+    }
+    let mut dps = 0.0;
+    if dist <= stats.range {
+        dps += stats.damage / stats.cooldown.max(0.05);
+    }
+    if let Some(sec) = crate::units::archetype::secondary_stats(kind)
+        && dist <= sec.range
+    {
+        dps += (sec.damage / sec.cooldown.max(0.05)) * 0.7;
+    }
+    dps
+}
+
 /// Priorità di focus per un bersaglio: minaccia (dps × counter contro il
 /// nostro kind primario). A pari priorità decide lo hp (vedi strategia).
 pub fn target_priority(kind: UnitKind, vs: UnitKind) -> f32 {
@@ -143,6 +184,35 @@ mod tests {
         let scout = effective_dps(UnitKind::Scout);
         assert!(tank > scout && scout > 0.0);
         assert_eq!(effective_dps(UnitKind::Engineer), 0.0);
+    }
+
+    #[test]
+    fn range_gates_dps_arty_outranges_heavy() {
+        // Heavy 19m, Arty 30m: a 25m l'arty picchia piena, l'heavy zero.
+        assert!(dps_at_range(UnitKind::Artillery, 25.0) > 0.0);
+        assert_eq!(dps_at_range(UnitKind::HeavyTank, 25.0), 0.0);
+        // Dentro le gittate: pieno come `effective_dps`.
+        assert_eq!(
+            dps_at_range(UnitKind::HeavyTank, 10.0),
+            effective_dps(UnitKind::HeavyTank)
+        );
+        assert_eq!(
+            dps_at_range(UnitKind::Artillery, 10.0),
+            effective_dps(UnitKind::Artillery)
+        );
+        // Secondaria Commander (missili 34m): oltre i 20m del cannone resta
+        // solo il contributo missili, oltre i 34m zero.
+        let cmd_full = effective_dps(UnitKind::Commander);
+        assert!(dps_at_range(UnitKind::Commander, 25.0) > 0.0);
+        assert!(dps_at_range(UnitKind::Commander, 25.0) < cmd_full);
+        assert_eq!(dps_at_range(UnitKind::Commander, 40.0), 0.0);
+        // Gittate massime e casi sporchi.
+        assert_eq!(max_range(UnitKind::Commander), 34.0);
+        assert_eq!(max_range(UnitKind::Artillery), 30.0);
+        assert_eq!(max_range(UnitKind::Engineer), 0.0);
+        assert_eq!(dps_at_range(UnitKind::Engineer, 5.0), 0.0);
+        assert_eq!(dps_at_range(UnitKind::HeavyTank, f32::NAN), 0.0);
+        assert_eq!(dps_at_range(UnitKind::HeavyTank, -3.0), 0.0);
     }
 
     #[test]

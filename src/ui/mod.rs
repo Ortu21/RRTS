@@ -1,4 +1,6 @@
+pub mod debug;
 pub mod industry;
+pub mod shell;
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
@@ -18,7 +20,25 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FrameTimeDiagnosticsPlugin::default())
-            .add_systems(Startup, setup_hud)
+            .init_resource::<industry::MapInput>()
+            .init_resource::<debug::DebugSettings>()
+            .init_resource::<debug::Inspected>()
+            .init_resource::<shell::ShellState>()
+            .init_resource::<crate::view::ViewState>()
+            .add_systems(Startup, (setup_hud, shell::setup))
+            .add_systems(PreUpdate, shell::actions.after(bevy::ui::UiSystems::Focus))
+            .add_systems(
+                PreUpdate,
+                industry::capture_pointer
+                    .after(shell::actions)
+                    .after(bevy::ui::UiSystems::Focus),
+            )
+            .add_systems(Update, shell::scroll_panels)
+            .add_systems(
+                PostUpdate,
+                (shell::sample, debug::draw_overlays, debug::draw_inspection)
+                    .after(SelectionSystems),
+            )
             .add_systems(PostUpdate, update_hud.after(SelectionSystems));
     }
 }
@@ -29,6 +49,9 @@ struct DebugHud;
 type UnitStatus = (Has<Selected>, Has<MoveTarget>, Has<Route>);
 
 fn setup_hud(mut commands: Commands, scenario: Res<crate::scenario::Scenario>) {
+    if matches!(*scenario, crate::scenario::Scenario::Playground) {
+        return;
+    }
     commands.spawn((
         DebugHud,
         industry::BlocksMap,
@@ -58,12 +81,6 @@ fn setup_hud(mut commands: Commands, scenario: Res<crate::scenario::Scenario>) {
         },
         BackgroundColor(Color::srgba(0.03, 0.05, 0.07, 0.85)),
     ));
-    commands.spawn((
-        industry::BlocksMap, Interaction::None,
-        Text::new("WASD / Arrows: pan   Q / E: rotate   Wheel: zoom\nLeft click / Drag: select   Shift: add / queue orders   Esc: clear   Right click: move / attack enemy / guard ally   G: attack-move, then left-click   P: patrol   T: guard, then left-click ally   H: hold   S: stop   R: restart when over"),
-        TextFont { font_size: FontSize::Px(15.0), ..default() },
-        Node { position_type: PositionType::Absolute, bottom: px(16), left: px(16), ..default() },
-    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -78,10 +95,13 @@ fn update_hud(
     navigation: Res<NavigationStats>,
     pending_order: Res<PendingOrder>,
     benchmark: Option<Res<crate::benchmark::VisualRun>>,
-    mut hud: Single<&mut Text, With<DebugHud>>,
+    hud: Option<Single<&mut Text, With<DebugHud>>>,
     time: Res<Time>,
     mut elapsed: Local<f32>,
 ) {
+    let Some(mut hud) = hud else {
+        return;
+    };
     *elapsed += time.delta_secs();
     if *elapsed < 0.1 {
         return;

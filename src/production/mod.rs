@@ -15,7 +15,7 @@ pub struct Job {
     pub kind: UnitKind,
     pub project: Project,
 }
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct Factory {
     pub queue: VecDeque<Job>,
     pub rally: Option<Vec3>,

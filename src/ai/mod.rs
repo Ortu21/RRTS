@@ -224,8 +224,27 @@ impl Plugin for AiPlugin {
     }
 }
 
-fn ai_active(config: Res<AiConfig>) -> bool {
-    config.mode != AiMode::Off && !config.teams.is_empty()
+fn ai_active(
+    config: Res<AiConfig>,
+    control: Option<Res<crate::view::SessionControl>>,
+    debug: Option<Res<crate::ui::debug::DebugSettings>>,
+) -> bool {
+    use crate::ui::debug::DebugTool;
+    config.mode != AiMode::Off
+        && !config.teams.is_empty()
+        && (control
+            .as_deref()
+            .is_none_or(|c| c.teams.contains(&crate::view::Controller::Bot))
+            || debug.as_deref().is_some_and(|d| {
+                [
+                    DebugTool::Decisions,
+                    DebugTool::Knowledge,
+                    DebugTool::Units,
+                    DebugTool::Buildings,
+                ]
+                .iter()
+                .any(|t| d.on(*t))
+            }))
 }
 
 /// Strategia (1Hz) + micro-esecuzione con budget, per OGNI team AI.
@@ -236,6 +255,7 @@ fn ai_tick(
     mut commands: Commands,
     time: Res<Time>,
     config: Res<AiConfig>,
+    control: Option<Res<crate::view::SessionControl>>,
     snapshots: Res<AiSnapshots>,
     match_result: Option<Res<crate::game_over::MatchResult>>,
     scenario: Res<crate::scenario::Scenario>,
@@ -302,6 +322,9 @@ fn ai_tick(
     let mut all_intent_labels: Vec<String> = Vec::new();
 
     for brain in config.sorted_teams() {
+        if !crate::view::bot_controls(control.as_deref(), brain.team) {
+            continue;
+        }
         let Some(snapshot) = snapshots.0.get(&brain.team) else {
             continue;
         };
@@ -360,7 +383,9 @@ fn ai_tick(
             &factory_queues,
             state.last_wave.get(&brain.team).copied().unwrap_or(0),
         );
-        all_intent_labels.extend(intents.iter().map(|i| format!("M{}:{i:?}", brain.team)));
+        if debug.as_deref().is_some_and(|d| d.enabled) {
+            all_intent_labels.extend(intents.iter().map(|i| format!("M{}:{i:?}", brain.team)));
+        }
         // 0.0.20 — catch-up onde: l'ondata lanciata consuma il periodo.
         if intents
             .iter()
@@ -436,6 +461,7 @@ fn micro_tick(
     time: Res<Time>,
     mut acc: Local<f32>,
     config: Res<AiConfig>,
+    control: Option<Res<crate::view::SessionControl>>,
     snapshots: Res<AiSnapshots>,
     match_result: Option<Res<crate::game_over::MatchResult>>,
     scenario: Res<crate::scenario::Scenario>,
@@ -486,6 +512,9 @@ fn micro_tick(
 
     let mut micro_labels: Vec<String> = Vec::new();
     for brain in config.sorted_teams() {
+        if !crate::view::bot_controls(control.as_deref(), brain.team) {
+            continue;
+        }
         let Some(snapshot) = snapshots.0.get(&brain.team) else {
             continue;
         };
@@ -493,7 +522,9 @@ fn micro_tick(
             continue;
         }
         let intents = strategy::decide_micro(snapshot, &brain.personality, *scenario);
-        micro_labels.extend(intents.iter().map(|i| format!("m{}:{i:?}", brain.team)));
+        if debug.as_deref().is_some_and(|d| d.enabled) {
+            micro_labels.extend(intents.iter().map(|i| format!("m{}:{i:?}", brain.team)));
+        }
         if intents.is_empty() {
             continue;
         }
@@ -617,5 +648,86 @@ mod tests {
         let teams = config.sorted_teams();
         assert_eq!(vec![teams[0].team, teams[1].team], vec![0, 1]);
         let _ = world.resource::<NavigationStats>();
+    }
+    #[test]
+    fn handoff_suspends_macro_and_micro_and_resumes_bot() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / 60.0,
+            )))
+            .insert_resource(Scenario::Playground)
+            .insert_resource(AiConfig::versus(
+                Personality::RUSHER,
+                Personality::TURTLE,
+                AiMode::Test,
+            ))
+            .add_plugins((
+                NavigationPlugin,
+                SpatialPlugin,
+                UnitPlugin { visuals: false },
+                MovementPlugin,
+                CombatPlugin,
+                EconomyPlugin,
+                StructuresPlugin { visuals: false },
+                ProductionPlugin,
+                FogPlugin { render: false },
+                AiPlugin,
+            ))
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>();
+        app.finish();
+        app.cleanup();
+
+        app.insert_resource(crate::view::SessionControl::from_cli("both", 2));
+        for _ in 0..120 {
+            app.update();
+        }
+        app.world_mut()
+            .resource_mut::<crate::view::SessionControl>()
+            .transfer(0, crate::view::Controller::Human);
+        let before = app
+            .world()
+            .resource::<AiState>()
+            .per_team
+            .get(&0)
+            .cloned()
+            .unwrap_or_default();
+        for _ in 0..300 {
+            app.update();
+        }
+        let after = app
+            .world()
+            .resource::<AiState>()
+            .per_team
+            .get(&0)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            (
+                before.orders_issued,
+                before.micro_orders,
+                before.builds_done,
+                before.enqueues_done
+            ),
+            (
+                after.orders_issued,
+                after.micro_orders,
+                after.builds_done,
+                after.enqueues_done
+            )
+        );
+        app.world_mut()
+            .resource_mut::<crate::view::SessionControl>()
+            .transfer(0, crate::view::Controller::Bot);
+        for _ in 0..300 {
+            app.update();
+        }
+        let resumed = app.world().resource::<AiState>().per_team.get(&0).unwrap();
+        assert!(
+            resumed.orders_issued + resumed.builds_done + resumed.enqueues_done
+                > before.orders_issued + before.builds_done + before.enqueues_done
+        );
     }
 }

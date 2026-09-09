@@ -142,7 +142,11 @@ fn flash_planned_routes(
     mut materials: ResMut<Assets<StandardMaterial>>,
     grid: Res<SpatialGrid>,
     units: Query<(Entity, &Route, &UnitOrder), (With<Selected>, Added<Route>)>,
+    debug: Option<Res<crate::ui::debug::DebugSettings>>,
 ) {
+    if !debug.is_some_and(|d| d.on(crate::ui::debug::DebugTool::Routes)) {
+        return;
+    }
     for (entity, route, order) in &units {
         let Some(origin) = grid.position(entity) else {
             continue;
@@ -186,7 +190,8 @@ fn flash_planned_routes(
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn update_order_graphics(
     mut commands: Commands,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
+    debug: Option<Res<crate::ui::debug::DebugSettings>>,
     assets: Res<LineAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     grid: Res<SpatialGrid>,
@@ -288,10 +293,16 @@ fn update_order_graphics(
     // Fade flashes out; drop lines/markers whose unit is gone, deselected
     // or done. Flashes are snapshots: they outlive orders and units.
     for (viz_entity, mut viz, _, material) in viz.iter_mut() {
+        let selected = units.contains(viz.unit);
         match &mut viz.kind {
             VizKind::Flash { remaining } => {
                 *remaining -= dt;
-                if *remaining <= 0.0 {
+                if *remaining <= 0.0
+                    || !selected
+                    || !debug
+                        .as_deref()
+                        .is_some_and(|d| d.on(crate::ui::debug::DebugTool::Routes))
+                {
                     commands.entity(viz_entity).despawn();
                 } else if let Some(mut mat) = materials.get_mut(&material.0) {
                     mat.base_color

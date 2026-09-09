@@ -155,54 +155,42 @@ fn main() -> std::process::ExitCode {
             ui::UiPlugin,
         ));
     if !config.benchmark {
-        // Spettatore 1v1: di default la fog resta quella del team visto;
-        // con entrambe le AI il FOG parte spento (toggle FOG nel pannello).
-        let spectate_both = config.ai == "both" || config.ai_team == 2;
-        app.add_plugins((
-            economy::EconomyPlugin,
-            fog::FogPlugin { render: true },
-            structures::StructuresPlugin { visuals: true },
-            production::ProductionPlugin,
-            ui::industry::IndustryUiPlugin,
-            game_over::GameOverPlugin,
-        ));
-        // Vista iniziale: team visto = blu, fog spettatore in demo 1v1.
-        app.insert_resource(view::ViewState {
-            team: 0,
-            fog_on: !spectate_both,
-        });
-        // AI grafica: `skirmish` = un team (tu giochi l'altro),
-        // `both` = demo 1v1 AI-vs-AI. Stesso Playground reale con Commander.
-        if config.ai != "off" {
-            let red = ai::Personality::from_name(&config.ai_personality);
-            let blue = ai::Personality::from_name(&config.ai_personality2);
-            let ai_config = if spectate_both {
-                // Blu = personality2, rosso = personality (default rusher vs turtle).
-                ai::AiConfig::versus(blue, red, ai::AiMode::Both)
-            } else {
-                let mode = if config.ai == "test" {
-                    ai::AiMode::Test
+        let control = view::SessionControl::from_cli(&config.ai, config.ai_team);
+        let team = control.player_team().unwrap_or(0);
+        let spectator = control.player_team().is_none();
+        // Keep both personalities available for later handoffs, independently
+        // from the set of teams currently controlled by bots.
+        let ai_config = ai::AiConfig::versus(
+            ai::Personality::from_name(
+                if !spectator && config.ai != "off" && config.ai_team == 0 {
+                    &config.ai_personality
                 } else {
-                    ai::AiMode::Skirmish
-                };
-                ai::AiConfig::single(config.ai_team.min(1), red, mode)
-            };
-            let title_extra = if spectate_both {
-                format!(
-                    " — AI vs AI ({} vs {})",
-                    ai_config.teams[0].personality.name, ai_config.teams[1].personality.name
-                )
+                    &config.ai_personality2
+                },
+            ),
+            ai::Personality::from_name(&config.ai_personality),
+            if spectator {
+                ai::AiMode::Both
             } else {
-                String::new()
-            };
-            if !title_extra.is_empty() {
-                println!(
-                    "Spectate 1v1{title_extra}: fog disattivata per lo spettatore. Tasti: +/- velocita, 0 reset 1x, Space pausa."
-                );
-            }
-            app.insert_resource(ai_config)
-                .add_plugins((ai::AiPlugin, ai::debug::AiDebugPlugin));
-        }
+                ai::AiMode::Skirmish
+            },
+        );
+        app.insert_resource(control)
+            .insert_resource(view::ViewState {
+                team,
+                fog_on: !spectator,
+            })
+            .insert_resource(ai_config)
+            .add_plugins((
+                economy::EconomyPlugin,
+                fog::FogPlugin { render: true },
+                structures::StructuresPlugin { visuals: true },
+                production::ProductionPlugin,
+                ui::industry::IndustryUiPlugin,
+                game_over::GameOverPlugin,
+                ai::AiPlugin,
+                ai::debug::AiDebugPlugin,
+            ));
     }
     if config.benchmark
         && let Err(error) = benchmark::add_graphical(&mut app, config)

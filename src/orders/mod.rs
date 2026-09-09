@@ -578,7 +578,7 @@ fn issue_hold_stop_keys(
             queue_hold(&mut commands.entity(entity));
         }
         *pending = PendingOrder::None;
-    } else if keys.just_pressed(KeyCode::KeyS) {
+    } else if keys.just_pressed(KeyCode::KeyX) {
         for entity in &selected {
             queue_stop(&mut commands.entity(entity));
         }

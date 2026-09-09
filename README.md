@@ -19,7 +19,15 @@ cargo run -- --ai skirmish
 cargo run -- --ai both --ai-personality turtle --ai-personality2 rusher
 ```
 
-`--ai skirmish` pits you (blue) against the red turtle AI; `--ai both` runs a 1v1 demo (blue rusher vs red turtle). Personalities are `turtle|rusher` per team (`--ai-personality` red, `--ai-personality2` blue, `--ai-team 0|1|2`). Demo keys: `+/-` speed, `0` reset 1x, `Space` pause. Score panel top-right. Match ends when a Commander dies (`R` restarts). The `VIEW & FOG` panel switches the played team (BLUE/RED) and toggles fog.
+`--ai skirmish` pits you (blue) against the red turtle AI; `--ai both` starts an observer match (blue rusher vs red turtle). `--ai-team 0` puts the bot on blue and gives you red. The CLI remains the match setup; no launcher is introduced.
+
+The HUD separates player control from observation. The top bar shows your role, match clock and economy; the bottom dock shows only the actions appropriate to the selection. **Control → Take control BLUE/RED** suspends that team's bot; **Leave to bot** hands over without discarding existing orders, construction or production. Taking another team hands the previous one to its bot. Dormant bots retain CLI personalities (`--ai-personality` for the single starting bot/red, `--ai-personality2` for blue in bot-vs-bot).
+
+Observers can inspect visible units and buildings but cannot issue orders, build, edit queues or change rally points. Choose **Full view**, **Fog BLUE**, or **Fog RED** without changing ownership. Base and entity focus buttons move the camera. Pausing leaves the camera and interface operational. `R` restarts a finished match with the current controllers and debug preferences, a fresh clock and 1× speed.
+
+**Debug [F3]** opens a sidebar with all tools initially off. Performance, simulation, navigation, economy, AI decisions/knowledge, unit/building/base markers, selected routes and the entity inspector each have their own toggle. Opening the sidebar enables nothing; closing it keeps enabled tools running, with their count visible in the header. Team and selection filters limit applicable data. Private enemy data remains hidden unless **Full debug view** is explicitly enabled; this does not affect what bots know. Global navigation/projectile totals require full view and unrestricted filters. Settings last for the current process only.
+
+Scroll within the debug sidebar, selection details or production queue; scrolling over their buttons does not zoom the battlefield. `PageUp/PageDown` also scroll the hovered panel. **Help [F1]** contains the complete controls.
 
 | Control | Action |
 |---|---|
@@ -38,17 +46,19 @@ cargo run -- --ai both --ai-personality turtle --ai-personality2 rusher
 | P | Arm patrol targeting (toggle), then left-click appends loop waypoints |
 | T | Arm guard targeting (toggle), then left-click a friendly unit |
 | H | Hold selected units in place (acquire and fire, never chase) |
-| S | Stop selected units |
+| X | Stop selected units |
+| F1 / F3 | Toggle help / debug sidebar |
+| Space / + / - / 0 | Pause / speed up / slow down / reset speed (observer or Simulation debug) |
 
-Green rings show selected units. The playground HUD reports version, FPS, counts per team, queued orders and pending paths; the benchmark HUD adds projectiles, engaging units, kinds, queued/failed paths and targeting state.
+Green rings show selected controllable units; the neutral inspection ring does not grant command authority. Normal order lines, destination markers, rally graphics and placement previews remain gameplay aids. Detailed planned routes are opt-in diagnostics. The graphical benchmark retains its dedicated measurement HUD; headless runs load no UI.
 
 ### Constructions
 
-Select a builder (Commander or Engineer): the BASE CONSTRUCTION menu appears. Pick Metal, Solar, Factory, Turret, Wall or LabT2, then left-click free ground (2 m grid snap). Only explicitly tasked builders march to the footprint edge and trickle work while inside their own build radius; any other order pauses the site. One active site per team, no refunds on cancel. Factories are rejected up front when all 12 exit doors are sealed (`Factory exits blocked`), so queued troops always have a door.
+Select a builder (Commander or Engineer): the construction grid appears in the bottom dock. Pick Metal, Solar, Factory, Turret, Wall or LabT2, then left-click free ground (2 m grid snap). Only explicitly tasked builders march to the footprint edge and trickle work while inside their own build radius; any other order pauses the site. One active site per team, no refunds on cancel. Factories are rejected up front when all 12 exit doors are sealed (`Factory exits blocked`), so queued troops always have a door.
 
 ### Production
 
-Select a completed Factory (tier 1) or LabT2 (tier 2): the factory panel enqueues producible units (Scout, HeavyTank, Artillery, Engineer, LightTank, plus HeavyTank2/Artillery2 from LabT2 only; Commander never queues; `MAX_QUEUE = 12`). Right-click free ground with no units selected to set the rally; new units march there. A finished product waits inside a surrounded factory (`blocked`) and retries about once per second, immediately when the rally changes — never teleports.
+Select a completed Factory (tier 1) or LabT2 (tier 2): the bottom dock enqueues producible units (Scout, HeavyTank, Artillery, Engineer, LightTank, plus HeavyTank2/Artillery2 from LabT2 only; Commander never queues; `MAX_QUEUE = 12`). Right-click free ground with no units selected to set the rally; new units march there. A finished product waits inside a surrounded factory (`blocked`) and retries about once per second, immediately when the rally changes — never teleports.
 
 ## Benchmark and profiler
 

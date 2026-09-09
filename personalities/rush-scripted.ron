@@ -5,6 +5,8 @@
     engineer_first: false,
     second_solar: false,
     mix: ((HeavyTank, 1), (LightTank, 0), (Artillery, 0)),
+    tech_mix: ((Scout, 0), (Scout, 0)),
+    max_tech: 0,
     max_turrets: 0,
     max_lance: 0,
     max_walls: 0,

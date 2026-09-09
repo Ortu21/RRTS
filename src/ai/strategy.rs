@@ -33,6 +33,13 @@ pub struct Personality {
     pub second_solar: bool,
     /// Mix produttivo T1 (kind, peso): la coda insegue queste proporzioni.
     pub mix: [(UnitKind, u32); 3],
+    /// Tech reattivi T1 (kind, peso): costruiti SOLO contro comp nemiche che
+    /// counterano davvero (edge > soglia, vedi `tech_pick`) — a nemico ignoto
+    /// edge 1.0 ovunque e si torna al mix normale. Pesi 0 = mai (baseline).
+    /// L'AI scopre così il roster nuovo senza cambiare cervello.
+    pub tech_mix: [(UnitKind, u32); 2],
+    /// Tetto condiviso tech vivi+accodati (0 = mai, solo main).
+    pub max_tech: usize,
     /// Torrette difensive massime (0 = mai, solo turtle).
     pub max_turrets: usize,
     /// Lance turret massime (0 = mai, solo turtle late con eco solida).
@@ -76,6 +83,8 @@ impl Personality {
             (UnitKind::LightTank, 2),
             (UnitKind::Artillery, 3),
         ],
+        tech_mix: [(UnitKind::MortarTank, 1), (UnitKind::MgTank, 1)],
+        max_tech: 2,
         max_turrets: 2,
         max_lance: 1,
         max_walls: 3,
@@ -100,6 +109,8 @@ impl Personality {
             (UnitKind::LightTank, 3),
             (UnitKind::Artillery, 1),
         ],
+        tech_mix: [(UnitKind::MgTank, 1), (UnitKind::MortarTank, 1)],
+        max_tech: 2,
         max_turrets: 0,
         max_lance: 0,
         max_walls: 0,
@@ -127,6 +138,8 @@ impl Personality {
             (UnitKind::Scout, 1),
             (UnitKind::HeavyTank, 0),
         ],
+        tech_mix: [(UnitKind::Scout, 0), (UnitKind::Scout, 0)],
+        max_tech: 0,
         max_turrets: 0,
         max_lance: 0,
         max_walls: 0,
@@ -154,6 +167,8 @@ impl Personality {
             (UnitKind::LightTank, 0),
             (UnitKind::Artillery, 0),
         ],
+        tech_mix: [(UnitKind::Scout, 0), (UnitKind::Scout, 0)],
+        max_tech: 0,
         max_turrets: 0,
         max_lance: 0,
         max_walls: 0,
@@ -198,6 +213,8 @@ impl Personality {
             engineer_first: def.engineer_first,
             second_solar: def.second_solar,
             mix: def.mix,
+            tech_mix: def.tech_mix,
+            max_tech: def.max_tech,
             max_turrets: def.max_turrets,
             max_lance: def.max_lance,
             max_walls: def.max_walls,
@@ -225,6 +242,8 @@ pub struct PersonalityDef {
     pub engineer_first: bool,
     pub second_solar: bool,
     pub mix: [(UnitKind, u32); 3],
+    pub tech_mix: [(UnitKind, u32); 2],
+    pub max_tech: usize,
     pub max_turrets: usize,
     pub max_lance: usize,
     pub max_walls: usize,
@@ -248,6 +267,8 @@ impl From<&Personality> for PersonalityDef {
             engineer_first: p.engineer_first,
             second_solar: p.second_solar,
             mix: p.mix,
+            tech_mix: p.tech_mix,
+            max_tech: p.max_tech,
             max_turrets: p.max_turrets,
             max_lance: p.max_lance,
             max_walls: p.max_walls,
@@ -336,6 +357,12 @@ pub enum AiIntent {
         units: Vec<Entity>,
         position: Vec3,
     },
+    /// Kiting: (unità, meta) per le batterie pressate — il nemico più vicino
+    /// è dentro la linea e la batteria arretra sparando (Move spara in marcia)
+    /// verso lo stand-off. Micro 4Hz, precede Hold per le unità pressate.
+    Kite {
+        moves: Vec<(Entity, Vec3)>,
+    },
 }
 
 /// 0.0.20 — periodo ondate in tick snapshot (4Hz): 300 = 75s. Rivalutazione
@@ -355,6 +382,15 @@ pub const BASE_THREAT_RADIUS: f32 = 120.0;
 /// per-kind): sotto sono linea (screen), sopra batteria (hold). Heavy2 21.9
 /// resta linea, Arty 30.0 batteria.
 pub const BATTERY_MIN_RANGE: f32 = 25.0;
+/// Kiting: dentro questa frazione della propria gittata dal nemico più vicino
+/// la batteria arretra sparando invece di tenere la posizione (che verrebbe
+/// caricata). Sopra resta in Hold. Isteresi implicita: marciando all'indietro
+/// la distanza cresce e il kite si spegne da solo.
+pub const KITE_LINE_FRAC: f32 = 0.75;
+/// Snipe: col Commander nemico in vista basta questa win_prob (sotto la
+/// soglia focus) per designarlo — il capitale vale il rischio che la truppa
+/// non vale. Mai sotto: niente suicidi per un'uccisione di prestigio.
+pub const SNIPE_MIN_WIN_PROB: f32 = 0.6;
 
 /// Ricordi freschi con potenza stimata, pesata per età (stesso decay della
 /// threat map) e scontata (posizioni non verificate). 0.0.17: sostituisce lo
@@ -510,6 +546,44 @@ fn counter_edge(kind: UnitKind, foe: &[(UnitKind, f32)]) -> f32 {
         / total
 }
 
+/// Soglia edge per tech pick reattivo: solo counter veri (>1.0 con margine),
+/// mai rumore da tabella neutra. Puro.
+pub const TECH_EDGE_MIN: f32 = 1.05;
+
+/// Tech pick reattivo: tra i tech con peso>0, quello con edge counter massimo
+/// contro la comp nemica — se supera la soglia e c'è cap condiviso.
+/// A nemico ignoto (`foe` vuoto) edge 1.0 ovunque → None = mix normale.
+/// Puro e deterministico (pareggi → ordine tabella).
+pub fn tech_pick(
+    tech_mix: &[(UnitKind, u32)],
+    foe: &[(UnitKind, f32)],
+    opponent: super::opponent::OpponentKind,
+    tech_count: usize,
+    max_tech: usize,
+) -> Option<UnitKind> {
+    if foe.is_empty() || tech_count >= max_tech {
+        return None;
+    }
+    let mut best: Option<(UnitKind, f32, u32)> = None;
+    for (kind, w) in tech_mix.iter().filter(|(_, w)| *w > 0) {
+        let edge = counter_edge(*kind, foe) * super::opponent::mix_bias(*kind, opponent);
+        if edge <= TECH_EDGE_MIN {
+            continue;
+        }
+        // Vince l'edge maggiore; a pari edge il peso tabella (priorità della
+        // personalità: rusher preferisce Mg, turtle i mortai); poi tabella.
+        let better = match best {
+            None => true,
+            Some((_, be, bw)) => (edge, *w)
+                .partial_cmp(&(be, bw))
+                .is_some_and(|o| o == std::cmp::Ordering::Greater),
+        };
+        if better {
+            best = Some((*kind, edge, *w));
+        }
+    }
+    best.map(|(k, _, _)| k)
+}
 /// Pesi mix già corretti per counter e opponent-bias: (kind, peso*edge*bias).
 /// Puro. 0.0.19: il bias da tabella `opponent::mix_bias` (±0.1) sposta il mix
 /// verso i counter della classe avversaria; Unknown = 1.0 = vecchio comportamento.
@@ -574,6 +648,22 @@ fn my_primary_kind(snapshot: &AiSnapshot) -> UnitKind {
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.index().cmp(&a.0.index())))
         .map(|(kind, _)| kind)
         .unwrap_or(UnitKind::HeavyTank)
+}
+
+/// Commander nemico in vista da snipare: hp minori, poi determinismo.
+/// `None` senza Commander visibili. Puro; la soglia win_prob resta al
+/// chiamante (`SNIPE_MIN_WIN_PROB`).
+pub fn snipe_target(snapshot: &AiSnapshot) -> Option<Entity> {
+    snapshot
+        .visible_enemies
+        .iter()
+        .filter(|e| e.kind == UnitKind::Commander)
+        .min_by(|a, b| {
+            a.health
+                .total_cmp(&b.health)
+                .then_with(|| a.entity.to_bits().cmp(&b.entity.to_bits()))
+        })
+        .map(|e| e.entity)
 }
 
 /// 0.0.20 — numero d'ondata (periodo 75s): tick snapshot (4Hz) / 300.
@@ -718,6 +808,21 @@ pub fn retreat_anchor(turrets: &[Vec3], home: Vec3) -> Vec3 {
 /// batterie / alla base). Pura.
 pub fn screen_position(guard: Vec3, threat: Vec3) -> Vec3 {
     guard.lerp(threat, 0.3).with_y(0.0)
+}
+
+/// Kite: punto di arretramento per unità pressata — proiezione a `range − 4`
+/// dalla minaccia lungo la direttrice, SEMPRE (a differenza di `hold_position`,
+/// che tiene il terreno se già in gittata: lì va bene, qui serve creare
+/// distanza). Degeneri (sopra il nemico): passo +X deterministico. Pura.
+pub fn kite_position(unit: Vec3, threat: Vec3, range: f32) -> Vec3 {
+    let mut dir = unit - threat;
+    dir.y = 0.0;
+    let dir = if dir.length_squared() < 1e-6 {
+        Vec3::X
+    } else {
+        dir.normalize()
+    };
+    (threat + dir * (range - 4.0)).with_y(0.0)
 }
 
 /// 0.0.20 — posizione batteria: sul lato armata della minaccia, a
@@ -884,22 +989,42 @@ pub fn decide(
                 count_kind(snapshot, &queued_all, k)
             })
         } else {
-            // Mix T1 per deficit di copertura pesato per counter e opponent
-            // (vivi + accodati). Pesi 0 = mai (baseline eco): mix vuoto →
-            // nessuna enqueue. Nemico ignoto → edge/bias 1.0 = vecchio
-            // comportamento.
-            let mix: Vec<(UnitKind, u32)> = personality
-                .mix
+            // Tech reattivo prima del mix: se la comp nemica è nota e un tech
+            // la countera davvero (edge > soglia) con cap libero, si costruisce
+            // lui (Mg vs sciami Light, mortai vs corazze). A nemico ignoto o
+            // cap pieno: mix normale, comportamento invariato.
+            let tech_count: usize = personality
+                .tech_mix
                 .iter()
-                .copied()
                 .filter(|(_, w)| *w > 0)
-                .collect();
-            if mix.is_empty() {
-                continue;
+                .map(|(k, _)| count_kind(snapshot, &queued_all, *k))
+                .sum();
+            if let Some(tech) = tech_pick(
+                &personality.tech_mix,
+                &foe,
+                opponent,
+                tech_count,
+                personality.max_tech,
+            ) {
+                tech
+            } else {
+                // Mix T1 per deficit di copertura pesato per counter e opponent
+                // (vivi + accodati). Pesi 0 = mai (baseline eco): mix vuoto →
+                // nessuna enqueue. Nemico ignoto → edge/bias 1.0 = vecchio
+                // comportamento.
+                let mix: Vec<(UnitKind, u32)> = personality
+                    .mix
+                    .iter()
+                    .copied()
+                    .filter(|(_, w)| *w > 0)
+                    .collect();
+                if mix.is_empty() {
+                    continue;
+                }
+                pick_deficit(&weighted_mix(&mix, &foe, opponent), |k| {
+                    count_kind(snapshot, &queued_all, k)
+                })
             }
-            pick_deficit(&weighted_mix(&mix, &foe, opponent), |k| {
-                count_kind(snapshot, &queued_all, k)
-            })
         };
         // Accoda solo se producibile (mai Commander).
         if UnitKind::PRODUCIBLE.contains(&kind) {
@@ -1055,34 +1180,92 @@ pub fn decide_micro(
     // proprio): solo quando dominante (win_prob oltre soglia), mai
     // inseguimenti suicidi. Fase A step 2: stima range-aware sul contatto
     // live (a contatto ≈ mischia, ma con artiglierie la gittata conta).
+    // Snipe: Commander nemico in vista = designato a soglia ridotta (vale il
+    // rischio); precede il focus normale.
     let (my_list, foe_list) = estimate_forces(snapshot);
     let win_prob =
         super::combat::predict_outcome_at_range(&my_list, &foe_list, engagement_range(snapshot));
-    if personality.focus_fire
-        && !snapshot.visible_enemies.is_empty()
-        && win_prob > FOCUS_MIN_WIN_PROB
-    {
-        let primary = my_primary_kind(snapshot);
-        let target = snapshot
-            .visible_enemies
-            .iter()
-            .max_by(|a, b| {
-                super::combat::target_priority(a.kind, primary)
-                    .total_cmp(&super::combat::target_priority(b.kind, primary))
-                    .then_with(|| b.health.total_cmp(&a.health))
-                    .then_with(|| a.entity.to_bits().cmp(&b.entity.to_bits()))
-            })
-            .map(|e| e.entity);
-        if let Some(target) = target {
-            intents.push(AiIntent::FocusFire { target });
+    if personality.focus_fire && !snapshot.visible_enemies.is_empty() {
+        if win_prob > SNIPE_MIN_WIN_PROB
+            && let Some(snipe) = snipe_target(snapshot)
+        {
+            intents.push(AiIntent::FocusFire { target: snipe });
+        } else if win_prob > FOCUS_MIN_WIN_PROB {
+            let primary = my_primary_kind(snapshot);
+            let target = snapshot
+                .visible_enemies
+                .iter()
+                .max_by(|a, b| {
+                    super::combat::target_priority(a.kind, primary)
+                        .total_cmp(&super::combat::target_priority(b.kind, primary))
+                        .then_with(|| b.health.total_cmp(&a.health))
+                        .then_with(|| a.entity.to_bits().cmp(&b.entity.to_bits()))
+                })
+                .map(|e| e.entity);
+            if let Some(target) = target {
+                intents.push(AiIntent::FocusFire { target });
+            }
         }
     }
 
     // Schermo + batteria: solo a contatto live e solo per unità ferme
-    // (niente deviazioni dell'ondata in marcia). La batteria tiene la
+    // (niente deviazioni dell'ondata in marcia), TRANNE il kite: le batterie
+    // pressate arretrano anche in marcia (mai gli Attack del focus: la
+    // pressione del focus resta). La batteria tiene la
     // gittata sul lato armata; lo schermo sta davanti alla batteria
     // (senza batteria: picchetto avanzato al 30% da guardia a minaccia).
     if let Some(threat) = visible_centroid(snapshot) {
+        // Kite: per ogni batteria (ferma o in marcia, mai in focus/build),
+        // se il nemico più vicino è dentro il 75% della gittata, meta di
+        // arretramento sparando lungo la direttrice unità→nemico. Direzione
+        // per-unità (non centroide): tiene anche contro fiancheggiatori.
+        // Chi kita esce dalla lista Hold (niente doppio ordine).
+        let mut kited: Vec<Entity> = Vec::new();
+        let mut kites: Vec<(Entity, Vec3)> = Vec::new();
+        for u in snapshot.my_units.iter().filter(|u| {
+            crate::units::archetype(u.kind).armed
+                && is_arty_role(u.kind)
+                && u.kind != UnitKind::Scout
+                && u.kind != UnitKind::Commander
+                && u.max_health > 0.0
+                && u.health / u.max_health >= WOUNDED_ARTY_FRAC
+                && matches!(
+                    u.order,
+                    UnitOrder::Idle | UnitOrder::HoldPosition | UnitOrder::Move { .. }
+                )
+                && !matches!(u.order, UnitOrder::Build { .. })
+        }) {
+            let range = crate::units::archetype(u.kind).range;
+            let mut near: Option<(f32, u64, Vec3)> = None;
+            for e in &snapshot.visible_enemies {
+                let d = u.pos.xz().distance_squared(e.pos.xz());
+                let better = match near {
+                    None => true,
+                    Some((bd, bb, _)) => {
+                        use std::cmp::Ordering as O;
+                        match d.total_cmp(&bd) {
+                            O::Less => true,
+                            O::Greater => false,
+                            O::Equal => e.entity.to_bits() < bb,
+                        }
+                    }
+                };
+                if better {
+                    near = Some((d, e.entity.to_bits(), e.pos));
+                }
+            }
+            if let Some((d_sq, _, npos)) = near
+                && d_sq < (range * KITE_LINE_FRAC) * (range * KITE_LINE_FRAC)
+            {
+                kited.push(u.entity);
+                kites.push((u.entity, kite_position(u.pos, npos, range)));
+            }
+        }
+        kited.sort_by_key(|e| e.to_bits());
+        kites.sort_by_key(|(e, _)| e.to_bits());
+        if !kites.is_empty() {
+            intents.push(AiIntent::Kite { moves: kites });
+        }
         let mut battery: Vec<(Entity, f32)> = snapshot
             .my_units
             .iter()
@@ -1095,6 +1278,7 @@ pub fn decide_micro(
                     && u.health / u.max_health >= WOUNDED_ARTY_FRAC
                     && matches!(u.order, UnitOrder::Idle | UnitOrder::HoldPosition)
                     && !matches!(u.order, UnitOrder::Build { .. })
+                    && !kited.contains(&u.entity)
             })
             .map(|u| (u.entity, crate::units::archetype(u.kind).range))
             .collect();
@@ -1557,6 +1741,125 @@ mod tests {
             0,
         );
         assert_eq!(enqueue_kind(&intents), Some(UnitKind::LightTank));
+    }
+
+    #[test]
+    fn tech_pick_reacts_to_comp_not_noise() {
+        use super::super::opponent::OpponentKind;
+        let max_l = crate::units::archetype(UnitKind::LightTank).max_health;
+        let max_h = crate::units::archetype(UnitKind::HeavyTank).max_health;
+        let lights: Vec<(UnitKind, f32)> = vec![(UnitKind::LightTank, max_l); 3];
+        let heavies: Vec<(UnitKind, f32)> = vec![(UnitKind::HeavyTank, max_h); 2];
+        // Sciame Light → MgTank (1.15); corazze → MortarTank (1.1).
+        assert_eq!(
+            tech_pick(
+                &Personality::TURTLE.tech_mix,
+                &lights,
+                OpponentKind::Unknown,
+                0,
+                2
+            ),
+            Some(UnitKind::MgTank)
+        );
+        assert_eq!(
+            tech_pick(
+                &Personality::TURTLE.tech_mix,
+                &heavies,
+                OpponentKind::Unknown,
+                0,
+                2
+            ),
+            Some(UnitKind::MortarTank)
+        );
+        // Ignoto / cap pieno / pesi 0 → None = mix normale.
+        assert_eq!(
+            tech_pick(
+                &Personality::TURTLE.tech_mix,
+                &[],
+                OpponentKind::Unknown,
+                0,
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            tech_pick(
+                &Personality::TURTLE.tech_mix,
+                &lights,
+                OpponentKind::Unknown,
+                2,
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            tech_pick(
+                &Personality::ECO_ONLY.tech_mix,
+                &lights,
+                OpponentKind::Unknown,
+                0,
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn turtle_builds_mg_vs_light_swarm() {
+        use crate::units::archetype;
+        // 2 engineer (cap) + 2 scout (cap, niente ramo occhi) + 3 light visti
+        // + factory T1 libera → tech reattivo MgTank, non Heavy.
+        let max_e = archetype(UnitKind::Engineer).max_health;
+        let max_s = archetype(UnitKind::Scout).max_health;
+        let max_l = archetype(UnitKind::LightTank).max_health;
+        let kinds = &[
+            (UnitKind::Engineer, max_e, UnitOrder::Idle),
+            (UnitKind::Engineer, max_e, UnitOrder::Idle),
+            (UnitKind::Scout, max_s, UnitOrder::Idle),
+            (UnitKind::Scout, max_s, UnitOrder::Idle),
+        ];
+        let mut snap = armed_snapshot(1, kinds);
+        for i in 0..3 {
+            snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+                entity: Entity::from_bits(900 + i),
+                pos: Vec3::new(10.0, 0.0, 0.0),
+                kind: UnitKind::LightTank,
+                health: max_l,
+            });
+        }
+        let intents = decide(
+            &snap,
+            &Personality::TURTLE,
+            Scenario::Playground,
+            &[fac(1, 0, false, 1, &[])],
+            0,
+        );
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::MgTank));
+        // Stesso ma 2 Mg vivi (cap tech): torna il mix normale (Heavy).
+        let mut capped_kinds: Vec<(UnitKind, f32, UnitOrder)> =
+            kinds.iter().map(|(k, h, o)| (*k, *h, o.clone())).collect();
+        let max_mg = archetype(UnitKind::MgTank).max_health;
+        capped_kinds.push((UnitKind::MgTank, max_mg, UnitOrder::Idle));
+        capped_kinds.push((UnitKind::MgTank, max_mg, UnitOrder::Idle));
+        let mut capped = armed_snapshot(1, &capped_kinds);
+        for i in 0..3 {
+            capped
+                .visible_enemies
+                .push(super::super::snapshot::AiEnemy {
+                    entity: Entity::from_bits(910 + i),
+                    pos: Vec3::new(10.0, 0.0, 0.0),
+                    kind: UnitKind::LightTank,
+                    health: max_l,
+                });
+        }
+        let intents = decide(
+            &capped,
+            &Personality::TURTLE,
+            Scenario::Playground,
+            &[fac(1, 0, false, 1, &[])],
+            0,
+        );
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
     }
 
     #[test]
@@ -2610,7 +2913,8 @@ mod tests {
 
     #[test]
     fn engineer_and_scout_queues_count_toward_caps() {
-        // Turtle: 1 engineer vivo + 1 accodato = cap raggiunto → truppa.
+        // Turtle: 1 engineer vivo + 1 accodato = cap raggiunto → tech reattivo
+        // (ricordo fresco di Heavy: mortaio, non Heavy).
         let mut snap = armed_snapshot(1, &[(UnitKind::Engineer, 70.0, UnitOrder::Idle)]);
         give_fresh_eyes(&mut snap);
         let intents = decide(
@@ -2620,8 +2924,8 @@ mod tests {
             &[fac(1, 0, false, 1, &[UnitKind::Engineer])],
             0,
         );
-        assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
-        // Scout accodato ma non ancora uscito: niente doppione.
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::MortarTank));
+        // Scout accodato ma non ancora uscito: niente doppione (stesso tech).
         let mut snap = armed_snapshot(1, &[]);
         give_fresh_eyes(&mut snap);
         let intents = decide(
@@ -2631,7 +2935,7 @@ mod tests {
             &[fac(1, 0, false, 1, &[UnitKind::Scout])],
             0,
         );
-        assert_eq!(enqueue_kind(&intents), Some(UnitKind::HeavyTank));
+        assert_eq!(enqueue_kind(&intents), Some(UnitKind::MortarTank));
     }
 
     #[test]
@@ -2962,6 +3266,128 @@ mod tests {
         assert!(
             micro.iter().any(|i| matches!(i, AiIntent::Retreat { .. })),
             "arty ferita ripiega: {micro:?}"
+        );
+    }
+
+    #[test]
+    fn kite_backoff_inside_line_hold_outside() {
+        use crate::units::archetype;
+        // Arty sola (30m) + heavy a 15m (< 22.5 linea): kita a ~26m dal
+        // nemico lungo la direttrice, e niente Hold per lei.
+        let max_a = archetype(UnitKind::Artillery).max_health;
+        let max_h = archetype(UnitKind::HeavyTank).max_health;
+        let foe = Vec3::new(15.0, 0.0, 0.0);
+        let mut snap = armed_snapshot(1, &[(UnitKind::Artillery, max_a, UnitOrder::Idle)]);
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: foe,
+            kind: UnitKind::HeavyTank,
+            health: max_h,
+        });
+        let micro = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
+        let dest = micro.iter().find_map(|i| match i {
+            AiIntent::Kite { moves } => Some(moves.clone()),
+            _ => None,
+        });
+        let moves = dest.expect("kite quando pressata");
+        assert_eq!(moves.len(), 1);
+        let have = moves[0].1;
+        // Meta di arretramento: ~26m dal nemico, più lontana di prima.
+        assert!((have.distance(foe) - 26.0).abs() < 1.0, "{have:?}");
+        assert!(have.distance(foe) > Vec3::ZERO.distance(foe));
+        assert!(
+            !micro
+                .iter()
+                .any(|i| matches!(i, AiIntent::HoldAtMaxRange { .. })),
+            "chi kita non tiene: {micro:?}"
+        );
+        // Nemico a 28m (> linea): niente kite, Hold normale.
+        let mut far = armed_snapshot(1, &[(UnitKind::Artillery, max_a, UnitOrder::Idle)]);
+        far.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(901),
+            pos: Vec3::new(28.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max_h,
+        });
+        let micro = decide_micro(&far, &Personality::RUSHER, Scenario::Playground);
+        assert!(
+            !micro.iter().any(|i| matches!(i, AiIntent::Kite { .. })),
+            "fuori linea tiene: {micro:?}"
+        );
+        assert!(
+            micro
+                .iter()
+                .any(|i| matches!(i, AiIntent::HoldAtMaxRange { .. })),
+            "hold fuori linea: {micro:?}"
+        );
+    }
+
+    #[test]
+    fn snipe_designates_commander_without_suicide() {
+        use crate::units::archetype;
+        // Selezione pura: il Commander (hp minori) vince su chiunque.
+        let max_h = archetype(UnitKind::HeavyTank).max_health;
+        let mut snap = armed_snapshot(1, &[(UnitKind::HeavyTank, max_h, UnitOrder::Idle)]);
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(901),
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max_h,
+        });
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(902),
+            pos: Vec3::new(12.0, 0.0, 0.0),
+            kind: UnitKind::Commander,
+            health: 150.0,
+        });
+        assert_eq!(snipe_target(&snap), Some(Entity::from_bits(902)));
+        assert!(snipe_target(&armed_snapshot(1, &[])).is_none());
+        // Dominanti 4v1 + Commander esposto: designato (snipe batte focus).
+        let mut strong = armed_snapshot(
+            1,
+            &[
+                (UnitKind::HeavyTank, max_h, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max_h, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max_h, UnitOrder::Idle),
+                (UnitKind::HeavyTank, max_h, UnitOrder::Idle),
+            ],
+        );
+        strong
+            .visible_enemies
+            .push(super::super::snapshot::AiEnemy {
+                entity: Entity::from_bits(903),
+                pos: Vec3::new(10.0, 0.0, 0.0),
+                kind: UnitKind::Commander,
+                health: 150.0,
+            });
+        let micro = decide_micro(&strong, &Personality::RUSHER, Scenario::Playground);
+        assert_eq!(
+            micro.iter().find_map(|i| match i {
+                AiIntent::FocusFire { target } => Some(*target),
+                _ => None,
+            }),
+            Some(Entity::from_bits(903))
+        );
+        // Debole 1v1+Commander full: silenzio, niente suicidi di prestigio.
+        let mut weak = armed_snapshot(1, &[(UnitKind::HeavyTank, max_h, UnitOrder::Idle)]);
+        weak.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(904),
+            pos: Vec3::new(10.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max_h,
+        });
+        weak.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(905),
+            pos: Vec3::new(12.0, 0.0, 0.0),
+            kind: UnitKind::Commander,
+            health: archetype(UnitKind::Commander).max_health,
+        });
+        let micro = decide_micro(&weak, &Personality::RUSHER, Scenario::Playground);
+        assert!(
+            !micro
+                .iter()
+                .any(|i| matches!(i, AiIntent::FocusFire { .. })),
+            "debole non snipa: {micro:?}"
         );
     }
 

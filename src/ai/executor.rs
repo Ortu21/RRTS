@@ -42,10 +42,10 @@ pub fn execute_movement_and_build(
 
     // Ordine di arbitraggio = ordine del vettore da decide()/decide_micro():
     // Build (una), Enqueue (solo conteggio qui), AttackMoveGroup/Scout,
-    // Retreat, FocusFire, Screen, HoldAtMaxRange.
+    // Retreat, FocusFire, Kite, Screen, HoldAtMaxRange.
     // 0.0.17: Retreat prima di FocusFire — i feriti ripiegano invece di
     // convergere sul designato; il budget APM taglia dalla coda se pieno.
-    // 0.0.20: micro a 4Hz con budget 2 (solo Retreat/Focus/Hold/Screen).
+    // 0.0.20: micro a 4Hz con budget 2 (Retreat/Focus/Hold/Screen + Kite).
     for intent in intents {
         match intent {
             AiIntent::Build(kind) => {
@@ -203,6 +203,53 @@ pub fn execute_movement_and_build(
                     // Raggiungibilità: mete walkable ma sigillate (tasche tra
                     // le rocce) manderebbero il planner in fail-loop a 4Hz
                     // (l'ordine fallito viene rimosso e riemesso ogni tick).
+                    if grid.find_path_for(pos, goal, radius).is_none() {
+                        continue;
+                    }
+                    queue_move(&mut commands.entity(entity), goal);
+                    unit_orders += 1;
+                }
+            }
+            AiIntent::Kite { moves } => {
+                // Kiting: arretramento sparando (Move spara in marcia) verso
+                // mete per-unità già calcolate. Stessa riparazione, isteresi
+                // (10m) e validazione della batteria: niente churn, niente
+                // fail-loop a 4Hz. Priorità su Hold per le unità pressate
+                // (la strategia le esclude già dalla lista Hold).
+                let radius = moves
+                    .iter()
+                    .filter_map(|(e, _)| {
+                        units
+                            .iter()
+                            .find(|(ue, _, _, _)| ue == e)
+                            .map(|(_, _, k, _)| crate::units::archetype(*k).radius)
+                    })
+                    .fold(0.5, f32::max);
+                let mut sorted = moves.clone();
+                sorted.sort_by_key(|(e, _)| e.to_bits());
+                for (entity, dest) in sorted {
+                    if unit_orders >= max_unit_orders {
+                        break;
+                    }
+                    let Some((pos, order)) = units
+                        .iter()
+                        .find(|(e, _, _, _)| *e == entity)
+                        .map(|(_, p, _, o)| (*p, o.clone()))
+                    else {
+                        continue;
+                    };
+                    if matches!(order, UnitOrder::Build { .. }) {
+                        continue;
+                    }
+                    let mut goal = grid.clear_point_for(dest, radius);
+                    if !(grid.is_walkable(goal) && grid.has_clearance_for(goal, radius)) {
+                        goal = scenario.center(team as usize);
+                    }
+                    if let UnitOrder::Move { destination: d } = &order
+                        && (goal - *d).length_squared() < 100.0
+                    {
+                        continue;
+                    }
                     if grid.find_path_for(pos, goal, radius).is_none() {
                         continue;
                     }

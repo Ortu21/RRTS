@@ -5,6 +5,8 @@
     engineer_first: true,
     second_solar: true,
     mix: ((HeavyTank, 5), (LightTank, 2), (Artillery, 3)),
+    tech_mix: ((MortarTank, 1), (MgTank, 1)),
+    max_tech: 2,
     max_turrets: 2,
     max_lance: 1,
     max_walls: 3,

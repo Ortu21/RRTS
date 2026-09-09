@@ -38,10 +38,11 @@ fn placement_rejects_bounds_obstacles_units_and_invalid_base_rules() {
     // builder walks over, work starts on arrival (see economy site_power).
     let builders = [(Team(0), Vec3::ZERO, COMMAND_BUILD_RADIUS)];
     assert!(placement_rule(Team(0), Vec3::X * 150.0, &[], &builders).is_ok());
-    // Wrong team, and a second site while one is active, are rejected.
+    // Wrong team rejected; second site while one is active is now ALLOWED
+    // (BAR-style: un cantiere per builder, nessun tetto per-team).
     assert!(placement_rule(Team(1), Vec3::ZERO, &[], &builders).is_err());
     let busy = [(Team(0), BuildingKind::Metal, Vec3::ZERO, true)];
-    assert!(placement_rule(Team(0), Vec3::ZERO, &busy, &builders).is_err());
+    assert!(placement_rule(Team(0), Vec3::ZERO, &busy, &builders).is_ok());
     // Factories never enable placement: the lab only makes units.
     let base = [(Team(0), BuildingKind::Factory, Vec3::ZERO, false)];
     assert!(placement_rule(Team(0), Vec3::ZERO, &base, &[]).is_err());

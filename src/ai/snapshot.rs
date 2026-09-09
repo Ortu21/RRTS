@@ -87,7 +87,9 @@ pub struct AiSnapshot {
     /// Edifici nemici visibili ora (0.0.16: riesumato, letto da threat map).
     pub visible_enemy_buildings: Vec<AiBuilding>,
     pub my_buildings: Vec<AiBuilding>,
-    pub active_site: Option<Entity>,
+    /// Cantieri propri attivi (vuoto = nessun cantiere). Un intento Build per
+    /// builder libero: l'eco parallela è strategia, non exploit.
+    pub active_sites: Vec<Entity>,
     /// Ricordi nemici (anche non più visibili), freschi prima.
     pub memory: Vec<AiMemory>,
     /// G1 — depositi metallo (terreno pubblico, uguali per ogni team).
@@ -364,10 +366,14 @@ pub fn build_snapshot(
         .collect();
     visible_enemy_buildings.sort_by_key(|b| b.entity.to_bits());
 
-    let active_site = my_buildings
+    // BAR-style: ogni builder porta avanti il suo cantiere — la lista
+    // (ordinata per determinismo) sostituisce il singolo active_site.
+    let mut active_sites: Vec<Entity> = my_buildings
         .iter()
-        .find(|b| b.under_construction)
-        .map(|b| b.entity);
+        .filter(|b| b.under_construction)
+        .map(|b| b.entity)
+        .collect();
+    active_sites.sort_by_key(|e| e.to_bits());
 
     let (stock, income, demand) =
         economy
@@ -389,7 +395,7 @@ pub fn build_snapshot(
         visible_enemies,
         visible_enemy_buildings,
         my_buildings,
-        active_site,
+        active_sites,
         memory: to_ai_memory(memory),
         explored_pct,
         explored_cells,

@@ -311,12 +311,13 @@ pub fn factory_spawn_ok(
 pub fn placement_rule(
     team: Team,
     _position: Vec3,
-    buildings: &[(Team, BuildingKind, Vec3, bool)],
+    _buildings: &[(Team, BuildingKind, Vec3, bool)],
     builders: &[(Team, Vec3, f32)],
 ) -> Result<(), &'static str> {
-    if buildings.iter().any(|(t, _, _, site)| *t == team && *site) {
-        return Err("One active construction site per team");
-    }
+    // BAR-style: nessun tetto per-team ai cantieri — ogni builder porta avanti
+    // il suo; il limite emerge dai builder vivi, non dalle regole. Cantieri
+    // multipli (anche stessa specie) sono intenzionali: l'eco parallela è
+    // strategia, non exploit. Resta il gate builder-vivi.
     if !builders.iter().any(|(t, _, _)| *t == team) {
         return Err("No builders alive: build an Engineer first");
     }

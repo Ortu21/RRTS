@@ -543,10 +543,10 @@ fn estimate_forces(snapshot: &AiSnapshot) -> ForcePair {
 
 /// Punto 1 — win_prob Lanchester dello snapshot (stessa `estimate_forces` di
 /// `decide`/`decide_micro`): telemetria e calibrazione courage dai dati veri.
-/// Pura e deterministica.
+/// Fase A step 2: range-aware come `decide`. Pura e deterministica.
 pub fn win_prob_of(snapshot: &AiSnapshot) -> f32 {
     let (my_list, foe_list) = estimate_forces(snapshot);
-    super::combat::predict_outcome(&my_list, &foe_list)
+    super::combat::predict_outcome_at_range(&my_list, &foe_list, engagement_range(snapshot))
 }
 
 /// Kind armato proprio più numeroso (primario) per il focus: pareggi → indice
@@ -650,6 +650,29 @@ pub fn base_under_threat(snapshot: &AiSnapshot, scenario: Scenario) -> bool {
     super::threat::build_threat(snapshot)
         .hotspot()
         .is_some_and(|h| h.xz().distance(home.xz()) < BASE_THREAT_RADIUS)
+}
+
+/// Fase A step 2 — distanza d'ingaggio (mio baricentro armato → baricentro
+/// minaccia: visibile, altrimenti ricordi freschi). Sconosciuta = 0.0
+/// (mischia immediata = vecchia matematica esatta). Pura.
+pub fn engagement_range(snapshot: &AiSnapshot) -> f32 {
+    let mut sum = Vec3::ZERO;
+    let mut n = 0u32;
+    for u in snapshot.army() {
+        sum += u.pos;
+        n += 1;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let mine = sum / n as f32;
+    if let Some(vis) = visible_centroid(snapshot) {
+        return mine.distance(vis);
+    }
+    if let Some(rem) = snapshot.remembered_centroid(MEMORY_FRESH_TICKS) {
+        return mine.distance(rem);
+    }
+    0.0
 }
 
 /// 0.0.20 — baricentro nemici visibili (punto minaccia per screen/hold).
@@ -877,7 +900,12 @@ pub fn decide(
     // più un muro: minacciati ma dominanti si contrattacca (`safety → 1`).
     let army_count = snapshot.army().len();
     let (my_list, foe_list) = estimate_forces(snapshot);
-    let win_prob = super::combat::predict_outcome(&my_list, &foe_list);
+    // Fase A step 2 — doppia stima: range-aware per marciare verso il nemico
+    // (chi picchia da fuori emerge dal sim), mischia per il contrattacco in
+    // casa (lì conta la supremazia di forze, non i 10s di orizzonte: da 300m
+    // il sim non vede l'ingaggio ma marciare resta giusto se dominanti).
+    let win_prob =
+        super::combat::predict_outcome_at_range(&my_list, &foe_list, engagement_range(snapshot));
     let threatened = base_under_threat(snapshot, scenario);
     // Alla cieca (mai visto il nemico: `win_prob` è 1.0 a vuoto) serve la massa
     // critica di prima: soglia effettiva +2, in curva invece che in ramo morto.
@@ -894,11 +922,19 @@ pub fn decide(
     // Catch-up: prima prontezza di ogni periodo (vedi doc di `decide`).
     let wave_due = on_wave || wave_id(snapshot.tick) > last_wave_id;
     // Minacciati: niente ondata programmata verso la base nemica (richiamo
-    // difensivo), MA se dominanti si contrattacca SULLA minaccia in casa
-    // (centroide visibile: l'AttackMove ingaggia strada facendo). Le baseline
-    // scripted restano richiamate sempre (niente micro difensivo a coprirle).
-    let push_threatened =
-        threatened && power_ok && wave_due && visible_centroid(snapshot).is_some();
+    // difensivo), MA se dominanti in mischia si contrattacca SULLA minaccia
+    // in casa (centroide visibile: l'AttackMove ingaggia strada facendo).
+    // Le baseline scripted restano richiamate sempre (niente micro difensivo
+    // a coprirle).
+    let push_threatened = threatened
+        && wave_due
+        && visible_centroid(snapshot).is_some()
+        && super::utility::attack_opportunity(
+            super::combat::predict_outcome(&my_list, &foe_list),
+            army_count,
+            threshold_eff,
+            true,
+        ) > courage;
     let scheduled = power_ok && wave_due && !threatened;
     let scripted = force_attack && !threatened;
     if scheduled || scripted || push_threatened {
@@ -997,9 +1033,11 @@ pub fn decide_micro(
 
     // Focus fire a priorità minaccia (dps × counter contro il kind primario
     // proprio): solo quando dominante (win_prob oltre soglia), mai
-    // inseguimenti suicidi. Stessa matematica 0.0.17.
+    // inseguimenti suicidi. Fase A step 2: stima range-aware sul contatto
+    // live (a contatto ≈ mischia, ma con artiglierie la gittata conta).
     let (my_list, foe_list) = estimate_forces(snapshot);
-    let win_prob = super::combat::predict_outcome(&my_list, &foe_list);
+    let win_prob =
+        super::combat::predict_outcome_at_range(&my_list, &foe_list, engagement_range(snapshot));
     if personality.focus_fire
         && !snapshot.visible_enemies.is_empty()
         && win_prob > FOCUS_MIN_WIN_PROB
@@ -2916,6 +2954,37 @@ mod tests {
         let far = Vec3::new(0.0, 0.0, 0.0);
         assert_eq!(retreat_anchor(&[far, near], home), near);
         assert_eq!(retreat_anchor(&[near, far], home), near);
+    }
+
+    #[test]
+    fn engagement_range_prefers_live_then_memory_then_melee() {
+        use crate::units::archetype;
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        // Armata a ZERO, nemico live a 30m: 30.
+        let mut snap = armed_snapshot(1, &[(UnitKind::HeavyTank, max, UnitOrder::Idle)]);
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: Vec3::new(30.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: max,
+        });
+        assert!((engagement_range(&snap) - 30.0).abs() < 0.01);
+        // Solo ricordo fresco a 40m (niente live): 40.
+        let mut ghost = armed_snapshot(1, &[(UnitKind::HeavyTank, max, UnitOrder::Idle)]);
+        ghost.memory.push(super::super::snapshot::AiMemory {
+            entity_bits: None,
+            pos: Vec3::new(40.0, 0.0, 0.0),
+            age_ticks: 5,
+            kind: Some(UnitKind::HeavyTank),
+            hp: max,
+            building: false,
+        });
+        assert!((engagement_range(&ghost) - 40.0).abs() < 0.01);
+        // Buio totale o nessuna armata: mischia (vecchia matematica).
+        let dark = armed_snapshot(1, &[(UnitKind::HeavyTank, max, UnitOrder::Idle)]);
+        assert_eq!(engagement_range(&dark), 0.0);
+        let empty = armed_snapshot(1, &[]);
+        assert_eq!(engagement_range(&empty), 0.0);
     }
 
     #[test]

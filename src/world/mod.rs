@@ -1,3 +1,8 @@
+//! Mondo: terreno procedurale deterministico + ostacoli seedati.
+//!
+//! Setup `Startup` una volta per `Scenario`. Mappa 600x600 con corsie 7m e
+//! connettività garantita (`MAP_SEED`). Niente logica unità qui.
+
 use bevy::prelude::*;
 
 pub use crate::navigation::HALF_SIZE as GROUND_HALF_SIZE;

@@ -1,4 +1,9 @@
-//! Presentation perspective is independent from who may command each team.
+//! Sessione: chi comanda (`SessionControl`) vs cosa si guarda (`ViewState`).
+//!
+//! Ex `view.rs`: rinominato perché non è la telecamera (`camera::RtsCamera`)
+//! ma autorità + prospettiva. Osservare non dà comando; `transfer` non tocca
+//! ordini/produzione esistenti. Letto da `selection`/`orders`/`ai`/`ui`.
+
 use bevy::prelude::*;
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]

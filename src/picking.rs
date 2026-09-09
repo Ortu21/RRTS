@@ -1,3 +1,8 @@
+//! Picking matematico: ray→ground e ray→box, niente stato.
+//!
+//! Usato da `selection` (click/box) e `orders` (destinazioni). Gated su fog
+//! dai chiamanti, non qui.
+
 use bevy::prelude::*;
 
 use crate::world::GROUND_HALF_SIZE;

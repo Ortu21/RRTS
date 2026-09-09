@@ -1,11 +1,16 @@
+//! Selezione: drag/box/single, gated su fog e `session::SessionControl`.
+//!
+//! Solo stato selezione (`Selected`, `DragSelection`). Niente ordini qui.
+//! L'ispettore neutro non dà autorità di comando (vedi `session`).
+
 use bevy::{prelude::*, transform::TransformSystems, window::PrimaryWindow};
 
 use crate::{
     camera::RtsCamera,
     orders::PendingOrder,
     picking::ray_box_distance,
+    session::ViewState,
     units::{Selectable, SelectionRing, Team, UNIT_HALF_SIZE},
-    view::ViewState,
 };
 
 pub struct SelectionPlugin;
@@ -78,8 +83,8 @@ fn select_units(
     mut drag: ResMut<DragSelection>,
     pending: Res<PendingOrder>,
     input: Res<crate::ui::industry::MapInput>,
-    view: Res<ViewState>,
-    control: Option<Res<crate::view::SessionControl>>,
+    view_state: Res<ViewState>,
+    control: Option<Res<crate::session::SessionControl>>,
     mut inspected: ResMut<crate::ui::debug::Inspected>,
 ) {
     if keys.just_pressed(KeyCode::Escape) {
@@ -101,7 +106,7 @@ fn select_units(
     let can_select = |team: u8| {
         control
             .as_deref()
-            .map_or(team == view.team, |c| c.can_command(team))
+            .map_or(team == view_state.team, |c| c.can_command(team))
     };
     // While an order is being targeted, left clicks belong to the order
     // system (which runs first): selection stays frozen, no stale drag.

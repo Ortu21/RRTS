@@ -1,3 +1,11 @@
+//! UI presentazione: HUD + controlli nativi Bevy.
+//!
+//! - `shell` = layout top-bar/dock/sidebar, azioni sessione.
+//! - `industry` = construction/production/ordini contestuali (solo presentazione, decisioni in sim).
+//! - `debug` = overlay opt-in, mai usato dalla sim (l'AI non legge da qui).
+//!
+//! Vedi `DESIGN.md` + `PRODUCT.md` per vincoli.
+
 pub mod debug;
 pub mod industry;
 pub mod shell;
@@ -24,7 +32,7 @@ impl Plugin for UiPlugin {
             .init_resource::<debug::DebugSettings>()
             .init_resource::<debug::Inspected>()
             .init_resource::<shell::ShellState>()
-            .init_resource::<crate::view::ViewState>()
+            .init_resource::<crate::session::ViewState>()
             .add_systems(Startup, (setup_hud, shell::setup))
             .add_systems(PreUpdate, shell::actions.after(bevy::ui::UiSystems::Focus))
             .add_systems(

@@ -1,3 +1,8 @@
+//! Indice spaziale: uniform hash ricostruito ogni frame.
+//!
+//! Condiviso da avoidance locale (`movement`) e acquisizione target (`combat`).
+//! Solo lettura/ricostruzione: niente decisioni.
+
 use crate::{
     combat::ChaseTargets,
     navigation::PlanPaths,

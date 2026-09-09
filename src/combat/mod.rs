@@ -1,3 +1,9 @@
+//! Combattimento: HP, armi, targeting guidato da ordini, proiettili, morti.
+//!
+//! Regole BAR-style: `AttackMove` si ferma e riprende, `Move` spara marciando,
+//! `Hold`/`Idle` difendono in piedi. Targeting sempre gated su fog (`can_target`).
+//! I marker `Chasing`/`HoldFire` sono locomozione, l'intento resta in `orders::UnitOrder`.
+
 use bevy::prelude::*;
 
 use crate::{

@@ -85,7 +85,7 @@ fn ai_speed_keys(
     mut speed: ResMut<AiSpeed>,
     mut time: ResMut<Time<Virtual>>,
     config: Res<AiConfig>,
-    control: Option<Res<crate::view::SessionControl>>,
+    control: Option<Res<crate::session::SessionControl>>,
     debug: Option<Res<crate::ui::debug::DebugSettings>>,
 ) {
     if control

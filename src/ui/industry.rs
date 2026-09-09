@@ -7,9 +7,9 @@ use crate::{
     picking::ground_position,
     production::Factory,
     selection::{Selected, SelectionSystems},
+    session::ViewState,
     structures::{self, Building, Construction, Placement},
     units::{Builder, CollisionRadius, Team, Unit, UnitKind, archetype},
-    view::ViewState,
 };
 use bevy::{prelude::*, transform::TransformSystems, window::PrimaryWindow};
 
@@ -252,7 +252,7 @@ pub fn capture_pointer(
     interactions: Query<&Interaction, With<BlocksMap>>,
     mut input: ResMut<MapInput>,
     match_result: Option<Res<crate::game_over::MatchResult>>,
-    control: Option<Res<crate::view::SessionControl>>,
+    control: Option<Res<crate::session::SessionControl>>,
 ) {
     input.commands_allowed = !match_result.is_some_and(|r| r.over)
         && control.as_deref().is_none_or(|c| c.player_team().is_some());
@@ -849,7 +849,7 @@ mod tests {
             .init_asset::<StandardMaterial>()
             .init_asset::<Mesh>()
             .init_asset::<bevy::render::mesh::skinning::SkinnedMeshInverseBindposes>()
-            .insert_resource(crate::view::SessionControl::default())
+            .insert_resource(crate::session::SessionControl::default())
             .add_plugins((
                 CameraPlugin,
                 crate::ui::UiPlugin,
@@ -929,8 +929,8 @@ mod tests {
             ))
             .id();
         app.world_mut()
-            .resource_mut::<crate::view::SessionControl>()
-            .transfer(0, crate::view::Controller::Bot);
+            .resource_mut::<crate::session::SessionControl>()
+            .transfer(0, crate::session::Controller::Bot);
         app.update();
         // Deliberately retain Selected to prove permissions are enforced even
         // when a stale selection survives an external input producer.

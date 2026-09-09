@@ -2,6 +2,8 @@
 
 A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets. Gameplay depends only on Bevy; benchmark reporting and machine metadata additionally use serde/serde_json and sysinfo (benchmark-only code paths).
 
+> New here (human or AI)? Read `ARCHITECTURE.md` first: module map, ownership rules, determinism gates. Code imports from `rust_rts::...` (`src/lib.rs`); `src/main.rs` is composition only.
+
 HUD and window titles read the version from `Cargo.toml` (`env!("CARGO_PKG_VERSION")`); there is a single source of truth, no duplicated labels.
 
 ## Run and controls

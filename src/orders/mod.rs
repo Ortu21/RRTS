@@ -1,3 +1,8 @@
+//! Ordini: intento `UnitOrder` (Idle/Move/Attack/AttackMove/Hold/Patrol/Guard/Build).
+//!
+//! Owner dello stato ordini ECS. Un ordine sostituisce la route; `movement`
+//! attende il planning. Grafica ordini BAR-style in `orders::lines`.
+
 use bevy::{prelude::*, window::PrimaryWindow};
 
 pub mod lines;
@@ -9,8 +14,8 @@ use crate::{
     navigation::{NavGrid, Route},
     picking::{ground_position, ray_box_distance},
     selection::{Selected, SelectionSystems},
+    session::ViewState,
     units::{Builder, Team, UNIT_HALF_SIZE, Unit},
-    view::ViewState,
 };
 
 pub struct OrderPlugin;

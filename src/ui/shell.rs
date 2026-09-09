@@ -6,8 +6,8 @@ use super::{
 use crate::{
     combat::Health,
     selection::Selected,
+    session::{Controller, SessionControl, ViewState},
     units::{Team, Unit, UnitKind},
-    view::{Controller, SessionControl, ViewState},
 };
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},

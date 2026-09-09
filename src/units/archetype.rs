@@ -21,10 +21,17 @@ pub enum UnitKind {
     LightTank,
     HeavyTank2,
     Artillery2,
+    MgTank,
+    LaserTank,
+    RocketTank,
+    MissileTank,
+    MortarTank,
+    SkyArtillery,
+    Vanguard,
 }
 
 impl UnitKind {
-    pub const ALL: [UnitKind; 8] = [
+    pub const ALL: [UnitKind; 15] = [
         Self::Scout,
         Self::HeavyTank,
         Self::Artillery,
@@ -33,12 +40,19 @@ impl UnitKind {
         Self::LightTank,
         Self::HeavyTank2,
         Self::Artillery2,
+        Self::MgTank,
+        Self::LaserTank,
+        Self::RocketTank,
+        Self::MissileTank,
+        Self::MortarTank,
+        Self::SkyArtillery,
+        Self::Vanguard,
     ];
     /// Units buildable from factories. The Commander is unique: it spawns
     /// once per team as the initial builder/base and is never queued.
     /// The Engineer is the mobile builder, produced by the laboratory.
     /// Tier-2 units need a LabT2 (see `Archetype.tier` + `Factory.tier`).
-    pub const PRODUCIBLE: [UnitKind; 7] = [
+    pub const PRODUCIBLE: [UnitKind; 14] = [
         Self::Scout,
         Self::HeavyTank,
         Self::Artillery,
@@ -46,6 +60,13 @@ impl UnitKind {
         Self::LightTank,
         Self::HeavyTank2,
         Self::Artillery2,
+        Self::MgTank,
+        Self::LaserTank,
+        Self::RocketTank,
+        Self::MissileTank,
+        Self::MortarTank,
+        Self::SkyArtillery,
+        Self::Vanguard,
     ];
 
     pub fn index(self) -> usize {
@@ -61,6 +82,30 @@ impl UnitKind {
     }
 }
 
+/// Weapon technology: HOW a gun delivers damage. Data, never branching in
+/// systems: `fire_weapons`/`fire_secondary` match once on this to pick the
+/// projectile/behaviour, every number below stays in the table.
+/// - `Gun`: mitra & cannons. Point-targeted tracer with deterministic spread
+///   (radians, scaled by distance): stationary close targets still get hit,
+///   movers dodge, long range sprays. Semi-real, never super-precise.
+/// - `Laser`: instant beam + flash visual, no travel time, no projectile.
+/// - `Dumbfire`: fast straight rocket to the locked point, small splash.
+/// - `Homing`: steering missile tracking the locked entity (old behaviour).
+/// - `Mortar`: short-range arcing shell (visual parabola) with splash.
+/// - `TopAttack`: plunging strike from the sky onto the locked point,
+///   dodgeable while it falls, splash on impact.
+///
+/// New techs = new variants + one fire/move branch each; balance stays here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum WeaponTech {
+    Gun,
+    Laser,
+    Dumbfire,
+    Homing,
+    Mortar,
+    TopAttack,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Archetype {
     pub name: &'static str,
@@ -74,6 +119,15 @@ pub struct Archetype {
     pub damage: f32,
     pub projectile_speed: f32,
     pub acquisition: f32,
+    /// Primary weapon technology (see `WeaponTech`). Turrets have no profile
+    /// component and keep the legacy precise-homing path: zero drift there.
+    pub tech: WeaponTech,
+    /// Angular spread in radians for `Gun` (0 = precise). Deterministic per
+    /// (shooter, tick, gun): same battle replays bit-identically.
+    pub spread_rad: f32,
+    /// Splash radius on impact (0 = single target). Enemies only, never
+    /// friendly fire: the AI cannot be trusted with its own artillery yet.
+    pub splash: f32,
     /// Sight for fog of war: normally SMALLER than weapon range, so long
     /// guns need team spotters (vision is shared per team). Kept separate
     /// from acquisition, which stays long for coordinated engagements.
@@ -91,7 +145,7 @@ pub struct Archetype {
     pub tier: u8,
 }
 
-pub const ARCHETYPES: [Archetype; 8] = [
+pub const ARCHETYPES: [Archetype; 15] = [
     Archetype {
         name: "scout",
         max_health: 60.0,
@@ -104,6 +158,9 @@ pub const ARCHETYPES: [Archetype; 8] = [
         damage: 6.0,
         projectile_speed: 34.0,
         acquisition: 34.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.03,
+        splash: 0.0,
         sight: 11.0,
         body: Vec3::new(0.45, 0.6, 0.45),
         radius: 0.45,
@@ -124,6 +181,9 @@ pub const ARCHETYPES: [Archetype; 8] = [
         damage: 15.0,
         projectile_speed: 30.0,
         acquisition: 30.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.025,
+        splash: 0.0,
         sight: 15.0,
         body: Vec3::new(0.65, 0.9, 0.65),
         radius: 0.6,
@@ -144,6 +204,9 @@ pub const ARCHETYPES: [Archetype; 8] = [
         damage: 25.0,
         projectile_speed: 26.0,
         acquisition: 36.0,
+        tech: WeaponTech::Dumbfire,
+        spread_rad: 0.0,
+        splash: 1.5,
         sight: 24.0,
         body: Vec3::new(0.7, 0.9, 0.9),
         radius: 0.65,
@@ -164,6 +227,9 @@ pub const ARCHETYPES: [Archetype; 8] = [
         damage: 7.0,
         projectile_speed: 36.0,
         acquisition: 32.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.02,
+        splash: 0.0,
         sight: 17.0,
         // Very large hull: ~2.5x tank footprint, unmistakable on the field.
         body: Vec3::new(1.4, 1.6, 1.8),
@@ -185,6 +251,9 @@ pub const ARCHETYPES: [Archetype; 8] = [
         damage: 0.0,
         projectile_speed: 1.0,
         acquisition: 0.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.0,
+        splash: 0.0,
         sight: crate::economy::balance::ENGINEER_SIGHT,
         body: Vec3::new(0.5, 0.7, 0.55),
         radius: 0.5,
@@ -205,6 +274,9 @@ pub const ARCHETYPES: [Archetype; 8] = [
         damage: 4.0,
         projectile_speed: 34.0,
         acquisition: 28.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.035,
+        splash: 0.0,
         sight: 12.0,
         body: Vec3::new(0.45, 0.6, 0.5),
         radius: 0.45,
@@ -220,11 +292,14 @@ pub const ARCHETYPES: [Archetype; 8] = [
         hull_turn: 2.4,
         traverse: 2.6,
         aim_tolerance: 0.14,
-        range: 21.9,
-        cooldown: 1.3,
-        damage: 24.0,
-        projectile_speed: 30.0,
+        range: 22.0,
+        cooldown: 1.2,
+        damage: 22.0,
+        projectile_speed: 0.0,
         acquisition: 32.0,
+        tech: WeaponTech::Laser,
+        spread_rad: 0.0,
+        splash: 0.0,
         sight: 16.0,
         body: Vec3::new(0.8, 1.05, 0.8),
         radius: 0.7,
@@ -240,11 +315,14 @@ pub const ARCHETYPES: [Archetype; 8] = [
         hull_turn: 1.6,
         traverse: 1.8,
         aim_tolerance: 0.10,
-        range: 34.5,
-        cooldown: 3.0,
-        damage: 40.0,
-        projectile_speed: 26.0,
-        acquisition: 40.0,
+        range: 40.0,
+        cooldown: 3.6,
+        damage: 55.0,
+        projectile_speed: 30.0,
+        acquisition: 44.0,
+        tech: WeaponTech::TopAttack,
+        spread_rad: 0.0,
+        splash: 4.5,
         sight: 26.0,
         body: Vec3::new(0.85, 1.05, 1.05),
         radius: 0.75,
@@ -253,13 +331,176 @@ pub const ARCHETYPES: [Archetype; 8] = [
         build_radius: 0.0,
         tier: 2,
     },
+    Archetype {
+        name: "mg_tank",
+        max_health: 95.0,
+        speed: 7.0,
+        hull_turn: 3.0,
+        traverse: 4.0,
+        aim_tolerance: 0.15,
+        range: 16.0,
+        cooldown: 0.28,
+        damage: 3.0,
+        projectile_speed: 40.0,
+        acquisition: 22.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.055,
+        splash: 0.0,
+        sight: 13.0,
+        body: Vec3::new(0.5, 0.65, 0.55),
+        radius: 0.5,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "laser_tank",
+        max_health: 80.0,
+        speed: 6.0,
+        hull_turn: 2.5,
+        traverse: 5.0,
+        aim_tolerance: 0.06,
+        range: 20.0,
+        cooldown: 1.1,
+        damage: 11.0,
+        projectile_speed: 0.0,
+        acquisition: 26.0,
+        tech: WeaponTech::Laser,
+        spread_rad: 0.0,
+        splash: 0.0,
+        sight: 15.0,
+        body: Vec3::new(0.5, 0.7, 0.6),
+        radius: 0.5,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "rocket_tank",
+        max_health: 105.0,
+        speed: 5.5,
+        hull_turn: 2.2,
+        traverse: 2.8,
+        aim_tolerance: 0.12,
+        range: 26.0,
+        cooldown: 2.4,
+        damage: 26.0,
+        projectile_speed: 26.0,
+        acquisition: 30.0,
+        tech: WeaponTech::Dumbfire,
+        spread_rad: 0.0,
+        splash: 2.5,
+        sight: 17.0,
+        body: Vec3::new(0.6, 0.8, 0.7),
+        radius: 0.55,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "missile_tank",
+        max_health: 90.0,
+        speed: 6.0,
+        hull_turn: 2.5,
+        traverse: 3.0,
+        aim_tolerance: 0.12,
+        range: 26.0,
+        cooldown: 2.6,
+        damage: 20.0,
+        projectile_speed: 22.0,
+        acquisition: 32.0,
+        tech: WeaponTech::Homing,
+        spread_rad: 0.0,
+        splash: 0.0,
+        sight: 18.0,
+        body: Vec3::new(0.55, 0.75, 0.6),
+        radius: 0.55,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "mortar_tank",
+        max_health: 95.0,
+        speed: 4.2,
+        hull_turn: 1.6,
+        traverse: 2.0,
+        aim_tolerance: 0.14,
+        range: 12.0,
+        cooldown: 3.6,
+        damage: 34.0,
+        projectile_speed: 18.0,
+        acquisition: 18.0,
+        tech: WeaponTech::Mortar,
+        spread_rad: 0.0,
+        splash: 3.5,
+        sight: 10.0,
+        body: Vec3::new(0.6, 0.75, 0.7),
+        radius: 0.55,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "sky_artillery",
+        max_health: 85.0,
+        speed: 4.0,
+        hull_turn: 1.5,
+        traverse: 1.8,
+        aim_tolerance: 0.12,
+        range: 38.0,
+        cooldown: 4.2,
+        damage: 42.0,
+        projectile_speed: 30.0,
+        acquisition: 44.0,
+        tech: WeaponTech::TopAttack,
+        spread_rad: 0.0,
+        splash: 4.0,
+        sight: 24.0,
+        body: Vec3::new(0.7, 0.9, 0.9),
+        radius: 0.6,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 1,
+    },
+    Archetype {
+        name: "vanguard",
+        max_health: 260.0,
+        speed: 5.4,
+        hull_turn: 2.4,
+        traverse: 3.0,
+        aim_tolerance: 0.12,
+        range: 19.0,
+        cooldown: 0.5,
+        damage: 8.0,
+        projectile_speed: 36.0,
+        acquisition: 28.0,
+        tech: WeaponTech::Gun,
+        spread_rad: 0.03,
+        splash: 0.0,
+        sight: 16.0,
+        body: Vec3::new(0.8, 1.0, 0.85),
+        radius: 0.7,
+        armed: true,
+        build_power: 0.0,
+        build_radius: 0.0,
+        tier: 2,
+    },
 ];
 
-/// Secondary weapon (missiles) for the Commander. Prova: slow, long range,
-/// high damage. Kept as data next to the archetype table so balance edits
-/// never touch systems code. `None` for regular units.
+/// Secondary weapon spec (dual-gun units): same gun model as the primary
+/// (`WeaponTech` + ballistics), plus its own traverse/aim feel. `None` for
+/// regular units. Adding a dual-gun unit = one const + one match arm, systems
+/// read through `secondary_stats()` and never branch per-kind.
 #[derive(Debug, Clone, Copy)]
-pub struct SecondaryStats {
+pub struct SecondarySpec {
+    pub tech: WeaponTech,
     pub range: f32,
     pub cooldown: f32,
     pub damage: f32,
@@ -267,9 +508,12 @@ pub struct SecondaryStats {
     pub acquisition: f32,
     pub traverse: f32,
     pub aim_tolerance: f32,
+    pub spread_rad: f32,
+    pub splash: f32,
 }
 
-pub const COMMANDER_MISSILES: SecondaryStats = SecondaryStats {
+pub const COMMANDER_MISSILES: SecondarySpec = SecondarySpec {
+    tech: WeaponTech::Homing,
     range: 34.0,
     cooldown: 2.5,
     damage: 40.0,
@@ -277,11 +521,28 @@ pub const COMMANDER_MISSILES: SecondaryStats = SecondaryStats {
     acquisition: 36.0,
     traverse: 1.6,
     aim_tolerance: 0.12,
+    spread_rad: 0.0,
+    splash: 0.0,
 };
 
-pub fn secondary_stats(kind: UnitKind) -> Option<&'static SecondaryStats> {
+/// Vanguard dual mount: twin laser beside the mitra (see primary row).
+pub const VANGUARD_LASERS: SecondarySpec = SecondarySpec {
+    tech: WeaponTech::Laser,
+    range: 22.0,
+    cooldown: 1.4,
+    damage: 14.0,
+    projectile_speed: 0.0,
+    acquisition: 28.0,
+    traverse: 4.0,
+    aim_tolerance: 0.08,
+    spread_rad: 0.0,
+    splash: 0.0,
+};
+
+pub fn secondary_stats(kind: UnitKind) -> Option<&'static SecondarySpec> {
     match kind {
         UnitKind::Commander => Some(&COMMANDER_MISSILES),
+        UnitKind::Vanguard => Some(&VANGUARD_LASERS),
         _ => None,
     }
 }
@@ -327,7 +588,13 @@ mod tests {
                 assert!(stats.aim_tolerance > 0.0);
                 assert!(stats.range > 0.0 && stats.acquisition >= stats.range);
                 assert!(stats.cooldown > 0.0 && stats.damage > 0.0);
-                assert!(stats.projectile_speed > 0.0);
+                // Beams are instant: no projectile speed. Everything else
+                // must travel (headless sim spawns real projectiles).
+                if stats.tech == WeaponTech::Laser {
+                    assert_eq!(stats.projectile_speed, 0.0);
+                } else {
+                    assert!(stats.projectile_speed > 0.0);
+                }
                 // Vision is normally shorter than weapon range: long guns
                 // need team spotters (shared visibility).
                 assert!(stats.sight > 0.0 && stats.sight < stats.range);
@@ -380,6 +647,45 @@ mod tests {
                 .count(),
             10
         );
+    }
+
+    #[test]
+    fn weapon_roster_covers_every_tech_once_per_tier1() {
+        use WeaponTech::*;
+        // One T1 troop per technology, tier-2 keeps heavies re-teched plus
+        // the dual-gun Vanguard (mitra + laser).
+        let tech_of = |k: UnitKind| archetype(k).tech;
+        assert_eq!(tech_of(UnitKind::MgTank), Gun);
+        assert_eq!(tech_of(UnitKind::LaserTank), Laser);
+        assert_eq!(tech_of(UnitKind::RocketTank), Dumbfire);
+        assert_eq!(tech_of(UnitKind::MissileTank), Homing);
+        assert_eq!(tech_of(UnitKind::MortarTank), Mortar);
+        assert_eq!(tech_of(UnitKind::SkyArtillery), TopAttack);
+        assert_eq!(tech_of(UnitKind::HeavyTank2), Laser);
+        assert_eq!(tech_of(UnitKind::Artillery2), TopAttack);
+        assert_eq!(tech_of(UnitKind::Vanguard), Gun);
+        for k in UnitKind::ALL {
+            assert_eq!(
+                archetype(k).tier == 2,
+                matches!(
+                    k,
+                    UnitKind::HeavyTank2 | UnitKind::Artillery2 | UnitKind::Vanguard
+                ),
+                "{k:?}"
+            );
+        }
+        // Splash only where the design says so; spread only on guns.
+        assert!(archetype(UnitKind::MgTank).spread_rad > 0.0);
+        assert!(archetype(UnitKind::MortarTank).splash > 0.0);
+        assert!(archetype(UnitKind::SkyArtillery).splash > 0.0);
+        assert_eq!(archetype(UnitKind::LaserTank).splash, 0.0);
+        assert_eq!(archetype(UnitKind::MissileTank).spread_rad, 0.0);
+        // Dual-gun units: commander missiles + vanguard lasers, nobody else.
+        assert!(secondary_stats(UnitKind::Commander).is_some());
+        assert!(secondary_stats(UnitKind::Vanguard).is_some());
+        assert_eq!(secondary_stats(UnitKind::Vanguard).unwrap().tech, Laser);
+        assert!(secondary_stats(UnitKind::HeavyTank).is_none());
+        assert!(secondary_stats(UnitKind::HeavyTank2).is_none());
     }
 
     #[test]

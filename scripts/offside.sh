@@ -67,9 +67,9 @@ cmd_run() {
     [ -f "$dir/Cargo.toml" ] || { echo "dir non valida: $dir"; exit 1; }
     local started; started="$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Il comando va in cmd.sh (una sola stringa, quotata dal chiamante se
-    # contiene pipe/redirect); il wrapper salva l'exit code in EXIT e, se
-    # killato, marca 143 (cancel).
-    printf '%s\n' "$*" > "$rd/cmd.sh"
+    # contiene pipe/redirect); eseguito dentro --dir. Il wrapper salva
+    # l'exit code in EXIT e, se killato, marca 143 (cancel).
+    printf 'cd %q && %s\n' "$dir" "$*" > "$rd/cmd.sh"
     chmod +x "$rd/cmd.sh"
     # wrapper: esegue cmd.sh, salva l'exit code in EXIT.
     # (niente setsid: non esiste su macOS; nohup+disown basta: il processo

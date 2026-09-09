@@ -26,6 +26,47 @@ pub fn effective_dps(kind: UnitKind) -> f32 {
     dps
 }
 
+/// Fase A step 1 — gittata massima d'ingaggio (primaria e secondaria):
+/// oltre non si colpisce. Pura. (Nessun chiamante oltre i test: il cablaggio
+/// nel predittore è lo step 2, con calibrazione sui dati torneo.)
+#[allow(dead_code)]
+pub fn max_range(kind: UnitKind) -> f32 {
+    let stats = crate::units::archetype(kind);
+    if !stats.armed {
+        return 0.0;
+    }
+    let mut range = stats.range;
+    if let Some(sec) = crate::units::archetype::secondary_stats(kind) {
+        range = range.max(sec.range);
+    }
+    range
+}
+
+/// Fase A step 1 — DPS erogabile a distanza `dist` (gating fisico: fuori
+/// gittata il cannone non colpisce, dentro rende pieno). Primaria e
+/// secondaria valutate sulle rispettive gittate. Pura e deterministica.
+/// (Statico: l'avvicinamento durante l'orizzonte è step 2.)
+#[allow(dead_code)]
+pub fn dps_at_range(kind: UnitKind, dist: f32) -> f32 {
+    if !dist.is_finite() || dist < 0.0 {
+        return 0.0;
+    }
+    let stats = crate::units::archetype(kind);
+    if !stats.armed {
+        return 0.0;
+    }
+    let mut dps = 0.0;
+    if dist <= stats.range {
+        dps += stats.damage / stats.cooldown.max(0.05);
+    }
+    if let Some(sec) = crate::units::archetype::secondary_stats(kind)
+        && dist <= sec.range
+    {
+        dps += (sec.damage / sec.cooldown.max(0.05)) * 0.7;
+    }
+    dps
+}
+
 /// Priorità di focus per un bersaglio: minaccia (dps × counter contro il
 /// nostro kind primario). A pari priorità decide lo hp (vedi strategia).
 pub fn target_priority(kind: UnitKind, vs: UnitKind) -> f32 {
@@ -59,17 +100,43 @@ pub fn predict_outcome(my: &[(UnitKind, f32)], foe: &[(UnitKind, f32)]) -> f32 {
         deal_damage(&mut theirs, my_dps * SIM_DT);
         deal_damage(&mut mine, foe_dps * SIM_DT);
     }
-    let my_left: f32 = mine.iter().map(|(_, hp)| hp).sum();
-    let foe_left: f32 = theirs.iter().map(|(_, hp)| hp).sum();
-    let my_frac = my_left / my_total;
-    let foe_frac = foe_left / foe_total;
-    let denom = my_frac + foe_frac;
-    // NaN esplicito: `<=` su NaN è falso e propagherebbe NaN nel clamp.
-    if !denom.is_finite() || denom <= 0.0 {
-        0.5
-    } else {
-        (my_frac / denom).clamp(0.0, 1.0)
+    finish_score(&mine, &theirs, my_total, foe_total)
+}
+
+/// Fase A step 2 — fast-forward range-aware: come `predict_outcome`, ma da
+/// distanza iniziale `dist` che si chiude a `closing_speed` (difensore fermo)
+/// e con ogni cannone gated sulla sua gittata. La dinamica che decide gli
+/// assedi (lunghi che picchiano da fuori, corti che incassano avvicinandosi)
+/// emerge dal sim, non da costanti.
+/// `dist` non-finita/≤0 (sconosciuta/cieca) = mischia immediata, bit-identica
+/// a `predict_outcome` (test di continuità). Pura e deterministica.
+pub fn predict_outcome_at_range(my: &[(UnitKind, f32)], foe: &[(UnitKind, f32)], dist: f32) -> f32 {
+    let mut mine = sanitized(my);
+    let mut theirs = sanitized(foe);
+    let my_total: f32 = mine.iter().map(|(_, hp)| hp).sum();
+    let foe_total: f32 = theirs.iter().map(|(_, hp)| hp).sum();
+    if my_total <= 0.0 && foe_total <= 0.0 {
+        return 0.5;
     }
+    if my_total <= 0.0 {
+        return 0.0;
+    }
+    if foe_total <= 0.0 {
+        return 1.0;
+    }
+    let mut d = if dist.is_finite() { dist.max(0.0) } else { 0.0 };
+    let close = closing_speed(&mine);
+    for _ in 0..SIM_STEPS {
+        if mine.is_empty() || theirs.is_empty() {
+            break;
+        }
+        let my_dps = side_dps_at_range(&mine, &theirs, d);
+        let foe_dps = side_dps_at_range(&theirs, &mine, d);
+        deal_damage(&mut theirs, my_dps * SIM_DT);
+        deal_damage(&mut mine, foe_dps * SIM_DT);
+        d = (d - close * SIM_DT).max(0.0);
+    }
+    finish_score(&mine, &theirs, my_total, foe_total)
 }
 
 /// Filtra hp non-finiti/≤0 e ordina per (kind, hp): risultato indipendente
@@ -108,6 +175,66 @@ fn side_dps(units: &[(UnitKind, f32)], foe: &[(UnitKind, f32)]) -> f32 {
         .sum()
 }
 
+/// Fase A step 2 — DPS del lato a distanza `dist`: come `side_dps`, ma ogni
+/// cannone spara solo dentro la sua gittata (`dps_at_range`). Oltre gittata
+/// il lato tace (assedi e kiting emergono dal fast-forward, non da costanti).
+/// Pura e deterministica.
+fn side_dps_at_range(units: &[(UnitKind, f32)], foe: &[(UnitKind, f32)], dist: f32) -> f32 {
+    let foe_total: f32 = foe.iter().map(|(_, hp)| hp).sum();
+    units
+        .iter()
+        .map(|(kind, _)| {
+            let edge = if foe_total > 0.0 {
+                foe.iter()
+                    .map(|(fk, fhp)| counter_mult(*kind, *fk) * fhp)
+                    .sum::<f32>()
+                    / foe_total
+            } else {
+                1.0
+            };
+            dps_at_range(*kind, dist) * edge
+        })
+        .sum()
+}
+
+/// Fase A step 2 — velocità di chiusura (coesione: avanza il più lento degli
+/// armati; il difensore tiene la posizione). Ipotesi conservativa per chi
+/// attacca: sovrastima il tempo esposto fuori gittata, quindi sottostima la
+/// win_prob contro difese lunghe — meno suicidi, mai più. 0 senza armati.
+/// Pura.
+pub fn closing_speed(my: &[(UnitKind, f32)]) -> f32 {
+    my.iter()
+        .map(|(kind, _)| *kind)
+        .filter(|k| crate::units::archetype(*k).armed)
+        .map(|k| crate::units::archetype(k).speed)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .fold(None, |acc: Option<f32>, s| {
+            Some(acc.map_or(s, |a: f32| a.min(s)))
+        })
+        .unwrap_or(0.0)
+}
+
+/// Punteggio finale 0..1 da hp residui (frazioni sul totale iniziale).
+/// Singola matematica per entrambi i predittori: mai divergono.
+fn finish_score(
+    mine: &[(UnitKind, f32)],
+    theirs: &[(UnitKind, f32)],
+    my_total: f32,
+    foe_total: f32,
+) -> f32 {
+    let my_left: f32 = mine.iter().map(|(_, hp)| hp).sum();
+    let foe_left: f32 = theirs.iter().map(|(_, hp)| hp).sum();
+    let my_frac = my_left / my_total;
+    let foe_frac = foe_left / foe_total;
+    let denom = my_frac + foe_frac;
+    // NaN esplicito: `<=` su NaN è falso e propagherebbe NaN nel clamp.
+    if !denom.is_finite() || denom <= 0.0 {
+        0.5
+    } else {
+        (my_frac / denom).clamp(0.0, 1.0)
+    }
+}
+
 /// Applica danno ai più feriti prima (ordinamento stabile deterministico).
 fn deal_damage(units: &mut Vec<(UnitKind, f32)>, mut dmg: f32) {
     // NaN esplicito: danno non-finito = nessun danno (mai propagato).
@@ -137,12 +264,113 @@ mod tests {
         vec![(UnitKind::HeavyTank, hp); n]
     }
 
+    fn one(kind: UnitKind) -> Vec<(UnitKind, f32)> {
+        vec![(kind, crate::units::archetype(kind).max_health)]
+    }
+
+    #[test]
+    fn range_blind_equals_melee_bit_identical() {
+        // Continuità: distanza sconosciuta = vecchia matematica esatta.
+        let a = vec![
+            (UnitKind::HeavyTank, 170.0),
+            (UnitKind::LightTank, 70.0),
+            (UnitKind::Artillery, 80.0),
+        ];
+        let foe = heavies(2);
+        for dist in [0.0, -5.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                predict_outcome_at_range(&a, &foe, dist).to_bits(),
+                predict_outcome(&a, &foe).to_bits(),
+                "dist {dist}"
+            );
+        }
+        // Anche simmetrico resta 0.5 a qualsiasi distanza.
+        assert_eq!(
+            predict_outcome_at_range(&heavies(3), &heavies(3), 25.0).to_bits(),
+            0.5f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn range_rewards_long_guns_monotonically() {
+        // 2 arty (30m) vs 1 heavy (19m): più distanza iniziale = più danno
+        // gratis prima del trade = win_prob monotona in distanza. A 0m è
+        // quasi parità vinta di misura, da 30m è dominanza.
+        let foe = one(UnitKind::HeavyTank);
+        let mine = vec![
+            (
+                UnitKind::Artillery,
+                crate::units::archetype(UnitKind::Artillery).max_health,
+            ),
+            (
+                UnitKind::Artillery,
+                crate::units::archetype(UnitKind::Artillery).max_health,
+            ),
+        ];
+        let p0 = predict_outcome_at_range(&mine, &foe, 0.0);
+        let p25 = predict_outcome_at_range(&mine, &foe, 25.0);
+        let p30 = predict_outcome_at_range(&mine, &foe, 30.0);
+        assert!(p0 > 0.5, "2v1 in mischia parte sopra: {p0}");
+        assert!(p25 > p0, "distanza aiuta i lunghi: {p25} > {p0}");
+        assert!(p30 > p25, "ancora distanza, ancora meglio: {p30} > {p25}");
+        assert!(p30 > 0.8, "da fuori gittata nemica è dominanza: {p30}");
+    }
+
+    #[test]
+    fn closing_speed_is_slowest_armed_or_zero() {
+        let hp = 100.0;
+        let mix = vec![
+            (UnitKind::HeavyTank, hp),
+            (UnitKind::Artillery, hp),
+            (UnitKind::Scout, hp),
+        ];
+        let min = [
+            crate::units::archetype(UnitKind::HeavyTank).speed,
+            crate::units::archetype(UnitKind::Artillery).speed,
+            crate::units::archetype(UnitKind::Scout).speed,
+        ]
+        .into_iter()
+        .fold(f32::INFINITY, f32::min);
+        assert!((closing_speed(&mix) - min).abs() < 1e-6);
+        assert_eq!(closing_speed(&[]), 0.0);
+        assert_eq!(closing_speed(&[(UnitKind::Engineer, hp)]), 0.0);
+    }
+
     #[test]
     fn dps_weights_tank_over_scout_and_ignores_engineer() {
         let tank = effective_dps(UnitKind::HeavyTank);
         let scout = effective_dps(UnitKind::Scout);
         assert!(tank > scout && scout > 0.0);
         assert_eq!(effective_dps(UnitKind::Engineer), 0.0);
+    }
+
+    #[test]
+    fn range_gates_dps_arty_outranges_heavy() {
+        // Heavy 19m, Arty 30m: a 25m l'arty picchia piena, l'heavy zero.
+        assert!(dps_at_range(UnitKind::Artillery, 25.0) > 0.0);
+        assert_eq!(dps_at_range(UnitKind::HeavyTank, 25.0), 0.0);
+        // Dentro le gittate: pieno come `effective_dps`.
+        assert_eq!(
+            dps_at_range(UnitKind::HeavyTank, 10.0),
+            effective_dps(UnitKind::HeavyTank)
+        );
+        assert_eq!(
+            dps_at_range(UnitKind::Artillery, 10.0),
+            effective_dps(UnitKind::Artillery)
+        );
+        // Secondaria Commander (missili 34m): oltre i 20m del cannone resta
+        // solo il contributo missili, oltre i 34m zero.
+        let cmd_full = effective_dps(UnitKind::Commander);
+        assert!(dps_at_range(UnitKind::Commander, 25.0) > 0.0);
+        assert!(dps_at_range(UnitKind::Commander, 25.0) < cmd_full);
+        assert_eq!(dps_at_range(UnitKind::Commander, 40.0), 0.0);
+        // Gittate massime e casi sporchi.
+        assert_eq!(max_range(UnitKind::Commander), 34.0);
+        assert_eq!(max_range(UnitKind::Artillery), 30.0);
+        assert_eq!(max_range(UnitKind::Engineer), 0.0);
+        assert_eq!(dps_at_range(UnitKind::Engineer, 5.0), 0.0);
+        assert_eq!(dps_at_range(UnitKind::HeavyTank, f32::NAN), 0.0);
+        assert_eq!(dps_at_range(UnitKind::HeavyTank, -3.0), 0.0);
     }
 
     #[test]

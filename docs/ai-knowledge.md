@@ -10,7 +10,7 @@ vault = perché / cosa imparato / cosa scartato. Il vault linka al codice con
 
 Spec madre: `docs/ai-advanced-plan.md` (fasi 0.0.18 → 0.0.21, paletti trasversali).
 Dettagli per fase: `docs/ai/018-macro-planner.md`, `019-scout-opponent.md`,
-`021-difficulty-suite.md`.
+`021-difficulty-suite.md`, `022-utility-full.md`.
 
 ## Fonti Tier0 (leggere prima, tutte gratuite su gameaipro.com)
 

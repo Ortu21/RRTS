@@ -19,4 +19,8 @@
     attack_at_tick: 18446744073709551615,
     scout_threat_weight: 1.2,
     commander_commit_prob: 0.95,
+    w_build: 1.0,
+    w_enqueue: 1.0,
+    w_scout: 1.0,
+    w_defense: 1.0,
 )

@@ -26,6 +26,7 @@ pub mod scout;
 pub mod snapshot;
 pub mod strategy;
 pub mod threat;
+pub mod utility;
 
 use crate::{
     combat::Health,
@@ -168,6 +169,19 @@ pub struct AiState {
     pub per_team: BTreeMap<u8, AiTeamStats>,
     /// 0.0.20 — ultima ondata lanciata per team (catch-up: vedi `decide`).
     pub last_wave: BTreeMap<u8, u64>,
+    /// Punto 1 — win_prob al lancio di ogni ondata *contata* (una per periodo).
+    /// Serie corta (<= periodi del match): calibrazione courage dai dati veri.
+    pub fire_win_probs: BTreeMap<u8, Vec<f32>>,
+}
+
+/// Punto 1 — avanza il contatore onde: conta solo il passaggio a un nuovo
+/// periodo (`wave_id > last`), mai le riemissioni `force_attack` dentro lo
+/// stesso periodo (gonfiavano il contatore a centinaia). Puro.
+pub fn note_wave_fired(last_wave_id: u64, tick: u64) -> (u64, bool) {
+    let id = strategy::wave_id(tick);
+    // `max` difensivo: se il tick snapshot mai andasse indietro (reset),
+    // l'ondata non resta soppressa per un intero periodo.
+    (id.max(last_wave_id), id > last_wave_id)
 }
 
 impl AiState {
@@ -387,14 +401,22 @@ fn ai_tick(
             all_intent_labels.extend(intents.iter().map(|i| format!("M{}:{i:?}", brain.team)));
         }
         // 0.0.20 — catch-up onde: l'ondata lanciata consuma il periodo.
+        // Punto 1 — conta solo il passaggio di periodo (mai le riemissioni).
         if intents
             .iter()
             .any(|i| matches!(i, strategy::AiIntent::AttackMoveGroup { .. }))
         {
-            state
-                .last_wave
-                .insert(brain.team, strategy::wave_id(snapshot.tick));
-            state.stats_mut(brain.team).waves_launched += 1;
+            let prev = state.last_wave.get(&brain.team).copied().unwrap_or(0);
+            let (next, counted) = note_wave_fired(prev, snapshot.tick);
+            state.last_wave.insert(brain.team, next);
+            if counted {
+                state.stats_mut(brain.team).waves_launched += 1;
+                state
+                    .fire_win_probs
+                    .entry(brain.team)
+                    .or_default()
+                    .push(strategy::win_prob_of(snapshot));
+            }
         }
         if intents.is_empty() {
             continue;
@@ -574,6 +596,21 @@ mod tests {
     };
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
+
+    /// Punto 1 — il contatore onde scatta solo al passaggio di periodo:
+    /// riemissioni `force_attack` dentro lo stesso periodo non contano.
+    #[test]
+    fn wave_counter_counts_period_transitions_only() {
+        // Periodo 300 tick snapshot: 0..299 = id 0, 300..599 = id 1.
+        assert_eq!(note_wave_fired(0, 0), (0, false));
+        assert_eq!(note_wave_fired(0, 300), (1, true));
+        // Riemissione nello stesso periodo: aggiorna ma non conta.
+        assert_eq!(note_wave_fired(1, 301), (1, false));
+        assert_eq!(note_wave_fired(1, 599), (1, false));
+        assert_eq!(note_wave_fired(1, 600), (2, true));
+        // Tick indietro (reset): mai soppressione, mai doppio conteggio.
+        assert_eq!(note_wave_fired(2, 10), (2, false));
+    }
 
     /// Smoke test 1v1: entrambi i Commander costruiscono senza panico e senza
     /// barare (snapshot isolati per team). Veloce: 600 tick bastano per i siti.

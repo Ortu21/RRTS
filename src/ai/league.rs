@@ -319,6 +319,10 @@ pub struct TeamSample {
     pub micro_orders: u64,
     #[serde(default)]
     pub commander_alive: bool,
+    /// Punto 1 — win_prob Lanchester dello snapshot a questo campione
+    /// (-1.0 = nessun cervello/snapshot per il team).
+    #[serde(default)]
+    pub win_prob: f32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -385,6 +389,12 @@ pub(crate) fn sample_teams(world: &mut World, tick: usize) -> MatchSample {
             .query_filtered::<(&Team, &Health), (With<Unit>, With<crate::units::Commander>)>()
             .iter(world)
             .any(|(t, h)| t.0 == id && h.current > 0.0);
+        // Punto 1 — win_prob onesta dallo snapshot del team (mai query dirette).
+        let win_prob = world
+            .get_resource::<super::AiSnapshots>()
+            .and_then(|s| s.0.get(&id))
+            .map(strategy::win_prob_of)
+            .unwrap_or(-1.0);
         let (blocked_factories, queued_units) = world
             .query_filtered::<(&Team, &crate::production::Factory), With<Building>>()
             .iter(world)
@@ -412,6 +422,7 @@ pub(crate) fn sample_teams(world: &mut World, tick: usize) -> MatchSample {
             waves_launched,
             micro_orders,
             commander_alive,
+            win_prob,
         }
     };
     MatchSample {
@@ -438,6 +449,9 @@ pub struct MatchGame {
     pub waves: [u64; 2],
     #[serde(default)]
     pub commander_alive: [bool; 2],
+    /// Punto 1 — win_prob a ogni ondata contata (serie corta, calibrazione).
+    #[serde(default)]
+    pub fire_win_probs: [Vec<f32>; 2],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,6 +564,16 @@ pub fn run_match(case: &MatchCase, repeat: usize, ticks_cap: usize) -> MatchGame
             samples.last().is_some_and(|s| s.blue.commander_alive),
             samples.last().is_some_and(|s| s.red.commander_alive),
         ],
+        fire_win_probs: app
+            .world()
+            .get_resource::<super::AiState>()
+            .map(|s| {
+                [
+                    s.fire_win_probs.get(&0).cloned().unwrap_or_default(),
+                    s.fire_win_probs.get(&1).cloned().unwrap_or_default(),
+                ]
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -811,6 +835,8 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // Punto 2 — ondate e sopravvivenza capitale (solo osservazione).
     let mut waves: Vec<f64> = vec![];
     let mut commander_alive_rate: Vec<f64> = vec![];
+    // Punto 1 — win_prob ai lanci contati (solo osservazione).
+    let mut fire_probs: Vec<f64> = vec![];
     for case in &cases {
         for game in &case.games {
             if let Some(t) = game.first_blood_tick {
@@ -824,6 +850,7 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                     as f64
                     / 2.0,
             );
+            fire_probs.extend(game.fire_win_probs.iter().flatten().map(|p| *p as f64));
             if let Some(last) = game.samples.last() {
                 explored.push(last.blue.explored_pct.max(last.red.explored_pct) * 100.0);
                 threats.push(last.blue.threat_max.max(last.red.threat_max));
@@ -838,6 +865,7 @@ pub fn run_suite(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         ("median_threat_max", threats),
         ("median_waves", waves),
         ("commander_survival_rate", commander_alive_rate),
+        ("median_fire_win_prob", fire_probs),
     ] {
         values.sort_by(f64::total_cmp);
         let median = if values.is_empty() {

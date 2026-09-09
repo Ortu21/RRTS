@@ -541,6 +541,14 @@ fn estimate_forces(snapshot: &AiSnapshot) -> ForcePair {
     (my_list, foe_list)
 }
 
+/// Punto 1 — win_prob Lanchester dello snapshot (stessa `estimate_forces` di
+/// `decide`/`decide_micro`): telemetria e calibrazione courage dai dati veri.
+/// Pura e deterministica.
+pub fn win_prob_of(snapshot: &AiSnapshot) -> f32 {
+    let (my_list, foe_list) = estimate_forces(snapshot);
+    super::combat::predict_outcome(&my_list, &foe_list)
+}
+
 /// Kind armato proprio più numeroso (primario) per il focus: pareggi → indice
 /// minore. Fallback HeavyTank se nessun armato (deterministico comunque).
 fn my_primary_kind(snapshot: &AiSnapshot) -> UnitKind {
@@ -583,8 +591,14 @@ pub fn is_arty_role(kind: UnitKind) -> bool {
 /// 0.0.20 — gruppo d'ondata: linea sana (niente scout, niente Commander, niente
 /// arty ferite, mai builder sul sito), ordinato per bits. Il Commander si
 /// aggiunge SOLO se `win_prob > commander_commit_prob` E la linea non è vuota
-/// (il capitale non forma mai un'ondata da solo). Puro e deterministico.
-pub fn wave_group(snapshot: &AiSnapshot, personality: &Personality, win_prob: f32) -> Vec<Entity> {
+/// E la base NON è minacciata (il capitale non si gioca nelle mischie
+/// difensive: lì ripiega col micro, vedi `decide_micro`). Puro e deterministico.
+pub fn wave_group(
+    snapshot: &AiSnapshot,
+    personality: &Personality,
+    win_prob: f32,
+    base_threatened: bool,
+) -> Vec<Entity> {
     let mut group: Vec<Entity> = snapshot
         .my_units
         .iter()
@@ -601,8 +615,10 @@ pub fn wave_group(snapshot: &AiSnapshot, personality: &Personality, win_prob: f3
         .map(|u| u.entity)
         .collect();
     group.sort_by_key(|e| e.to_bits());
-    // Commit del capitale: solo con vittoria quasi certa e scorta presente.
-    if !group.is_empty() && win_prob > personality.commander_commit_prob {
+    // Commit del capitale: solo con vittoria quasi certa, scorta presente e
+    // base libera (mai nelle mischie difensive: il torneo mostra il Commander
+    // perso proprio lì anche oltre soglia 0.95).
+    if !group.is_empty() && !base_threatened && win_prob > personality.commander_commit_prob {
         let mut capitals: Vec<Entity> = snapshot
             .my_units
             .iter()
@@ -852,35 +868,50 @@ pub fn decide(
         }
     }
 
-    // 3. Tattica 0.0.17/0.0.20 — courage predittivo (Lanchester) a ONDE:
-    // l'ondata parte alla prima prontezza di ogni periodo (~75s) se la
-    // win_prob supera il courage effettivo (base + shift opponent ±0.1),
-    // oppure a tempo fisso per le baseline scripted (bypassano il cancello
-    // d'ondata, mai quello di difesa). Se bassa, resta a casa (niente
-    // rinforzi suicidi). Con la base minacciata niente ondata: richiamo
-    // difensivo, il micro scherma a casa. La stima unisce vista live e
-    // ricordi freschi pesati per età; alla cieca resta la massa critica.
+    // 3. Tattica utility (Punto 2): `opportunity = win_prob × readiness ×
+    // safety` (prodotto fuzzy-AND, vedi `utility.rs`) confrontata con il
+    // `courage` effettivo (base + shift opponent ±0.1). Sostituisce il cancello
+    // booleano 0.0.17 e il ramo cieco separato (alla cieca soglia +2 in curva).
+    // Baseline scripted a tempo fisso come prima (bypassano il cancello
+    // d'ondata, mai quello di difesa). Il richiamo difensivo non è
+    // più un muro: minacciati ma dominanti si contrattacca (`safety → 1`).
     let army_count = snapshot.army().len();
     let (my_list, foe_list) = estimate_forces(snapshot);
     let win_prob = super::combat::predict_outcome(&my_list, &foe_list);
-    let power_ok = if snapshot.visible_enemies.is_empty() && !has_fresh_eyes(snapshot) {
-        // Nemico mai visto: serve massa critica per marciare alla cieca.
-        // Saturating: soglie "mai" (usize::MAX delle baseline) non devono
-        // andare in overflow.
-        army_count >= personality.army_threshold.saturating_add(2)
-    } else {
-        win_prob > courage && army_count >= personality.army_threshold
-    };
+    let threatened = base_under_threat(snapshot, scenario);
+    // Alla cieca (mai visto il nemico: `win_prob` è 1.0 a vuoto) serve la massa
+    // critica di prima: soglia effettiva +2, in curva invece che in ramo morto.
+    // Saturating: soglie "mai" (usize::MAX delle baseline) non vanno in overflow.
+    let blind = snapshot.visible_enemies.is_empty() && !has_fresh_eyes(snapshot);
+    let threshold_eff = personality
+        .army_threshold
+        .saturating_add(if blind { 2 } else { 0 });
+    let opportunity =
+        super::utility::attack_opportunity(win_prob, army_count, threshold_eff, threatened);
+    let power_ok = opportunity > courage;
     let force_attack = army_count > 0 && snapshot.tick >= personality.attack_at_tick;
     let on_wave = is_wave_tick(snapshot.tick);
     // Catch-up: prima prontezza di ogni periodo (vedi doc di `decide`).
     let wave_due = on_wave || wave_id(snapshot.tick) > last_wave_id;
-    if ((power_ok && wave_due) || force_attack) && !base_under_threat(snapshot, scenario) {
-        let group = wave_group(snapshot, personality, win_prob);
+    // Minacciati: niente ondata programmata verso la base nemica (richiamo
+    // difensivo), MA se dominanti si contrattacca SULLA minaccia in casa
+    // (centroide visibile: l'AttackMove ingaggia strada facendo). Le baseline
+    // scripted restano richiamate sempre (niente micro difensivo a coprirle).
+    let push_threatened =
+        threatened && power_ok && wave_due && visible_centroid(snapshot).is_some();
+    let scheduled = power_ok && wave_due && !threatened;
+    let scripted = force_attack && !threatened;
+    if scheduled || scripted || push_threatened {
+        let destination = if push_threatened {
+            visible_centroid(snapshot).unwrap_or_else(|| attack_destination(snapshot, scenario))
+        } else {
+            attack_destination(snapshot, scenario)
+        };
+        let group = wave_group(snapshot, personality, win_prob, threatened);
         if !group.is_empty() {
             intents.push(AiIntent::AttackMoveGroup {
                 units: group,
-                destination: attack_destination(snapshot, scenario),
+                destination,
             });
         }
     }
@@ -2710,8 +2741,40 @@ mod tests {
     #[test]
     fn wave_recalls_when_base_threatened() {
         use crate::units::archetype;
-        // Stessa forza dominante, ma nemico in casa (entro 120m): niente
-        // ondata, il micro scherma a casa (richiamo difensivo).
+        // Nemico in casa (entro 120m da (260, 260)): a parità niente ondata,
+        // il micro scherma a casa (richiamo difensivo).
+        let max = archetype(UnitKind::HeavyTank).max_health;
+        let raider = || super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(900),
+            pos: Vec3::new(230.0, 0.0, 230.0),
+            kind: UnitKind::HeavyTank,
+            health: max,
+        };
+        let mut even = armed_snapshot(1, &[(UnitKind::HeavyTank, max, UnitOrder::Idle)]);
+        even.visible_enemies.push(raider());
+        assert!(base_under_threat(&even, Scenario::Playground));
+        even.tick = 300;
+        let intents = decide(&even, &Personality::RUSHER, Scenario::Playground, &[], 0);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. })),
+            "a parità minacciati l'ondata resta a casa: {intents:?}"
+        );
+        // Il micro invece scherma: linea a casa.
+        let micro = decide_micro(&even, &Personality::RUSHER, Scenario::Playground);
+        assert!(
+            micro.iter().any(|i| matches!(i, AiIntent::Screen { .. })),
+            "schermo a casa: {micro:?}"
+        );
+    }
+
+    #[test]
+    fn dominant_counter_pushes_onto_threat_at_home() {
+        use crate::units::archetype;
+        // Punto 2 — stessa minaccia in casa, ma dominanti 4v1: il richiamo non
+        // è più un muro, si contrattacca SULLA minaccia (centroide visibile),
+        // senza capitale (qui assente comunque).
         let max = archetype(UnitKind::HeavyTank).max_health;
         let mut snap = armed_snapshot(
             1,
@@ -2722,7 +2785,6 @@ mod tests {
                 (UnitKind::HeavyTank, max, UnitOrder::Idle),
             ],
         );
-        // Casa team 1 = (260, 260): nemico a 50m dentro il raggio.
         snap.visible_enemies.push(super::super::snapshot::AiEnemy {
             entity: Entity::from_bits(900),
             pos: Vec3::new(230.0, 0.0, 230.0),
@@ -2732,17 +2794,14 @@ mod tests {
         assert!(base_under_threat(&snap, Scenario::Playground));
         snap.tick = 300;
         let intents = decide(&snap, &Personality::RUSHER, Scenario::Playground, &[], 0);
+        let dest = intents.iter().find_map(|i| match i {
+            AiIntent::AttackMoveGroup { destination, .. } => Some(*destination),
+            _ => None,
+        });
+        let dest = dest.expect("dominanti: contrattacco sulla minaccia");
         assert!(
-            !intents
-                .iter()
-                .any(|i| matches!(i, AiIntent::AttackMoveGroup { .. })),
-            "con la base minacciata l'ondata resta a casa: {intents:?}"
-        );
-        // Il micro invece scherma: linea + batteria? (qui solo heavies).
-        let micro = decide_micro(&snap, &Personality::RUSHER, Scenario::Playground);
-        assert!(
-            micro.iter().any(|i| matches!(i, AiIntent::Screen { .. })),
-            "schermo a casa: {micro:?}"
+            (dest.x - 230.0).abs() < 0.01 && (dest.z - 230.0).abs() < 0.01,
+            "meta sul raider, non sulla base nemica: {dest:?}"
         );
     }
 
@@ -2772,18 +2831,23 @@ mod tests {
                 max_health: max_h,
             });
         };
-        // wave_group diretto: soglia commit rusher 0.9.
+        // wave_group diretto: soglia commit rusher 0.9, base libera.
         let mut snap = armed_snapshot(1, &[(UnitKind::Commander, max_c, UnitOrder::Idle)]);
         escort(&mut snap);
-        let cautious = wave_group(&snap, &Personality::RUSHER, 0.6);
+        let cautious = wave_group(&snap, &Personality::RUSHER, 0.6, false);
         assert_eq!(cautious.len(), 2);
         assert!(!cautious.contains(&Entity::from_bits(100)));
-        let committed = wave_group(&snap, &Personality::RUSHER, 0.99);
+        let committed = wave_group(&snap, &Personality::RUSHER, 0.99, false);
         assert_eq!(committed.len(), 3);
         assert!(committed.contains(&Entity::from_bits(100)));
+        // Base minacciata: il capitale non si gioca nelle mischie difensive,
+        // anche oltre soglia (il torneo lo perdeva proprio lì).
+        let defended = wave_group(&snap, &Personality::RUSHER, 1.0, true);
+        assert_eq!(defended.len(), 2);
+        assert!(!defended.contains(&Entity::from_bits(100)));
         // Solo capitale (niente scorta): mai ondata solitaria.
         let alone = armed_snapshot(1, &[(UnitKind::Commander, max_c, UnitOrder::Idle)]);
-        assert!(wave_group(&alone, &Personality::RUSHER, 1.0).is_empty());
+        assert!(wave_group(&alone, &Personality::RUSHER, 1.0, false).is_empty());
     }
 
     #[test]

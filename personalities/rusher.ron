@@ -6,6 +6,7 @@
     second_solar: false,
     mix: ((HeavyTank, 6), (LightTank, 3), (Artillery, 1)),
     max_turrets: 0,
+    max_lance: 0,
     max_walls: 0,
     max_metals: 2,
     max_solars: 2,

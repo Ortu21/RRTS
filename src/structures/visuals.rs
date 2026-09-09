@@ -16,10 +16,10 @@ impl Plugin for BuildingVisualsPlugin {
 }
 #[derive(Resource)]
 struct BuildingAssets {
-    bodies: [Handle<Mesh>; 6],
-    accents: [Handle<Mesh>; 6],
+    bodies: [Handle<Mesh>; BuildingKind::ALL.len()],
+    accents: [Handle<Mesh>; BuildingKind::ALL.len()],
     team: [Handle<StandardMaterial>; 2],
-    detail: [Handle<StandardMaterial>; 6],
+    detail: [Handle<StandardMaterial>; BuildingKind::ALL.len()],
     site: Handle<StandardMaterial>,
     ring: Handle<Mesh>,
     selected: Handle<StandardMaterial>,
@@ -54,6 +54,8 @@ fn setup_assets(
             meshes.add(Cuboid::new(2.0, 0.15, 2.0)),
             // LabT2 front door, wider than the T1 one.
             meshes.add(Cuboid::new(7.0, 3.6, 0.2)),
+            // Lance crown: taller thin spire, reads apart from the laser ring.
+            meshes.add(Cylinder::new(0.7, 3.4)),
         ],
         team: [
             materials.add(Color::srgb(0.15, 0.45, 0.7)),
@@ -68,6 +70,7 @@ fn setup_assets(
             materials.add(Color::srgb(1.0, 0.45, 0.1)),
             materials.add(Color::srgb(0.25, 0.25, 0.28)),
             materials.add(Color::srgb(0.2, 0.5, 0.9)),
+            materials.add(Color::srgb(0.75, 0.9, 1.0)),
         ],
         site: materials.add(Color::srgb(0.5, 0.4, 0.2)),
         ring: meshes.add(Annulus::new(0.94, 1.0)),
@@ -154,14 +157,23 @@ fn add_visuals(
                     MeshMaterial3d(assets.green.clone()),
                     Transform::from_xyz(0.0, s.height * 0.5 + 2.0, 0.011),
                 ));
-                // Laser barrel on turrets only: tracks TurretYaw (see
+                // Laser barrel on gun turrets (Lance gets a longer one so the
+                // 28m gun reads apart on the field): tracks TurretYaw (see
                 // aim_building_barrels below), like unit barrels do.
-                if *kind == BuildingKind::Turret {
+                if matches!(*kind, BuildingKind::Turret | BuildingKind::Lance) {
                     p.spawn((
                         TurretBarrel,
                         Mesh3d(assets.barrel.clone()),
                         MeshMaterial3d(assets.barrel_material.clone()),
-                        Transform::from_xyz(0.0, s.height * 0.5 + 0.4, 0.0),
+                        Transform::from_xyz(0.0, s.height * 0.5 + 0.4, 0.0).with_scale(Vec3::new(
+                            1.0,
+                            1.0,
+                            if *kind == BuildingKind::Lance {
+                                1.5
+                            } else {
+                                1.0
+                            },
+                        )),
                     ));
                 }
             });

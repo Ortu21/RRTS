@@ -12,7 +12,7 @@ use crate::{
     navigation::Route,
     orders::{UnitOrder, UnitOrderQueue, allows_auto_targeting, allows_chase, complete_order},
     spatial::SpatialGrid,
-    units::{Builder, CollisionRadius, Team, Unit, UnitKind},
+    units::{Builder, CollisionRadius, Team, Unit, UnitKind, archetype::WeaponTech},
 };
 
 pub struct CombatPlugin;
@@ -51,7 +51,9 @@ impl Plugin for CombatPlugin {
                     )
                         .chain()
                         .in_set(WeaponSystems),
-                    move_projectiles.in_set(ProjectileSystems),
+                    (move_projectiles, tick_beams)
+                        .chain()
+                        .in_set(ProjectileSystems),
                     process_deaths.in_set(DeathSystems),
                 ),
             );
@@ -140,22 +142,47 @@ pub struct Weapon {
     pub projectile_speed: f32,
 }
 
+/// Primary gun profile from the archetype table (`tech`/`spread`/`splash`).
+/// Turrets and test dummies carry a bare `Weapon` with no profile and keep
+/// the legacy precise-homing path: zero behaviour drift outside real units.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct WeaponProfile {
+    pub tech: WeaponTech,
+    pub spread_rad: f32,
+    pub splash: f32,
+}
+
+impl Default for WeaponProfile {
+    fn default() -> Self {
+        Self {
+            tech: WeaponTech::Homing,
+            spread_rad: 0.0,
+            splash: 0.0,
+        }
+    }
+}
+
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct WeaponState {
     pub remaining: f32,
 }
 
-/// Secondary weapon (Commander missiles, prova). Shares the same
-/// `AttackTarget` lock as the primary (mitra): no separate acquisition pass.
-/// Own range/cooldown/yaw so the two guns feel different and can be tuned
-/// independently. Upgrade hook: fields are components, future levels just
-/// swap values.
+/// Secondary weapon (Commander missiles, Vanguard lasers). Shares the same
+/// `AttackTarget` lock as the primary: no separate acquisition pass.
+/// Own tech/range/cooldown/yaw so the two guns feel different and can be
+/// tuned independently. Tech fields mirror `WeaponProfile`: both guns run the
+/// same fire/move code paths, never per-kind branches.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct SecondaryWeapon {
+    pub tech: WeaponTech,
     pub range: f32,
     pub cooldown: f32,
     pub damage: f32,
     pub projectile_speed: f32,
+    pub traverse: f32,
+    pub aim_tolerance: f32,
+    pub spread_rad: f32,
+    pub splash: f32,
 }
 
 #[derive(Component, Debug, Clone, Copy, Default)]
@@ -206,6 +233,98 @@ pub struct Projectile {
     pub target: Entity,
     pub speed: f32,
     pub damage: f32,
+    pub kind: ProjectileKind,
+}
+
+/// Projectile behaviour. `Guided` is the legacy steering missile (turrets and
+/// homing tech). `Shot` flies straight to a locked aim point: guns bake their
+/// deterministic spread into `aim`, mortars add a visual arc, splash shells
+/// hurt an area. `Plunge` spawns high above the aim and falls straight down
+/// (top-attack: dodgeable while falling, impact where it lands, not where
+/// the target was). All fields are plain data: repeats stay bit-identical.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProjectileKind {
+    Guided,
+    Shot {
+        aim: Vec3,
+        arc: f32,
+        splash: f32,
+        t: f32,
+        dur: f32,
+    },
+    Plunge {
+        aim: Vec3,
+        splash: f32,
+    },
+}
+
+/// Mortar visual arc height (pure decoration: damage uses the aim point).
+/// Top-attack spawn height: fall time at 30 m/s ≈ 1.4 s of dodge window.
+pub const MORTAR_ARC_HEIGHT: f32 = 5.0;
+pub const PLUNGE_HEIGHT: f32 = 42.0;
+/// Laser/impact flash lifetime (visual only, despawned by `tick_beams`).
+pub const BEAM_TTL_SECS: f32 = 0.12;
+
+/// Deterministic aim spread: uniform disk of angular radius `spread_rad`
+/// scaled by distance (far shots spray, point blank stays true). Pure hash of
+/// (shooter, tick, gun): same battle replays bit-identically, no RNG state in
+/// the sim. `gun_idx` 0 = primary, 1 = secondary (two guns same tick differ).
+pub fn spread_offset(
+    shooter_bits: u64,
+    tick: u64,
+    gun_idx: u64,
+    spread_rad: f32,
+    dist: f32,
+) -> Vec2 {
+    if !spread_rad.is_finite() || spread_rad <= 0.0 || !dist.is_finite() || dist <= 0.0 {
+        return Vec2::ZERO;
+    }
+    let mut h = shooter_bits
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(tick.wrapping_mul(0xBF58476D1CE4E5B9))
+        .wrapping_add((gun_idx + 1).wrapping_mul(0x94D049BB133111EB));
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D049BB133111EB);
+    h ^= h >> 31;
+    let u1 = ((h >> 32) as f32) / (u32::MAX as f32);
+    let u2 = ((h & 0xFFFF_FFFF) as f32) / (u32::MAX as f32);
+    let angle = u1 * std::f32::consts::TAU;
+    let radius = spread_rad * dist * u2.sqrt();
+    Vec2::new(angle.cos() * radius, angle.sin() * radius)
+}
+
+/// Splash victim selection: live enemies inside `radius` of impact, ordered
+/// by entity bits (deterministic). Pure helper so the rule is unit-testable
+/// without a World; the system feeds it from the spatial grid + queries.
+pub fn splash_targets(
+    candidates: &[(u64, u8, Vec3, f32)],
+    impact: Vec3,
+    radius: f32,
+    shooter_team: u8,
+) -> Vec<u64> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return Vec::new();
+    }
+    let mut out: Vec<u64> = candidates
+        .iter()
+        .filter(|(_, team, _, hp)| *team != shooter_team && *hp > 0.0)
+        .filter(|(_, _, pos, _)| pos.distance_squared(impact) <= radius * radius)
+        .map(|(bits, _, _, _)| *bits)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Beam/impact flash: visual only, never sim state. Spawned stretched
+/// from→to, shrinks and despawns in `tick_beams`. Lasers read as instant
+/// light; splash impacts get a short vertical pop.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct BeamFlash {
+    pub ttl: f32,
+    pub life: f32,
 }
 
 pub fn in_weapon_range(from: Vec3, to: Vec3, range: f32) -> bool {
@@ -947,33 +1066,37 @@ fn traverse_turrets(
     }
 }
 
-/// Secondary traverse: same lock, independent yaw rate from
-/// `COMMANDER_MISSILES`. Missiles aim slower, so at close range the mitra
-/// fires first while missiles still traverse — double gun feeling.
+/// Secondary traverse: same lock, per-gun yaw rate from the secondary spec.
+/// Slow secondaries (missiles) still traverse behind the mitra at close
+/// range: double gun feeling, now data-driven per dual-gun unit.
 #[allow(clippy::type_complexity)]
 fn traverse_secondary(
     time: Res<Time>,
     grid: Res<SpatialGrid>,
     mut units: Query<
-        (&Transform, &mut SecondaryTurretYaw, Option<&AttackTarget>),
+        (
+            &Transform,
+            &SecondaryWeapon,
+            &mut SecondaryTurretYaw,
+            Option<&AttackTarget>,
+        ),
         (With<Unit>, With<SecondaryWeapon>),
     >,
 ) {
     use crate::movement::{rotate_toward, yaw_toward};
-    use crate::units::archetype::COMMANDER_MISSILES;
 
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for (transform, mut turret, target) in &mut units {
+    for (transform, gun, mut turret, target) in &mut units {
         let body_yaw = transform.rotation.to_euler(EulerRot::YXZ).0;
         let aim = target
             .and_then(|target| grid.position(target.0))
             .filter(|aim| aim.xz().distance_squared(transform.translation.xz()) > f32::EPSILON)
             .map(|aim| yaw_toward(aim - transform.translation))
             .unwrap_or(body_yaw);
-        turret.0 = rotate_toward(turret.0, aim, COMMANDER_MISSILES.traverse * dt);
+        turret.0 = rotate_toward(turret.0, aim, gun.traverse * dt);
     }
 }
 
@@ -981,6 +1104,14 @@ fn traverse_secondary(
 struct ProjectileAssets {
     mesh: Handle<Mesh>,
     team_material: [Handle<StandardMaterial>; 2],
+    /// Elongated tracer for guns (unit box, stretched per shot).
+    tracer_mesh: Handle<Mesh>,
+    /// Dark shell for dumbfire rockets and mortar rounds.
+    shell_mesh: Handle<Mesh>,
+    shell_material: Handle<StandardMaterial>,
+    /// Shared unit cube for beams/columns + hot flash material.
+    beam_mesh: Handle<Mesh>,
+    beam_material: Handle<StandardMaterial>,
 }
 
 fn setup_projectile_assets(
@@ -1004,23 +1135,66 @@ fn setup_projectile_assets(
                 ..default()
             }),
         ],
+        tracer_mesh: meshes.add(Cuboid::new(0.12, 0.12, 1.0)),
+        shell_mesh: meshes.add(Sphere::new(0.28)),
+        shell_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.15, 0.14, 0.13),
+            emissive: Color::srgb(0.9, 0.35, 0.05).into(),
+            unlit: true,
+            ..default()
+        }),
+        beam_mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+        beam_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.98, 0.85),
+            emissive: Color::srgb(1.0, 0.95, 0.6).into(),
+            unlit: true,
+            ..default()
+        }),
     });
+}
+
+/// Shared beam-flash spawner: stretched glowing box from→to, shrinks away in
+/// `tick_beams`. Visual only, never sim state.
+fn spawn_beam(
+    commands: &mut Commands,
+    assets: &ProjectileAssets,
+    from: Vec3,
+    to: Vec3,
+    width: f32,
+    ttl: f32,
+) {
+    let dir = to - from;
+    let len = dir.length().max(0.5);
+    let mut transform = Transform::from_translation((from + to) * 0.5);
+    if dir.length_squared() > f32::EPSILON {
+        transform = transform.looking_at(to, Vec3::Y);
+    }
+    transform.scale = Vec3::new(width, width, len);
+    commands.spawn((
+        BeamFlash { ttl, life: ttl },
+        transform,
+        Mesh3d(assets.beam_mesh.clone()),
+        MeshMaterial3d(assets.beam_material.clone()),
+    ));
 }
 
 #[allow(clippy::type_complexity)]
 fn fire_weapons(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
+    clock: Res<CombatClock>,
     assets: Option<Res<ProjectileAssets>>,
     health: Query<&Health>,
     mut shooters: Query<
         (
+            Entity,
             &Transform,
             &Team,
             &Weapon,
             &mut WeaponState,
             &AttackTarget,
             &TurretYaw,
+            Option<&WeaponProfile>,
             Option<&UnitKind>,
             Option<&crate::structures::Turret>,
         ),
@@ -1033,7 +1207,19 @@ fn fire_weapons(
     let Some(assets) = assets else {
         return;
     };
-    for (transform, team, weapon, mut state, target, turret, kind, turret_marker) in &mut shooters {
+    for (
+        entity,
+        transform,
+        team,
+        weapon,
+        mut state,
+        target,
+        turret,
+        profile,
+        kind,
+        turret_marker,
+    ) in &mut shooters
+    {
         if state.remaining > 0.0 {
             continue;
         }
@@ -1048,6 +1234,8 @@ fn fire_weapons(
         // Fire only when the barrel has traversed onto the target: slow
         // turrets genuinely shoot later, fast ones snap-shoot on the move.
         // Tolerance comes from the unit table or the turret table.
+        // Top-attack lobs skyward: no traverse gate, only range/cooldown.
+        let tech = profile.map(|p| p.tech).unwrap_or(WeaponTech::Homing);
         let tolerance = match (kind, turret_marker) {
             (Some(k), _) => crate::units::archetype(*k).aim_tolerance,
             (None, Some(_)) => {
@@ -1056,38 +1244,161 @@ fn fire_weapons(
             }
             (None, None) => 0.12,
         };
-        let aim = crate::movement::yaw_toward(target_position - transform.translation);
-        if crate::movement::wrap_angle(aim - turret.0).abs() > tolerance {
-            continue;
+        if !matches!(tech, WeaponTech::TopAttack) {
+            let aim = crate::movement::yaw_toward(target_position - transform.translation);
+            if crate::movement::wrap_angle(aim - turret.0).abs() > tolerance {
+                continue;
+            }
         }
         state.remaining = weapon.cooldown;
-        // Spawn at the muzzle: forward of the traversing barrel.
-        let muzzle = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos()) * crate::units::MUZZLE_REACH;
-        commands.spawn((
-            Projectile {
-                target: target.0,
-                speed: weapon.projectile_speed,
-                damage: weapon.damage,
-            },
-            *team,
-            Transform::from_translation(transform.translation + muzzle),
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(assets.team_material[team.0 as usize % 2].clone()),
-        ));
+        let muzzle_dir = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos());
+        let muzzle = transform.translation + muzzle_dir * crate::units::MUZZLE_REACH;
+        let team_mat = assets.team_material[team.0 as usize % 2].clone();
+        match tech {
+            WeaponTech::Laser => {
+                // Instant beam: zero-travel shot impacting in
+                // `move_projectiles` later this same tick (same DPS as table),
+                // plus the light flash now.
+                spawn_beam(
+                    &mut commands,
+                    &assets,
+                    muzzle,
+                    target_position,
+                    0.22,
+                    BEAM_TTL_SECS,
+                );
+                commands.spawn((
+                    Projectile {
+                        target: target.0,
+                        speed: 1.0,
+                        damage: weapon.damage,
+                        kind: ProjectileKind::Shot {
+                            aim: target_position,
+                            arc: 0.0,
+                            splash: 0.0,
+                            t: 0.0,
+                            dur: 0.0,
+                        },
+                    },
+                    *team,
+                    Transform::from_translation(muzzle),
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(team_mat.clone()),
+                ));
+            }
+            WeaponTech::TopAttack => {
+                // Plunging strike above the locked point: dodgeable while it
+                // falls, splash where it lands (not where the target was).
+                let splash = profile.map(|p| p.splash).unwrap_or(0.0);
+                let top = Vec3::new(
+                    target_position.x,
+                    target_position.y + PLUNGE_HEIGHT,
+                    target_position.z,
+                );
+                commands.spawn((
+                    Projectile {
+                        target: target.0,
+                        speed: weapon.projectile_speed.max(1.0),
+                        damage: weapon.damage,
+                        kind: ProjectileKind::Plunge {
+                            aim: target_position,
+                            splash,
+                        },
+                    },
+                    *team,
+                    Transform::from_translation(top).with_scale(Vec3::splat(1.6)),
+                    Mesh3d(assets.shell_mesh.clone()),
+                    MeshMaterial3d(assets.shell_material.clone()),
+                ));
+            }
+            WeaponTech::Homing => {
+                commands.spawn((
+                    Projectile {
+                        target: target.0,
+                        speed: weapon.projectile_speed,
+                        damage: weapon.damage,
+                        kind: ProjectileKind::Guided,
+                    },
+                    *team,
+                    Transform::from_translation(muzzle),
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(team_mat.clone()),
+                ));
+            }
+            WeaponTech::Gun | WeaponTech::Dumbfire | WeaponTech::Mortar => {
+                // Point-targeted shot: guns bake deterministic spread into the
+                // aim (movers dodge, close still targets eat it); mortars arc.
+                let dist = transform.translation.distance(target_position);
+                let spread = profile.map(|p| p.spread_rad).unwrap_or(0.0);
+                let offset = spread_offset(entity.to_bits(), clock.tick, 0, spread, dist);
+                let aim = Vec3::new(
+                    target_position.x + offset.x,
+                    target_position.y,
+                    target_position.z + offset.y,
+                );
+                let splash = profile.map(|p| p.splash).unwrap_or(0.0);
+                let arc = if matches!(tech, WeaponTech::Mortar) {
+                    MORTAR_ARC_HEIGHT
+                } else {
+                    0.0
+                };
+                let dur = (dist / weapon.projectile_speed.max(0.05)).max(0.001);
+                let (mesh, material, tint_scale) = match tech {
+                    WeaponTech::Mortar => (
+                        assets.shell_mesh.clone(),
+                        assets.shell_material.clone(),
+                        Vec3::splat(1.6),
+                    ),
+                    WeaponTech::Dumbfire => {
+                        (assets.mesh.clone(), team_mat.clone(), Vec3::splat(1.4))
+                    }
+                    _ => (
+                        assets.tracer_mesh.clone(),
+                        team_mat.clone(),
+                        Vec3::new(1.0, 1.0, dist.max(1.0)),
+                    ),
+                };
+                let mut shot = Transform::from_translation(muzzle);
+                if matches!(tech, WeaponTech::Gun) && dist > f32::EPSILON {
+                    shot = shot.looking_at(aim, Vec3::Y);
+                }
+                shot.scale = tint_scale;
+                commands.spawn((
+                    Projectile {
+                        target: target.0,
+                        speed: weapon.projectile_speed.max(0.05),
+                        damage: weapon.damage,
+                        kind: ProjectileKind::Shot {
+                            aim,
+                            arc,
+                            splash,
+                            t: 0.0,
+                            dur,
+                        },
+                    },
+                    *team,
+                    shot,
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material),
+                ));
+            }
+        }
     }
 }
 
-/// Missile fire for the Commander. Same `AttackTarget` as the mitra but own
-/// range/cooldown/yaw gate, so the two weapons overlap without syncing.
-/// Prova tuning lives in `COMMANDER_MISSILES`.
+/// Second-gun fire for dual-gun units (Commander missiles, Vanguard lasers).
+/// Same `AttackTarget` as the primary, own tech/range/cooldown/yaw gate from
+/// the secondary spec: the two guns overlap without syncing, tuned per unit.
 #[allow(clippy::type_complexity)]
 fn fire_secondary(
     mut commands: Commands,
     grid: Res<SpatialGrid>,
+    clock: Res<CombatClock>,
     assets: Option<Res<ProjectileAssets>>,
     health: Query<&Health>,
     mut shooters: Query<
         (
+            Entity,
             &Transform,
             &Team,
             &SecondaryWeapon,
@@ -1098,12 +1409,10 @@ fn fire_secondary(
         With<Unit>,
     >,
 ) {
-    use crate::units::archetype::COMMANDER_MISSILES;
-
     let Some(assets) = assets else {
         return;
     };
-    for (transform, team, weapon, mut state, target, turret) in &mut shooters {
+    for (entity, transform, team, weapon, mut state, target, turret) in &mut shooters {
         if state.remaining > 0.0 {
             continue;
         }
@@ -1115,54 +1424,296 @@ fn fire_secondary(
         {
             continue;
         }
-        let aim = crate::movement::yaw_toward(target_position - transform.translation);
-        if crate::movement::wrap_angle(aim - turret.0).abs() > COMMANDER_MISSILES.aim_tolerance {
-            continue;
+        // Lasers ride straight off the pod: no traverse gate, like TopAttack.
+        if !matches!(weapon.tech, WeaponTech::Laser) {
+            let aim = crate::movement::yaw_toward(target_position - transform.translation);
+            if crate::movement::wrap_angle(aim - turret.0).abs() > weapon.aim_tolerance {
+                continue;
+            }
         }
         state.remaining = weapon.cooldown;
-        // Missiles launch higher off the hull so the two muzzles read apart.
-        let muzzle = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos()) * 2.2 + Vec3::Y * 1.6;
-        commands.spawn((
-            Projectile {
-                target: target.0,
-                speed: weapon.projectile_speed,
-                damage: weapon.damage,
-            },
-            *team,
-            Transform::from_translation(transform.translation + muzzle),
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(assets.team_material[team.0 as usize % 2].clone()),
-        ));
+        let team_mat = assets.team_material[team.0 as usize % 2].clone();
+        match weapon.tech {
+            WeaponTech::Laser => {
+                let muzzle = transform.translation + Vec3::Y * 1.6;
+                spawn_beam(
+                    &mut commands,
+                    &assets,
+                    muzzle,
+                    target_position,
+                    0.22,
+                    BEAM_TTL_SECS,
+                );
+                commands.spawn((
+                    Projectile {
+                        target: target.0,
+                        speed: 1.0,
+                        damage: weapon.damage,
+                        kind: ProjectileKind::Shot {
+                            aim: target_position,
+                            arc: 0.0,
+                            splash: 0.0,
+                            t: 0.0,
+                            dur: 0.0,
+                        },
+                    },
+                    *team,
+                    Transform::from_translation(muzzle),
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(team_mat),
+                ));
+            }
+            // Missiles launch higher off the hull so the two muzzles read apart.
+            // Top-attack lobs from the sky above the locked point (dodgeable).
+            _ => {
+                let muzzle_dir = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos());
+                let muzzle = transform.translation + muzzle_dir * 2.2 + Vec3::Y * 1.6;
+                let dist = transform.translation.distance(target_position);
+                let offset =
+                    spread_offset(entity.to_bits(), clock.tick, 1, weapon.spread_rad, dist);
+                let aim = Vec3::new(
+                    target_position.x + offset.x,
+                    target_position.y,
+                    target_position.z + offset.y,
+                );
+                let dur = (dist / weapon.projectile_speed.max(0.05)).max(0.001);
+                let is_plunge = matches!(weapon.tech, WeaponTech::TopAttack);
+                let spawn = if is_plunge {
+                    Vec3::new(aim.x, aim.y + PLUNGE_HEIGHT, aim.z)
+                } else {
+                    muzzle
+                };
+                commands.spawn((
+                    Projectile {
+                        target: target.0,
+                        speed: weapon.projectile_speed.max(0.05),
+                        damage: weapon.damage,
+                        kind: match weapon.tech {
+                            WeaponTech::Homing => ProjectileKind::Guided,
+                            WeaponTech::TopAttack => ProjectileKind::Plunge {
+                                aim,
+                                splash: weapon.splash,
+                            },
+                            _ => ProjectileKind::Shot {
+                                aim,
+                                arc: if matches!(weapon.tech, WeaponTech::Mortar) {
+                                    MORTAR_ARC_HEIGHT
+                                } else {
+                                    0.0
+                                },
+                                splash: weapon.splash,
+                                t: 0.0,
+                                dur,
+                            },
+                        },
+                    },
+                    *team,
+                    Transform::from_translation(spawn),
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(team_mat),
+                ));
+            }
+        }
     }
 }
 
-/// Simple homing projectiles: steer at the target's current position,
-/// apply damage on impact, despawn quietly if the target is already gone.
+/// Impact resolution: splash hurts live enemies in radius (sorted, deterministic),
+/// single-target hits the locked target only if still near the impact point
+/// (movers dodge). Buildings take splash like units (they carry Team+Health).
+/// Pure data flow except the damage writes, which stay in one place.
+#[allow(clippy::too_many_arguments)]
+fn resolve_impact(
+    impact: Vec3,
+    splash: f32,
+    damage: f32,
+    target: Entity,
+    shooter_team: Team,
+    grid: &SpatialGrid,
+    teams: &Query<&Team>,
+    health: &mut Query<&mut Health>,
+) {
+    if splash > 0.0 {
+        let mut victims: Vec<(u64, Entity)> = Vec::new();
+        grid.for_each_nearby(impact, splash, |entry| {
+            victims.push((entry.entity.to_bits(), entry.entity));
+        });
+        victims.sort_unstable();
+        victims.dedup();
+        for (_, victim) in victims {
+            let enemy = teams.get(victim).is_ok_and(|t| t.is_enemy(shooter_team));
+            let alive = health.get(victim).is_ok_and(|h| !is_dead(h));
+            if enemy
+                && alive
+                && let Ok(mut h) = health.get_mut(victim)
+            {
+                h.current = apply_damage_to(h.current, damage).clamp(0.0, h.max);
+            }
+        }
+    } else if let Ok(target_health) = health.get(target) {
+        let enemy = teams.get(target).is_ok_and(|t| t.is_enemy(shooter_team));
+        let near = grid.position(target).is_some_and(|p| {
+            p.distance_squared(impact) <= PROJECTILE_HIT_RADIUS * PROJECTILE_HIT_RADIUS
+        });
+        if enemy
+            && !is_dead(target_health)
+            && near
+            && let Ok(mut h) = health.get_mut(target)
+        {
+            h.current = apply_damage_to(h.current, damage).clamp(0.0, h.max);
+        }
+    }
+}
+
 fn move_projectiles(
     mut commands: Commands,
     time: Res<Time>,
     grid: Res<SpatialGrid>,
-    mut projectiles: Query<(Entity, &mut Transform, &Projectile)>,
+    assets: Option<Res<ProjectileAssets>>,
+    teams: Query<&Team>,
     mut health: Query<&mut Health>,
+    mut projectiles: Query<(Entity, &mut Transform, &mut Projectile, &Team)>,
 ) {
     let dt = time.delta_secs();
-    for (entity, mut transform, projectile) in &mut projectiles {
-        let Some(target_position) = target_position(&grid, projectile.target) else {
+    for (entity, mut transform, mut projectile, team) in &mut projectiles {
+        let kind = projectile.kind;
+        match kind {
+            ProjectileKind::Guided => {
+                // Legacy steering missile: tracks the locked entity, dies
+                // quietly with it. Turrets and homing tech live here.
+                let Some(target_position) = target_position(&grid, projectile.target) else {
+                    commands.entity(entity).despawn();
+                    continue;
+                };
+                let offset = target_position - transform.translation;
+                let distance = offset.length();
+                let step = projectile.speed * dt;
+                if distance <= step.max(PROJECTILE_HIT_RADIUS) {
+                    if let Ok(mut target_health) = health.get_mut(projectile.target) {
+                        target_health.current =
+                            apply_damage_to(target_health.current, projectile.damage)
+                                .clamp(0.0, target_health.max);
+                    }
+                    commands.entity(entity).despawn();
+                } else if distance > f32::EPSILON {
+                    transform.translation += offset / distance * step;
+                }
+            }
+            ProjectileKind::Shot {
+                aim,
+                arc,
+                splash,
+                t,
+                dur,
+            } => {
+                // Straight flight to the locked aim point (guns, dumbfire,
+                // lasers, mortars with a visual parabola). Damage on arrival:
+                // splash hurts the area, single-target needs the lock still
+                // near the impact (spread misses and movers live here).
+                let base = transform.translation;
+                let to_aim = aim - base;
+                // Arrival check on flat distance (arc lifts y, never target).
+                let flat = Vec3::new(to_aim.x, 0.0, to_aim.z).length();
+                let step = projectile.speed * dt;
+                if flat <= step.max(PROJECTILE_HIT_RADIUS) || t >= dur {
+                    let impact = Vec3::new(aim.x, aim.y, aim.z);
+                    let (damage, target, shooter) = (projectile.damage, projectile.target, *team);
+                    resolve_impact(
+                        impact,
+                        splash,
+                        damage,
+                        target,
+                        shooter,
+                        &grid,
+                        &teams,
+                        &mut health,
+                    );
+                    if splash > 0.0
+                        && let Some(assets) = assets.as_deref()
+                    {
+                        spawn_beam(
+                            &mut commands,
+                            assets,
+                            impact,
+                            impact + Vec3::Y * 3.0,
+                            0.9,
+                            BEAM_TTL_SECS,
+                        );
+                    }
+                    commands.entity(entity).despawn();
+                } else {
+                    let dir = to_aim / to_aim.length().max(f32::EPSILON);
+                    let nt = (t + dt).min(dur);
+                    let frac = if dur > 0.0 { nt / dur } else { 1.0 };
+                    let mut next = base + dir * step.min(flat);
+                    if arc > 0.0 {
+                        // Parabola over the whole flight (visual only).
+                        next.y = base.y + (aim.y - base.y) * frac + arc * 4.0 * frac * (1.0 - frac);
+                    }
+                    transform.translation = next;
+                    projectile.kind = ProjectileKind::Shot {
+                        aim,
+                        arc,
+                        splash,
+                        t: nt,
+                        dur,
+                    };
+                }
+            }
+            ProjectileKind::Plunge { aim, splash } => {
+                // Top-attack: straight down above the locked point. Lands
+                // where it lands (dodgeable): splash at current xz on touchdown.
+                let step = projectile.speed * dt;
+                let ground_y = aim.y;
+                if transform.translation.y - step <= ground_y {
+                    let impact =
+                        Vec3::new(transform.translation.x, ground_y, transform.translation.z);
+                    let (damage, target, shooter) = (projectile.damage, projectile.target, *team);
+                    resolve_impact(
+                        impact,
+                        splash.max(PROJECTILE_HIT_RADIUS),
+                        damage,
+                        target,
+                        shooter,
+                        &grid,
+                        &teams,
+                        &mut health,
+                    );
+                    if let Some(assets) = assets.as_deref() {
+                        spawn_beam(
+                            &mut commands,
+                            assets,
+                            impact,
+                            impact + Vec3::Y * 6.0,
+                            1.4,
+                            BEAM_TTL_SECS * 2.0,
+                        );
+                    }
+                    commands.entity(entity).despawn();
+                } else {
+                    transform.translation.y -= step;
+                }
+            }
+        }
+    }
+}
+
+/// Beam/impact flashes shrink away on a fixed visual lifetime. Pure
+/// presentation: sim state never reads them back.
+fn tick_beams(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut flashes: Query<(Entity, &mut BeamFlash, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut flash, mut transform) in &mut flashes {
+        flash.ttl -= dt;
+        if flash.ttl <= 0.0 {
             commands.entity(entity).despawn();
             continue;
-        };
-        let offset = target_position - transform.translation;
-        let distance = offset.length();
-        let step = projectile.speed * dt;
-        if distance <= step.max(PROJECTILE_HIT_RADIUS) {
-            if let Ok(mut target_health) = health.get_mut(projectile.target) {
-                target_health.current = apply_damage_to(target_health.current, projectile.damage)
-                    .clamp(0.0, target_health.max);
-            }
-            commands.entity(entity).despawn();
-        } else if distance > f32::EPSILON {
-            transform.translation += offset / distance * step;
         }
+        let k = (flash.ttl / flash.life).clamp(0.0, 1.0);
+        transform.scale.x *= k.max(0.2);
+        transform.scale.y *= k.max(0.2);
     }
 }
 
@@ -1232,6 +1783,7 @@ mod tests {
         CollisionRadius,
         Health,
         Weapon,
+        WeaponProfile,
         WeaponState,
         AcquisitionRange,
         TurretYaw,
@@ -1241,7 +1793,7 @@ mod tests {
             _ => position,
         };
         let stats = crate::units::archetype(kind);
-        let (kind_component, radius, health, weapon, weapon_state, acquisition, turret) =
+        let (kind_component, radius, health, weapon, profile, weapon_state, acquisition, turret) =
             crate::units::arm_bundle(id, kind);
         (
             Unit(id),
@@ -1254,6 +1806,7 @@ mod tests {
             radius,
             health,
             weapon,
+            profile,
             weapon_state,
             acquisition,
             turret,
@@ -2308,5 +2861,222 @@ mod tests {
         } else {
             panic!("order must keep its destination during engagements");
         }
+    }
+
+    #[test]
+    fn spread_is_deterministic_bounded_and_varied() {
+        // Same inputs, same offset (repeats bit-identical); bounded by the
+        // angular cone; varied across ticks (no two volleys alike).
+        let a = spread_offset(12345, 100, 0, 0.05, 15.0);
+        let b = spread_offset(12345, 100, 0, 0.05, 15.0);
+        assert_eq!(a, b);
+        assert!(a.length() <= 0.05 * 15.0 + 1e-4);
+        assert_eq!(spread_offset(1, 1, 0, 0.0, 15.0), Vec2::ZERO);
+        assert_eq!(spread_offset(1, 1, 0, 0.05, 0.0), Vec2::ZERO);
+        assert_eq!(spread_offset(1, 1, 0, 0.05, -4.0), Vec2::ZERO);
+        let mut seen = std::collections::BTreeSet::new();
+        for tick in 0..200u64 {
+            let o = spread_offset(777, tick, 0, 0.05, 15.0);
+            assert!(o.length() <= 0.75 + 1e-4);
+            seen.insert((o.x.to_bits(), o.y.to_bits()));
+        }
+        assert!(seen.len() > 150, "spread must vary, got {}", seen.len());
+        // Primary/secondary same tick differ.
+        assert_ne!(
+            spread_offset(777, 42, 0, 0.05, 15.0),
+            spread_offset(777, 42, 1, 0.05, 15.0)
+        );
+    }
+
+    #[test]
+    fn splash_hits_live_enemies_only_sorted() {
+        let origin = Vec3::ZERO;
+        let near = Vec3::new(2.0, 0.0, 0.0);
+        let far = Vec3::new(50.0, 0.0, 0.0);
+        let candidates = vec![
+            (9u64, 0u8, origin, 100.0), // shooter team: skipped
+            (4u64, 1u8, near, 100.0),   // enemy in radius
+            (7u64, 1u8, near, 100.0),   // enemy in radius (order!)
+            (2u64, 1u8, far, 100.0),    // too far
+            (5u64, 0u8, near, 100.0),   // friendly: never
+            (6u64, 1u8, near, 0.0),     // dead: never
+        ];
+        assert_eq!(splash_targets(&candidates, origin, 3.0, 0), vec![4, 7]);
+        assert!(splash_targets(&candidates, origin, 0.0, 0).is_empty());
+        assert!(splash_targets(&candidates, far, 3.0, 0) == vec![2]);
+    }
+
+    /// Aimed single shot: aligned turret, zeroed cooldown, static target.
+    /// Returns (shooter, target).
+    fn aimed_duel(
+        app: &mut App,
+        shooter_id: u32,
+        shooter_kind: UnitKind,
+        target_id: u32,
+        target_kind: UnitKind,
+        distance: f32,
+    ) -> (Entity, Entity) {
+        let shooter = app
+            .world_mut()
+            .spawn(combatant(
+                shooter_id,
+                0,
+                Vec3::new(0.0, 0.8, 0.0),
+                UnitOrder::HoldPosition,
+                shooter_kind,
+            ))
+            .id();
+        let target = app
+            .world_mut()
+            .spawn(combatant(
+                target_id,
+                1,
+                Vec3::new(distance, 0.8, 0.0),
+                UnitOrder::Idle,
+                target_kind,
+            ))
+            .id();
+        app.world_mut()
+            .entity_mut(shooter)
+            .insert(AttackTarget(target));
+        app.world_mut()
+            .entity_mut(shooter)
+            .insert(WeaponState { remaining: 0.0 });
+        let aim = crate::movement::yaw_toward(Vec3::X * distance);
+        app.world_mut().entity_mut(shooter).insert(TurretYaw(aim));
+        (shooter, target)
+    }
+
+    #[test]
+    fn laser_hits_instantly_with_beam() {
+        let mut app = combat_app();
+        let (_, target) = aimed_duel(
+            &mut app,
+            700,
+            UnitKind::LaserTank,
+            701,
+            UnitKind::HeavyTank,
+            15.0,
+        );
+        for _ in 0..120 {
+            app.update();
+        }
+        // 11 dmg/1.1s over 2s: 1-2 hits landed, beam flashes came and went.
+        let hp = app.world().get::<Health>(target).unwrap().current;
+        assert!((170.0 - 22.0 - 1e-3..170.0).contains(&hp), "hp={hp}");
+        let flashes = app
+            .world_mut()
+            .query::<&BeamFlash>()
+            .iter(app.world())
+            .count();
+        assert!(flashes <= 2, "flashes must decay, got {flashes}");
+    }
+
+    #[test]
+    fn mortar_splashes_groups() {
+        let mut app = combat_app();
+        let (_, first) = aimed_duel(
+            &mut app,
+            710,
+            UnitKind::MortarTank,
+            711,
+            UnitKind::HeavyTank,
+            10.0,
+        );
+        let second = app
+            .world_mut()
+            .spawn(combatant(
+                712,
+                1,
+                Vec3::new(10.0, 0.8, 2.5),
+                UnitOrder::Idle,
+                UnitKind::HeavyTank,
+            ))
+            .id();
+        // One shell (~0.6s flight) then splash 3.5 covers both at 2.5m.
+        for _ in 0..150 {
+            app.update();
+        }
+        let hp1 = app.world().get::<Health>(first).unwrap().current;
+        let hp2 = app.world().get::<Health>(second).unwrap().current;
+        assert!(hp1 < 170.0, "direct victim damaged, hp={hp1}");
+        assert!(hp2 < 170.0, "splash victim damaged, hp={hp2}");
+    }
+
+    #[test]
+    fn top_attack_lands_delayed_and_dodgeable() {
+        let mut app = combat_app();
+        let (_, target) = aimed_duel(
+            &mut app,
+            720,
+            UnitKind::SkyArtillery,
+            721,
+            UnitKind::HeavyTank,
+            30.0,
+        );
+        // Fall from 42m at 30 m/s ≈ 1.4s: nothing landed yet at 0.5s...
+        for _ in 0..30 {
+            app.update();
+        }
+        assert_eq!(app.world().get::<Health>(target).unwrap().current, 170.0);
+        // ...but the delayed AoE connects afterwards.
+        for _ in 0..170 {
+            app.update();
+        }
+        let hp = app.world().get::<Health>(target).unwrap().current;
+        assert!(hp < 170.0, "delayed strike landed, hp={hp}");
+    }
+
+    #[test]
+    fn mg_spread_misses_sometimes() {
+        let mut app = combat_app();
+        let (_, target) = aimed_duel(
+            &mut app,
+            730,
+            UnitKind::MgTank,
+            731,
+            UnitKind::HeavyTank,
+            15.0,
+        );
+        // 0.28s cycle over 10s ≈ 35 shots of 3 dmg: some must spray wide
+        // (0.055 rad at 15m reaches 0.8m off a 0.7m hit disc).
+        for _ in 0..600 {
+            app.update();
+        }
+        let hp = app.world().get::<Health>(target).unwrap().current;
+        let dealt = 170.0 - hp;
+        assert!(dealt > 20.0, "mitra must connect, dealt={dealt}");
+        assert!(dealt < 35.0 * 3.0, "spread must miss some, dealt={dealt}");
+    }
+
+    #[test]
+    fn dumbfire_rocket_alpha_with_light_splash() {
+        let mut app = combat_app();
+        let (_, first) = aimed_duel(
+            &mut app,
+            740,
+            UnitKind::RocketTank,
+            741,
+            UnitKind::HeavyTank,
+            18.0,
+        );
+        let second = app
+            .world_mut()
+            .spawn(combatant(
+                742,
+                1,
+                Vec3::new(18.0, 0.8, 2.0),
+                UnitOrder::Idle,
+                UnitKind::HeavyTank,
+            ))
+            .id();
+        // 2.4s cycle: first impact (~0.7s flight) then splash 2.5 clips both.
+        for _ in 0..300 {
+            app.update();
+        }
+        let hp1 = app.world().get::<Health>(first).unwrap().current;
+        let hp2 = app.world().get::<Health>(second).unwrap().current;
+        assert!(hp1 <= 170.0 - 26.0 + 1e-3, "direct alpha landed, hp={hp1}");
+        assert!(hp2 < 170.0, "splash clipped the neighbour, hp={hp2}");
     }
 }

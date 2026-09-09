@@ -35,6 +35,8 @@ pub struct Personality {
     pub mix: [(UnitKind, u32); 3],
     /// Torrette difensive massime (0 = mai, solo turtle).
     pub max_turrets: usize,
+    /// Lance turret massime (0 = mai, solo turtle late con eco solida).
+    pub max_lance: usize,
     /// 0.0.18 — muri difensivi massimi (0 = mai, solo turtle: schermo
     /// davanti alla prima torretta verso la minaccia).
     pub max_walls: usize,
@@ -75,6 +77,7 @@ impl Personality {
             (UnitKind::Artillery, 3),
         ],
         max_turrets: 2,
+        max_lance: 1,
         max_walls: 3,
         max_metals: 3,
         max_solars: 3,
@@ -98,6 +101,7 @@ impl Personality {
             (UnitKind::Artillery, 1),
         ],
         max_turrets: 0,
+        max_lance: 0,
         max_walls: 0,
         max_metals: 2,
         max_solars: 2,
@@ -124,6 +128,7 @@ impl Personality {
             (UnitKind::HeavyTank, 0),
         ],
         max_turrets: 0,
+        max_lance: 0,
         max_walls: 0,
         max_metals: 3,
         max_solars: 3,
@@ -150,6 +155,7 @@ impl Personality {
             (UnitKind::Artillery, 0),
         ],
         max_turrets: 0,
+        max_lance: 0,
         max_walls: 0,
         max_metals: 2,
         max_solars: 2,
@@ -193,6 +199,7 @@ impl Personality {
             second_solar: def.second_solar,
             mix: def.mix,
             max_turrets: def.max_turrets,
+            max_lance: def.max_lance,
             max_walls: def.max_walls,
             max_metals: def.max_metals,
             max_solars: def.max_solars,
@@ -219,6 +226,7 @@ pub struct PersonalityDef {
     pub second_solar: bool,
     pub mix: [(UnitKind, u32); 3],
     pub max_turrets: usize,
+    pub max_lance: usize,
     pub max_walls: usize,
     pub max_metals: usize,
     pub max_solars: usize,
@@ -241,6 +249,7 @@ impl From<&Personality> for PersonalityDef {
             second_solar: p.second_solar,
             mix: p.mix,
             max_turrets: p.max_turrets,
+            max_lance: p.max_lance,
             max_walls: p.max_walls,
             max_metals: p.max_metals,
             max_solars: p.max_solars,
@@ -809,6 +818,17 @@ pub fn decide(
         && snapshot.count_building(BuildingKind::Turret) < personality.max_turrets
     {
         intents.push(AiIntent::Build(BuildingKind::Turret));
+    }
+    // Lance turret (scala gittate): seconda risposta statica, solo turtle late
+    // con eco solida (stesso cancello del LabT2: niente torrette da 220/220 a
+    // economia zoppa). Conta anche i siti: niente doppie richieste.
+    if personality.max_lance > 0
+        && snapshot.complete_building(BuildingKind::Turret) > 0
+        && snapshot.count_building(BuildingKind::Lance) < personality.max_lance
+        && snapshot.income[0] >= LABT2_MIN_METAL_INCOME
+        && snapshot.income[1] >= LABT2_MIN_ENERGY_INCOME
+    {
+        intents.push(AiIntent::Build(BuildingKind::Lance));
     }
     // 0.0.18 — muri: schermo davanti alla prima torretta completa (l'executor
     // cerca gli slot verso la minaccia, senza murare le factory). Solo turtle,

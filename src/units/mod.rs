@@ -199,6 +199,7 @@ pub fn arm_bundle(
     CollisionRadius,
     Health,
     Weapon,
+    crate::combat::WeaponProfile,
     WeaponState,
     AcquisitionRange,
     crate::combat::TurretYaw,
@@ -222,6 +223,11 @@ pub fn arm_bundle(
             damage: stats.damage,
             projectile_speed: stats.projectile_speed,
         },
+        crate::combat::WeaponProfile {
+            tech: stats.tech,
+            spread_rad: stats.spread_rad,
+            splash: stats.splash,
+        },
         WeaponState {
             // Stagger first volleys deterministically (see desync_phase).
             remaining: desync_phase(id) * stats.cooldown,
@@ -231,7 +237,7 @@ pub fn arm_bundle(
     )
 }
 
-/// Secondary bundle for dual-gun units (Commander missiles, prova).
+/// Secondary bundle for dual-gun units (Commander missiles, Vanguard lasers).
 /// Returns None for regular units: no extra components, no system cost.
 pub fn secondary_bundle(
     id: u32,
@@ -240,10 +246,15 @@ pub fn secondary_bundle(
     let stats = archetype::secondary_stats(kind)?;
     Some((
         SecondaryWeapon {
+            tech: stats.tech,
             range: stats.range,
             cooldown: stats.cooldown,
             damage: stats.damage,
             projectile_speed: stats.projectile_speed,
+            traverse: stats.traverse,
+            aim_tolerance: stats.aim_tolerance,
+            spread_rad: stats.spread_rad,
+            splash: stats.splash,
         },
         SecondaryWeaponState {
             remaining: desync_phase(id.wrapping_add(0x9E37)) * stats.cooldown,
@@ -271,7 +282,7 @@ fn setup_visual_assets(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     // One body mesh per archetype (sizes differ); team colors stay shared.
-    let body_meshes: [Handle<Mesh>; 8] = UnitKind::ALL.map(|kind| {
+    let body_meshes: [Handle<Mesh>; UnitKind::ALL.len()] = UnitKind::ALL.map(|kind| {
         let half = archetype(kind).body;
         meshes.add(Cuboid::from_size(half * 2.0))
     });
@@ -340,7 +351,7 @@ fn setup_visual_assets(
 }
 #[derive(Resource)]
 struct UnitVisualAssets {
-    body_meshes: [Handle<Mesh>; 8],
+    body_meshes: [Handle<Mesh>; UnitKind::ALL.len()],
     materials_by_team: [Handle<StandardMaterial>; 2],
     ring: Handle<Mesh>,
     ring_material: Handle<StandardMaterial>,
@@ -449,6 +460,16 @@ fn add_visuals(
                         Mesh3d(missile_mesh.clone()),
                         MeshMaterial3d(missile_material.clone()),
                         Transform::from_xyz(0.0, TURRET_Y + 1.4, 0.9),
+                    ));
+                }
+                // Dual-gun non-commanders (Vanguard lasers today): same pod so
+                // the second gun reads visually, sized to a normal hull.
+                if !is_commander && archetype::secondary_stats(*kind).is_some() {
+                    parent.spawn((
+                        SecondaryTurret,
+                        Mesh3d(missile_mesh.clone()),
+                        MeshMaterial3d(missile_material.clone()),
+                        Transform::from_xyz(0.0, TURRET_Y + 0.6, 0.6),
                     ));
                 }
                 if kind.is_builder() && !stats.armed {
@@ -581,9 +602,13 @@ mod tests {
         // Mitra sul primario, missili sul secondario, mai sulle truppe.
         assert!(secondary_stats(UnitKind::Commander).is_some());
         assert!(secondary_stats(UnitKind::HeavyTank).is_none());
-        let (_, _, _, weapon, _, acquisition, _) = arm_bundle(7, UnitKind::Commander);
+        let (_, _, _, weapon, profile, _, acquisition, _) = arm_bundle(7, UnitKind::Commander);
         let (secondary, _, _) = secondary_bundle(7, UnitKind::Commander).unwrap();
         assert!(secondary_bundle(7, UnitKind::HeavyTank).is_none());
+        assert!(secondary_bundle(7, UnitKind::Vanguard).is_some());
+        // Primary gun profile matches the table tech; secondary is homing.
+        assert_eq!(profile.tech, crate::units::archetype::WeaponTech::Gun);
+        assert_eq!(secondary.tech, crate::units::archetype::WeaponTech::Homing);
         // Lock unico sul gun più lungo, fuoco gated per gun.
         assert_eq!(
             acquisition.0,
@@ -650,8 +675,8 @@ pub fn spawn_combat_unit(
         },
     ));
     if stats.armed {
-        let (_, _, _, weapon, weapon_state, acquisition, turret) = arm_bundle(id, kind);
-        entity.insert((weapon, weapon_state, acquisition, turret));
+        let (_, _, _, weapon, profile, weapon_state, acquisition, turret) = arm_bundle(id, kind);
+        entity.insert((weapon, profile, weapon_state, acquisition, turret));
     }
     if let Some(secondary) = secondary_bundle(id, kind) {
         entity.insert(secondary);

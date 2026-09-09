@@ -62,13 +62,26 @@ pub const COURAGE_SHIFT: [f32; 4] = [-0.1, 0.1, 0.1, 0.0];
 ///   lente sprecate.
 ///
 /// Dato, non logica: i sistemi leggono tramite `mix_bias`, mai branch.
-pub const MIX_BIAS: [[f32; 8]; 4] = [
-    //              Scout  Heavy  Arty   Cmdr   Eng    Light  Hvy2   Arty2
+/// Nuove truppe = 1.0 neutro (l'AI non le costruisce ancora: restano appannaggio
+/// del player finché un mix T1/T2 non le adotta).
+pub const MIX_BIAS: [[f32; 15]; 4] = [
+    //              Scout  Heavy  Arty   Cmdr   Eng    Light  Hvy2   Arty2  Mg     Laser  Rockt  Mssl   Mortar SkyArt Vang
     /* Rusher  */
-    [1.0, 1.1, 1.1, 1.0, 1.0, 0.9, 1.1, 1.1],
-    /* Turtle  */ [1.0, 1.0, 1.1, 1.0, 1.0, 0.9, 1.0, 1.1],
-    /* Eco     */ [1.0, 1.0, 0.9, 1.0, 1.0, 1.1, 1.0, 0.9],
-    /* Unknown */ [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    [
+        1.0, 1.1, 1.1, 1.0, 1.0, 0.9, 1.1, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ],
+    /* Turtle  */
+    [
+        1.0, 1.0, 1.1, 1.0, 1.0, 0.9, 1.0, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ],
+    /* Eco     */
+    [
+        1.0, 1.0, 0.9, 1.0, 1.0, 1.1, 1.0, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ],
+    /* Unknown */
+    [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ],
 ];
 
 /// Classifica l'avversario da conteggi freschi + timing primo contatto +
@@ -101,10 +114,12 @@ pub fn classify(snapshot: &AiSnapshot) -> OpponentKind {
         .map(|max_age| snapshot.tick.saturating_sub(max_age));
     let early = first_seen_tick.is_some_and(|t| t < EARLY_CONTACT_TICK);
 
-    let has_static_defense = snapshot
-        .visible_enemy_buildings
-        .iter()
-        .any(|b| matches!(b.kind, BuildingKind::Turret | BuildingKind::Wall));
+    let has_static_defense = snapshot.visible_enemy_buildings.iter().any(|b| {
+        matches!(
+            b.kind,
+            BuildingKind::Turret | BuildingKind::Wall | BuildingKind::Lance
+        )
+    });
     if has_static_defense {
         return OpponentKind::Turtle;
     }

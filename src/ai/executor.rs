@@ -306,7 +306,11 @@ pub fn execute_movement_and_build(
                 let home = scenario.center(team as usize);
                 let turrets: Vec<Vec3> = buildings
                     .iter()
-                    .filter(|(t, k, _, site)| t.0 == team && *k == BuildingKind::Turret && !site)
+                    .filter(|(t, k, _, site)| {
+                        t.0 == team
+                            && matches!(*k, BuildingKind::Turret | BuildingKind::Lance)
+                            && !site
+                    })
                     .map(|(_, _, p, _)| *p)
                     .collect();
                 let anchor = super::strategy::retreat_anchor(&turrets, home);

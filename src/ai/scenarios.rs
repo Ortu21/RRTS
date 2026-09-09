@@ -410,6 +410,74 @@ fn eval_siege(
     (checks, m)
 }
 
+fn setup_lance_hold(app: &mut App) {
+    // Scala gittate in scena: Lance blu (28m) vs 2 Rocket rossi (26m).
+    // I rocket devono entrare nei 28m per sparare e la Lance li vede prima:
+    // la banda 26<28 esiste apposta. Niente cervelli, solo ordini.
+    let world = app.world_mut();
+    let scenario = *world.resource::<Scenario>();
+    let grid = world.resource::<crate::navigation::NavGrid>().clone();
+    let base = scenario.center(0);
+    let foe = scenario.center(1);
+    let dir = (foe - base).normalize_or_zero();
+    let tpos = grid.clear_point_for(base + Vec3::new(10.0, 0.0, 10.0), 2.0);
+    spawn_building(
+        &mut world.commands(),
+        Team(0),
+        BuildingKind::Lance,
+        tpos,
+        true,
+    );
+    world.flush();
+    let ids: Vec<u32> = (0..2)
+        .map(|_| app.world_mut().resource_mut::<UnitIds>().allocate())
+        .collect();
+    {
+        let world = app.world_mut();
+        let mut cmds = world.commands();
+        for (i, id) in ids.into_iter().enumerate() {
+            let pos = base + dir * 150.0 + Vec3::new(0.0, 0.0, (i as f32 - 0.5) * 6.0);
+            let e = spawn_combat_unit(
+                &mut cmds,
+                id,
+                Team(1),
+                UnitKind::RocketTank,
+                pos.with_y(0.8),
+            );
+            crate::orders::queue_attack_move(&mut cmds.entity(e), base);
+        }
+    }
+    app.world_mut().flush();
+}
+
+fn eval_lance_hold(
+    app: &mut App,
+    _series: &[super::league::MatchSample],
+) -> (Vec<CheckResult>, BTreeMap<String, f64>) {
+    let world = app.world_mut();
+    let lances = world
+        .query_filtered::<(&Team, &BuildingKind, &Health), With<Building>>()
+        .iter(world)
+        .filter(|(t, k, h)| t.0 == 0 && **k == BuildingKind::Lance && h.current > 0.0)
+        .count();
+    let attackers_left = alive_units(world, 1);
+    let m = BTreeMap::from([
+        ("lances_left".to_owned(), lances as f64),
+        ("attackers_left".to_owned(), attackers_left as f64),
+    ]);
+    // La Lance vede prima (28 vs 26) e regge: deve restare in piedi e aver
+    // morso gli assalitori (2 rocket non bastano a seppellirla).
+    let checks = vec![
+        check("lance-holds", lances == 1, format!("lances left={lances}")),
+        check(
+            "lance-bites-back",
+            attackers_left < 2,
+            format!("attackers left={attackers_left}"),
+        ),
+    ];
+    (checks, m)
+}
+
 fn eval_no_cheat(
     app: &mut App,
     _series: &[super::league::MatchSample],
@@ -635,6 +703,13 @@ pub fn all_scenarios() -> Vec<ScenarioDef> {
             setup: setup_commander_snipe,
             evaluate: eval_commander_snipe,
         },
+        ScenarioDef {
+            id: "lance-hold",
+            description: "Lance blu (28m) vs 2 rocket rossi (26m): banda scala",
+            ticks: 3600,
+            setup: setup_lance_hold,
+            evaluate: eval_lance_hold,
+        },
     ]
 }
 
@@ -666,6 +741,7 @@ fn brains_for(id: &str) -> (Option<Personality>, Option<Personality>) {
         "siege" => (None, None),
         "no-cheat" => (Some(P::TURTLE), Some(P::RUSHER)),
         "counter-comp" => (None, None),
+        "lance-hold" => (None, None),
         "commander-snipe" => (Some(P::TURTLE), None),
         _ => (None, None),
     }
@@ -769,13 +845,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn battery_has_eight_unique_scenarios() {
+    fn battery_has_nine_unique_scenarios() {
         let defs = all_scenarios();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 9);
         let mut ids: Vec<&str> = defs.iter().map(|d| d.id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.len(), 9);
         for def in &defs {
             assert!(def.ticks >= 1800, "{} troppo corto", def.id);
             assert!(!def.description.is_empty());
@@ -788,7 +864,11 @@ mod tests {
         // cervelli), gli altri hanno almeno un cervello che gioca.
         for def in all_scenarios() {
             let (blue, red) = brains_for(def.id);
-            if def.id == "micro-duel" || def.id == "siege" || def.id == "counter-comp" {
+            if def.id == "micro-duel"
+                || def.id == "siege"
+                || def.id == "counter-comp"
+                || def.id == "lance-hold"
+            {
                 assert!(blue.is_none() && red.is_none(), "{}", def.id);
             } else {
                 assert!(blue.is_some() || red.is_some(), "{}", def.id);

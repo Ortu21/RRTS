@@ -223,6 +223,7 @@ fn update_fog(
             &Team,
             &crate::economy::balance::BuildingKind,
             &Health,
+            Has<crate::structures::Construction>,
         ),
         With<Building>,
     >,
@@ -246,10 +247,12 @@ fn update_fog(
             reveal(&mut map, team.0, transform.translation, sight_range(*kind));
         }
     }
-    for (transform, team, kind, health) in &buildings {
+    for (transform, team, kind, health, site) in &buildings {
         // Per-kind sight (see BuildingStats): walls are blind, turrets watch
-        // their own gun range.
-        if health.current > 0.0 {
+        // their own gun range. Construction sites grant NO vision (not even
+        // to the owner): piazzare un Metal al centro mappa non deve regalare
+        // la mappa — si scorta con unità vere o si finisce di costruire.
+        if health.current > 0.0 && !site {
             reveal(&mut map, team.0, transform.translation, kind.stats().sight);
         }
     }
@@ -553,6 +556,44 @@ mod tests {
         assert!(map.visible(0, Vec3::new(-260.0, 0.0, -260.0)));
         assert!(!map.visible(0, Vec3::new(260.0, 0.0, 260.0)));
         assert_eq!(app.world().resource::<FogClock>().revision, 1);
+    }
+
+    #[test]
+    fn construction_site_grants_no_vision_until_finished() {
+        use crate::economy::balance::BuildingKind;
+        use bevy::time::TimeUpdateStrategy;
+
+        // Bug: piazzare un Metal al centro mappa rivelava subito l'area.
+        // I cantieri (propri compresi) non danno visione finché non finiscono.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / 60.0,
+            )))
+            .add_plugins(FogPlugin { render: false });
+        let at = Vec3::ZERO;
+        crate::structures::spawn_building(
+            &mut app.world_mut().commands(),
+            Team(0),
+            BuildingKind::Metal,
+            at,
+            false,
+        );
+        app.world_mut().flush();
+        app.finish();
+        app.cleanup();
+        app.update();
+        assert!(
+            app.world_mut()
+                .query_filtered::<&BuildingKind, With<crate::structures::Construction>>()
+                .iter(app.world())
+                .count()
+                == 1,
+            "il test richiede un cantiere vero"
+        );
+        let map = app.world().resource::<VisibilityMap>();
+        assert!(!map.visible(0, at), "il cantiere non deve vedere");
+        assert!(!map.explored(0, at), "né esplorare per sempre");
     }
 
     #[test]

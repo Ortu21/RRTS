@@ -46,16 +46,19 @@ pub fn execute_movement_and_build(
     // 0.0.17: Retreat prima di FocusFire — i feriti ripiegano invece di
     // convergere sul designato; il budget APM taglia dalla coda se pieno.
     // 0.0.20: micro a 4Hz con budget 2 (Retreat/Focus/Hold/Screen + Kite).
+    // Cantieri assegnati in questo tick (builder + spot): ogni intento Build
+    // consuma un builder libero distinto e gli spot non si sovrappongono.
+    let mut assigned: Vec<Entity> = Vec::new();
+    let mut claimed: Vec<(BuildingKind, Vec3)> = Vec::new();
     for intent in intents {
         match intent {
             AiIntent::Build(kind) => {
-                if builds >= 1 || snapshot.active_site.is_some() {
-                    continue;
-                }
                 let mut candidates: Vec<(Entity, Vec3)> = units
                     .iter()
-                    .filter(|(_, _, k, o)| {
-                        k.is_builder() && matches!(o, UnitOrder::Idle | UnitOrder::HoldPosition)
+                    .filter(|(e, _, k, o)| {
+                        k.is_builder()
+                            && matches!(o, UnitOrder::Idle | UnitOrder::HoldPosition)
+                            && !assigned.contains(e)
                     })
                     .map(|(e, pos, _, _)| (*e, *pos))
                     .collect();
@@ -70,8 +73,14 @@ pub fn execute_movement_and_build(
                 // 0.0.18 — torrette: spirale sull'hotspot minaccia (fallback
                 // base); muri: slot davanti alla prima torretta che non murano
                 // le factory. Threat dalla snapshot onesta (mai query dirette).
+                // `claimed` fonde i cantieri aperti in questo stesso tick:
+                // due intenti non si contendono mai lo stesso spot/porta.
+                let mut probe: Vec<(Team, BuildingKind, Vec3, bool)> = buildings.to_vec();
+                for (k, p) in &claimed {
+                    probe.push((Team(team), *k, *p, true));
+                }
                 let Some(spot) = (if *kind == BuildingKind::Metal {
-                    let metals: Vec<Vec3> = buildings
+                    let metals: Vec<Vec3> = probe
                         .iter()
                         .filter(|(_, k, _, _)| *k == BuildingKind::Metal)
                         .map(|(_, _, p, _)| *p)
@@ -90,7 +99,7 @@ pub fn execute_movement_and_build(
                     super::strategy::find_wall_spot(
                         grid,
                         team,
-                        buildings,
+                        &probe,
                         builder_pos,
                         unit_footprints,
                         hotspot,
@@ -106,7 +115,7 @@ pub fn execute_movement_and_build(
                         *kind,
                         scenario,
                         builder_pos,
-                        buildings,
+                        &probe,
                         builders_live,
                         unit_footprints,
                         anchor,
@@ -123,6 +132,8 @@ pub fn execute_movement_and_build(
                     spot,
                 );
                 queue_build(&mut commands.entity(builder_entity), site);
+                assigned.push(builder_entity);
+                claimed.push((*kind, spot));
                 builds += 1;
             }
             AiIntent::Enqueue { factory, kind } => {
@@ -506,6 +517,67 @@ mod tests {
         assert_eq!(orders, 2, "budget micro = 2 ordini");
         assert_eq!(builds, 0);
         assert_eq!(crate::ai::MICRO_BUDGET, 2);
+    }
+
+    #[test]
+    fn parallel_builds_use_distinct_builders_and_spots() {
+        // BAR-style: 2 intenti Build + 2 builder liberi = 2 cantieri su spot
+        // diversi con builder diversi; con 1 solo builder ne parte 1.
+        for builders in [1usize, 2usize] {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins);
+            app.finish();
+            app.cleanup();
+            let snap = AiSnapshot {
+                team: 1,
+                ..Default::default()
+            };
+            let mut units = Vec::new();
+            for i in 0..builders {
+                let e = app.world_mut().spawn_empty().id();
+                let pos = Vec3::new(i as f32 * 60.0, 0.0, 0.0);
+                units.push((e, pos, UnitKind::Commander, UnitOrder::Idle));
+            }
+            let live: Vec<(Team, Vec3, f32)> = units
+                .iter()
+                .map(|(_, p, _, _)| (Team(1), *p, 1.4))
+                .collect();
+            let intents = vec![
+                AiIntent::Build(crate::economy::balance::BuildingKind::Factory),
+                AiIntent::Build(crate::economy::balance::BuildingKind::Factory),
+            ];
+            let grid = open_grid();
+            let mut commands = app.world_mut().commands();
+            let (_, builds, _) = execute_movement_and_build(
+                &mut commands,
+                &snap,
+                &intents,
+                1,
+                8,
+                &grid,
+                crate::scenario::Scenario::Playground,
+                &units,
+                &[],
+                &live,
+                &[],
+            );
+            assert_eq!(builds, builders, "un cantiere per builder libero");
+            app.world_mut().flush();
+            let mut spots: Vec<Vec3> = app
+                .world_mut()
+                .query_filtered::<&Transform, With<crate::structures::Building>>()
+                .iter(app.world())
+                .map(|t| t.translation)
+                .collect();
+            assert_eq!(spots.len(), builds, "un sito per intento servito");
+            spots.sort_by_key(|p| (p.x.to_bits(), p.z.to_bits()));
+            for w in spots.windows(2) {
+                assert!(
+                    w[0].distance_squared(w[1]) > 1.0,
+                    "spot sovrapposti nello stesso tick: {w:?}"
+                );
+            }
+        }
     }
 
     #[test]

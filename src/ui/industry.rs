@@ -4,6 +4,7 @@ use crate::{
     combat::Health,
     economy::balance::*,
     orders::PendingOrder,
+    orders::{UnitOrder, UnitOrderQueue},
     picking::ground_position,
     production::Factory,
     selection::{Selected, SelectionSystems},
@@ -441,10 +442,12 @@ fn placement_and_rally(
             &Builder,
             &CollisionRadius,
             &Health,
+            &UnitOrder,
         ),
         With<Unit>,
     >,
     units: Query<(&Transform, &CollisionRadius), With<Unit>>,
+    mut queues: Query<&mut UnitOrderQueue>,
     interactions: Query<&Interaction, With<BlocksMap>>,
     view: Res<ViewState>,
     deposits: Option<Res<crate::structures::MetalDeposits>>,
@@ -496,18 +499,27 @@ fn placement_and_rally(
         // Live builders only: the dead neither enable placement nor build.
         let live: Vec<_> = builders
             .iter()
-            .filter(|(_, _, _, _, _, h)| h.current > 0.0)
-            .map(|(e, t, p, b, r, _)| (e, *t, p.translation, b.radius, b.power, r.0))
+            .filter(|(_, _, _, _, _, h, _)| h.current > 0.0)
+            .map(|(e, t, p, b, r, _, o)| (e, *t, p.translation, b.radius, b.power, r.0, o.clone()))
             .collect();
-        let live_builders: Vec<_> = live.iter().map(|(_, t, p, r, _, _)| (*t, *p, *r)).collect();
+        let live_builders: Vec<_> = live
+            .iter()
+            .map(|(_, t, p, r, _, _, _)| (*t, *p, *r))
+            .collect();
         // Tasked builders still alive: only these march on confirm. If they
         // all died mid-preview the placement is dead too — re-task, no
         // silent fallback to other builders.
         let mut tasked: Vec<_> = live
             .iter()
-            .filter(|(e, t, _, _, _, _)| t.0 == view.team && placement.builders.contains(e))
-            .map(|(e, _, p, r, _, body)| (*e, p.xz().distance(point.xz()), *r, *p, *body))
+            .filter(|(e, t, _, _, _, _, _)| t.0 == view.team && placement.builders.contains(e))
+            .map(|(e, _, p, r, _, body, o)| {
+                (*e, p.xz().distance(point.xz()), *r, *p, *body, o.clone())
+            })
             .collect();
+        tasked.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.0.to_bits().cmp(&b.0.to_bits()))
+        });
         tasked.sort_by(|a, b| {
             a.1.total_cmp(&b.1)
                 .then_with(|| a.0.to_bits().cmp(&b.0.to_bits()))
@@ -521,7 +533,7 @@ fn placement_and_rally(
             valid = Err("Tasked builders lost — pick builders and retry");
         }
         placement.message = match (&valid, tasked.first()) {
-            (Ok(()), Some((_, dist, radius, _, _))) if *dist <= *radius => {
+            (Ok(()), Some((_, dist, radius, _, _, _))) if *dist <= *radius => {
                 format!(
                     "VALID cell ({:.0}, {:.0}): {} tasked builder(s) in range — left-click to place",
                     point.x,
@@ -529,7 +541,7 @@ fn placement_and_rally(
                     tasked.len()
                 )
             }
-            (Ok(()), Some((_, dist, radius, _, _))) => format!(
+            (Ok(()), Some((_, dist, radius, _, _, _))) => format!(
                 "VALID cell ({:.0}, {:.0}): {} tasked builder(s), nearest {dist:.0}m away (range {radius:.0}m) — march on confirm",
                 point.x,
                 point.z,
@@ -598,7 +610,7 @@ fn placement_and_rally(
             // valid ground): the new footprint itself can seal its stand-off,
             // which would loop MoveTarget/fail forever, so it is rejected
             // with the preview kept armed.
-            let approach_ok = tasked.first().is_some_and(|(_, _, _, pos, body)| {
+            let approach_ok = tasked.first().is_some_and(|(_, _, _, pos, body, _)| {
                 let probe = grid.cloned_with_obstacle(structures::building_obstacle(kind, point));
                 let approach =
                     structures::site_approach(&probe, point, *pos, kind.stats().half, *body);
@@ -615,19 +627,39 @@ fn placement_and_rally(
             // (multi-selection): resolve marches the out-of-range ones to a
             // stand-off and holds them there. Already-in-range ones just hold.
             // Any later order (manual move away) drops the task and pauses.
-            let en_route = tasked.iter().filter(|(_, d, r, _, _)| *d > *r).count();
-            for (entity, _, _, _, _) in &tasked {
-                crate::orders::queue_build(&mut commands.entity(*entity), site);
+            // BAR-style queueing: with Shift held, busy builders APPEND the
+            // Build behind their live order (idle ones take it live as usual)
+            // and placement stays armed for chaining; plain click replaces and
+            // disarms like before.
+            let additive = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+            let en_route = tasked.iter().filter(|(_, d, r, _, _, _)| *d > *r).count();
+            for (entity, _, _, _, _, order) in &tasked {
+                if additive && crate::orders::is_busy(order, &mut queues, *entity) {
+                    crate::orders::enqueue_order(
+                        &mut commands,
+                        &mut queues,
+                        *entity,
+                        UnitOrder::Build { site },
+                    );
+                } else {
+                    crate::orders::queue_build(&mut commands.entity(*entity), site);
+                }
             }
-            placement.message = if en_route > 0 {
-                format!(
-                    "Construction placed. {en_route} builder(s) en route, work starts on arrival."
-                )
+            if additive {
+                placement.message = format!(
+                    "Construction queued (Shift): {en_route} builder(s) en route, placement still armed."
+                );
             } else {
-                "Construction started. Cancellation gives NO REFUND.".into()
-            };
-            placement.kind = None;
-            placement.builders.clear();
+                placement.message = if en_route > 0 {
+                    format!(
+                        "Construction placed. {en_route} builder(s) en route, work starts on arrival."
+                    )
+                } else {
+                    "Construction started. Cancellation gives NO REFUND.".into()
+                };
+                placement.kind = None;
+                placement.builders.clear();
+            }
         }
     }
 }

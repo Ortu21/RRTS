@@ -875,7 +875,19 @@ pub fn decide(
             .map(|b| b.pos),
     );
     let metal_free = crate::structures::count_free(&snapshot.deposits, &metal_pos);
-    if snapshot.active_site.is_none() {
+    // BAR-style: un intento Build per builder libero (Idle/Hold) — ognuno
+    // porta avanti il suo cantiere. Il tetto emerge dai builder, non da regole:
+    // a inizio partita è 1 sito come prima, con l'Engineer diventano 2.
+    let idle_builders = snapshot
+        .my_units
+        .iter()
+        .filter(|u| {
+            u.kind.is_builder()
+                && u.health > 0.0
+                && matches!(u.order, UnitOrder::Idle | UnitOrder::HoldPosition)
+        })
+        .count();
+    if idle_builders > 0 {
         let metal = snapshot.count_building(BuildingKind::Metal);
         let solar = snapshot.count_building(BuildingKind::Solar);
         let factory = snapshot.count_building(BuildingKind::Factory);
@@ -891,29 +903,40 @@ pub fn decide(
         // invece di accodare un Build che resta fermo. Il bootstrap resta
         // incondizionato (senza primo Metal/Solar/Factory non c'è income).
         let affordable = plan.time_to_afford_secs.is_finite();
-        if metal == 0 && metal_free > 0 {
-            intents.push(AiIntent::Build(BuildingKind::Metal));
+        // La specie prioritaria si decide una volta sola; poi un intento per
+        // builder libero (stessa specie in parallelo = eco parallela, come un
+        // player che sdoppia i builder). L'executor assegna builder distinti e
+        // salta gli spot già presi nello stesso tick.
+        let kind = if metal == 0 && metal_free > 0 {
+            Some(BuildingKind::Metal)
         } else if solar == 0 {
-            intents.push(AiIntent::Build(BuildingKind::Solar));
+            Some(BuildingKind::Solar)
         } else if factory == 0 {
-            intents.push(AiIntent::Build(BuildingKind::Factory));
+            Some(BuildingKind::Factory)
         } else if personality.second_solar && solar < 2 {
-            intents.push(AiIntent::Build(BuildingKind::Solar));
+            Some(BuildingKind::Solar)
         } else if metal_starved && affordable && metal < personality.max_metals && metal_free > 0 {
-            intents.push(AiIntent::Build(BuildingKind::Metal));
+            Some(BuildingKind::Metal)
         } else if energy_starved && affordable && solar < personality.max_solars {
-            intents.push(AiIntent::Build(BuildingKind::Solar));
+            Some(BuildingKind::Solar)
         } else if factory < personality.max_factories && metal >= 2 {
             // Seconda lab solo a eco metal avviata (2 Metal): raddoppia il
             // throughput, ma va nutrita.
-            intents.push(AiIntent::Build(BuildingKind::Factory));
+            Some(BuildingKind::Factory)
         } else if snapshot.complete_building(BuildingKind::LabT2) == 0
             && snapshot.complete_building(BuildingKind::Factory) > 0
             && snapshot.tick >= LABT2_MIN_TICK
             && snapshot.income[0] >= LABT2_MIN_METAL_INCOME
             && snapshot.income[1] >= LABT2_MIN_ENERGY_INCOME
         {
-            intents.push(AiIntent::Build(BuildingKind::LabT2));
+            Some(BuildingKind::LabT2)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            for _ in 0..idle_builders {
+                intents.push(AiIntent::Build(kind));
+            }
         }
     }
     // Difesa statica: torrette vicino alla base (l'executor cerca lo spot in
@@ -1513,11 +1536,22 @@ pub fn find_build_spot(
                 if valid_ground(grid, kind, point, units).is_err() {
                     continue;
                 }
+                // Impronte esistenti (incluse quelle aperte in questo stesso
+                // tick, fuse via `probe` dall'executor): mai due edifici
+                // sovrapposti, mai due cantieri sullo stesso spot.
+                let clash = buildings.iter().any(|(_, bk, bp, _)| {
+                    let bh = bk.stats().half;
+                    let kh = kind.stats().half;
+                    (bp.x - point.x).abs() < bh.x + kh.x && (bp.z - point.z).abs() < bh.y + kh.y
+                });
+                if clash {
+                    continue;
+                }
                 if factory_spawn_ok(grid, kind, point).is_err() {
                     continue; // porte murate: la spirale cerca un punto libero
                 }
                 if placement_rule(crate::units::Team(team), point, buildings, builders).is_err() {
-                    return None; // sito attivo o nessun builder: inutile cercare oltre
+                    continue; // nessun builder vivo: inutile cercare oltre
                 }
                 // Stand-off reale del builder (bordo footprint, non centro):
                 // raggio scafo conservativo (commander 1.4) così vale per tutti.
@@ -1591,10 +1625,18 @@ mod tests {
 
     #[test]
     fn build_order_metal_solar_factory_in_sequence() {
-        let snap = empty_snapshot(1);
-        let p = Personality::TURTLE;
-        let intents = decide(&snap, &p, Scenario::Playground, &[], 0);
-        assert_eq!(intents, vec![AiIntent::Build(BuildingKind::Metal)]);
+        let mut snap = empty_snapshot(1);
+        idle_commander(&mut snap);
+        // Commander + Engineer liberi: bootstrap parallelo, stessa specie.
+        idle_engineer(&mut snap);
+        let intents = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
+        assert_eq!(
+            intents,
+            vec![
+                AiIntent::Build(BuildingKind::Metal),
+                AiIntent::Build(BuildingKind::Metal)
+            ]
+        );
     }
 
     #[test]
@@ -1926,6 +1968,7 @@ mod tests {
     #[test]
     fn labt2_needs_time_and_factory() {
         let mut snap = armed_snapshot(1, &[]);
+        idle_commander(&mut snap);
         // 0.0.18 — il LabT2 vuole eco vera (2 Metal + 2 Solar di income),
         // non solo il tick: la soglia temporale da sola non basta più.
         snap.income = [10.0, 24.0];
@@ -2278,6 +2321,7 @@ mod tests {
         // G1: unico deposito occupato dal nemico visibile → niente Metal,
         // la macro passa al Solare invece di intasarsi.
         let mut snap = empty_snapshot(1);
+        idle_commander(&mut snap);
         snap.visible_enemy_buildings
             .push(super::super::snapshot::AiBuilding {
                 entity: Entity::from_bits(800),
@@ -2788,6 +2832,32 @@ mod tests {
         );
     }
 
+    fn idle_commander(snap: &mut AiSnapshot) {
+        use crate::units::archetype;
+        let max_c = archetype(UnitKind::Commander).max_health;
+        snap.my_units.push(super::super::snapshot::AiUnit {
+            entity: Entity::from_bits(99),
+            pos: Vec3::ZERO,
+            kind: UnitKind::Commander,
+            order: UnitOrder::Idle,
+            health: max_c,
+            max_health: max_c,
+        });
+    }
+
+    fn idle_engineer(snap: &mut AiSnapshot) {
+        use crate::units::archetype;
+        let max_e = archetype(UnitKind::Engineer).max_health;
+        snap.my_units.push(super::super::snapshot::AiUnit {
+            entity: Entity::from_bits(98),
+            pos: Vec3::ZERO,
+            kind: UnitKind::Engineer,
+            order: UnitOrder::Idle,
+            health: max_e,
+            max_health: max_e,
+        });
+    }
+
     fn eco_snapshot(
         team: u8,
         metals: usize,
@@ -2816,6 +2886,16 @@ mod tests {
         }
         snap.income = income;
         snap.demand = demand;
+        // Un Commander libero: gli intenti Build scalano sui builder liberi.
+        let max_c = crate::units::archetype(UnitKind::Commander).max_health;
+        snap.my_units.push(super::super::snapshot::AiUnit {
+            entity: Entity::from_bits(99),
+            pos: Vec3::ZERO,
+            kind: UnitKind::Commander,
+            order: UnitOrder::Idle,
+            health: max_c,
+            max_health: max_c,
+        });
         snap
     }
 
@@ -3002,6 +3082,18 @@ mod tests {
         use crate::units::archetype;
         // Un solo heavy contro forza superiore: prima dello schedule, niente.
         let mut snap = eco_snapshot(1, 2, 1, 1, [10.0, 12.0], [9.0, 30.0]);
+        // Builder inerme al posto del Commander: serve un builder libero per
+        // gli intenti ma senza distorcere la stima forze (1200hp).
+        snap.my_units.retain(|u| u.kind != UnitKind::Commander);
+        let max_e = archetype(UnitKind::Engineer).max_health;
+        snap.my_units.push(super::super::snapshot::AiUnit {
+            entity: Entity::from_bits(98),
+            pos: Vec3::ZERO,
+            kind: UnitKind::Engineer,
+            order: UnitOrder::Idle,
+            health: max_e,
+            max_health: max_e,
+        });
         snap.my_units.push(super::super::snapshot::AiUnit {
             entity: Entity::from_bits(100),
             pos: Vec3::ZERO,

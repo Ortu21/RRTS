@@ -38,10 +38,33 @@ pub const SCOUT_DETOUR_M: f32 = 20.0;
 pub const SCOUT_SPREAD_WEIGHT: f32 = 0.6;
 pub const SCOUT_SPREAD_RANGE: f32 = 150.0;
 
-/// Score frontiera: novelty (1 = mai visto, 0 = esplorato) meno minaccia
-/// normalizzata pesata per personalità. Puro.
+/// Score frontiera: information-gain (1 = tutto da scoprire, 0 = mappato)
+/// meno minaccia normalizzata pesata per personalità. Puro.
 pub fn frontier_score(novelty: f32, threat: f32, weight: f32) -> f32 {
     novelty - (threat / SCOUT_THREAT_SCALE) * weight
+}
+
+/// 0.0.24 — information-gain attesa (Welsh/Zielinski smart questions: vale
+/// quanto IMPARI, non quanto è vergine il punto): frazione di celle
+/// inesplorate nel 3×3 attorno a (col, row). 1.0 = tutto da scoprire (come la
+/// vecchia novelty), 0.0 = già mappato; in mezzo preferisce l'inesplorato
+/// profondo ai bordi già battuti. Pura e deterministica.
+pub fn info_gain(snapshot: &AiSnapshot, col: usize, row: usize) -> f32 {
+    let n = EXPLORED_GRID_N;
+    let mut unseen = 0u32;
+    let mut total = 0u32;
+    for r in row.saturating_sub(1)..=(row + 1).min(n - 1) {
+        for c in col.saturating_sub(1)..=(col + 1).min(n - 1) {
+            total += 1;
+            if !snapshot.explored_cell(c, r) {
+                unseen += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    unseen as f32 / total as f32
 }
 
 /// Centro mondo della cella frontiera (col,row). Stessa geometria di
@@ -165,7 +188,9 @@ pub fn frontier_targets(
                     continue;
                 }
                 let center = frontier_cell_center(col, row);
-                let novelty = if explored { 0.0 } else { 1.0 };
+                // 0.0.24 — information-gain attesa invece della novelty binaria
+                // (agli estremi coincide: vergine circondata da vergine = 1).
+                let novelty = info_gain(snapshot, col, row);
                 let score = frontier_score(
                     novelty,
                     threat.query(center),
@@ -293,6 +318,31 @@ mod tests {
         });
         let map = super::super::threat::build_threat(&snap);
         (snap, map)
+    }
+
+    #[test]
+    fn info_gain_matches_binary_at_extremes() {
+        // 0.0.24 — vergine ovunque = 1.0 (come la vecchia novelty), visto
+        // ovunque = 0.0; in mezzo vince l'inesplorato profondo sul bordo.
+        let virgin = empty_snapshot(1);
+        assert_eq!(info_gain(&virgin, 16, 16), 1.0);
+        assert_eq!(info_gain(&virgin, 0, 0), 1.0);
+        let mut seen = explored_snapshot(1, &[]);
+        for cell in seen.explored_cells.iter_mut() {
+            *cell = true;
+        }
+        assert_eq!(info_gain(&seen, 16, 16), 0.0);
+        // Metà mappa vista (col 0..=15), metà vergine: profondo > bordo.
+        let mut half = explored_snapshot(1, &[]);
+        for row in 0..EXPLORED_GRID_N {
+            for col in 0..=15 {
+                half.explored_cells[row * EXPLORED_GRID_N + col] = true;
+            }
+        }
+        let deep = info_gain(&half, 24, 16);
+        let edge = info_gain(&half, 16, 16);
+        assert_eq!(deep, 1.0);
+        assert!(edge > 0.0 && edge < deep, "{edge} vs {deep}");
     }
 
     #[test]

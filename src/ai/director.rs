@@ -339,6 +339,27 @@ pub fn evaluate_balance(world: &mut World, team: u8) -> Vec<CheckResult> {
             detail: "no snapshot (harness senza AI)".to_owned(),
         }),
     }
+    // 0.0.24 — opponent-sane: credenza con confidenza 0..1; Unknown viaggia
+    // sempre a conf 0 (nessuna classe inventata al buio). Solo osservazione.
+    let (opp_ok, opp_detail) = world
+        .get_resource::<super::AiSnapshots>()
+        .and_then(|s| s.0.get(&team))
+        .map(|snap| {
+            let conf_ok =
+                snap.opp_confidence.is_finite() && (0.0..=1.0).contains(&snap.opp_confidence);
+            let consistent = snap.opponent != super::opponent::OpponentKind::Unknown
+                || snap.opp_confidence == 0.0;
+            (
+                conf_ok && consistent,
+                format!("opp={:?} conf={:.2}", snap.opponent, snap.opp_confidence),
+            )
+        })
+        .unwrap_or((true, "no snapshot".to_owned()));
+    checks.push(CheckResult {
+        name: "opponent-sane",
+        pass: opp_ok,
+        detail: opp_detail,
+    });
     checks
 }
 

@@ -478,6 +478,80 @@ fn eval_lance_hold(
     (checks, m)
 }
 
+fn setup_arty_siege(app: &mut App) {
+    // 0.0.24 — assedio range-sensibile (esercita lo spread threat 0.0.23):
+    // batteria blu di 3 Artillery ferme (30m) vs 4 LightTank rossi (13m) in
+    // attack-move. I light devono attraversare 17m di inviluppo prima di
+    // sparare; le arty tengono il terreno (Hold = niente chase suicida).
+    // Scriptato puro, niente cervelli: gate meccanica, non AI.
+    let world = app.world_mut();
+    let scenario = *world.resource::<Scenario>();
+    let base = scenario.center(0);
+    let foe = scenario.center(1);
+    let dir = (foe - base).normalize_or_zero();
+    let ids: Vec<u32> = (0..7)
+        .map(|_| app.world_mut().resource_mut::<UnitIds>().allocate())
+        .collect();
+    {
+        let world = app.world_mut();
+        let mut cmds = world.commands();
+        for (i, id) in ids[..3].iter().enumerate() {
+            let pos = base + Vec3::new(10.0 + (i as f32 - 1.0) * 6.0, 0.8, 10.0);
+            let e = spawn_combat_unit(&mut cmds, *id, Team(0), UnitKind::Artillery, pos);
+            cmds.entity(e).insert(UnitOrder::HoldPosition);
+        }
+        for (i, id) in ids[3..].iter().enumerate() {
+            let pos = base + dir * 150.0 + Vec3::new(0.0, 0.8, (i as f32 - 1.5) * 5.0);
+            let e = spawn_combat_unit(&mut cmds, *id, Team(1), UnitKind::LightTank, pos);
+            crate::orders::queue_attack_move(&mut cmds.entity(e), base);
+        }
+    }
+    app.world_mut().flush();
+}
+
+fn eval_arty_siege(
+    app: &mut App,
+    _series: &[super::league::MatchSample],
+) -> (Vec<CheckResult>, BTreeMap<String, f64>) {
+    let world = app.world_mut();
+    // Conteggi per-kind: lo Startup schiera anche i Commander idle alle basi,
+    // che non partecipano (come negli altri scenari scriptati).
+    let blue_arty = world
+        .query_filtered::<(&Team, &UnitKind, &Health), With<Unit>>()
+        .iter(world)
+        .filter(|(t, k, h)| t.0 == 0 && **k == UnitKind::Artillery && h.current > 0.0)
+        .count();
+    let red_lights = world
+        .query_filtered::<(&Team, &UnitKind, &Health), With<Unit>>()
+        .iter(world)
+        .filter(|(t, k, h)| t.0 == 1 && **k == UnitKind::LightTank && h.current > 0.0)
+        .count();
+    let red_dead = 4usize.saturating_sub(red_lights);
+    let m = BTreeMap::from([
+        ("blue_arty".to_owned(), blue_arty as f64),
+        ("red_lights_left".to_owned(), red_lights as f64),
+        ("red_lights_dead".to_owned(), red_dead as f64),
+    ]);
+    // Banda gittate 13<30: la batteria deve mordere prima del contatto
+    // (light morti nell'inviluppo) e non farsi seppellire (arty in piedi).
+    // Gate larghe calibrate sul run reale, numeri fini in metriche.
+    let mut checks = vec![
+        check(
+            "arty-bites-first",
+            red_dead >= 3,
+            format!("red lights dead={red_dead}/4"),
+        ),
+        check(
+            "arty-survives",
+            blue_arty >= 2,
+            format!("blue arty={blue_arty}/3"),
+        ),
+    ];
+    let (clean, detail) = nav_clean(world);
+    checks.push(check("arty-nav-clean", clean, detail));
+    (checks, m)
+}
+
 fn eval_no_cheat(
     app: &mut App,
     _series: &[super::league::MatchSample],
@@ -710,6 +784,13 @@ pub fn all_scenarios() -> Vec<ScenarioDef> {
             setup: setup_lance_hold,
             evaluate: eval_lance_hold,
         },
+        ScenarioDef {
+            id: "arty-siege",
+            description: "3 arty blu ferme (30m) vs 4 light rossi (13m): inviluppo",
+            ticks: 3600,
+            setup: setup_arty_siege,
+            evaluate: eval_arty_siege,
+        },
     ]
 }
 
@@ -847,11 +928,11 @@ mod tests {
     #[test]
     fn battery_has_nine_unique_scenarios() {
         let defs = all_scenarios();
-        assert_eq!(defs.len(), 9);
+        assert_eq!(defs.len(), 10);
         let mut ids: Vec<&str> = defs.iter().map(|d| d.id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 9);
+        assert_eq!(ids.len(), 10);
         for def in &defs {
             assert!(def.ticks >= 1800, "{} troppo corto", def.id);
             assert!(!def.description.is_empty());
@@ -860,14 +941,15 @@ mod tests {
 
     #[test]
     fn every_scenario_has_a_brain_or_a_script() {
-        // micro-duel, siege e counter-comp sono scriptati puri (niente
-        // cervelli), gli altri hanno almeno un cervello che gioca.
+        // micro-duel, siege, counter-comp e lance-hold sono scriptati puri
+        // (niente cervelli), gli altri hanno almeno un cervello che gioca.
         for def in all_scenarios() {
             let (blue, red) = brains_for(def.id);
             if def.id == "micro-duel"
                 || def.id == "siege"
                 || def.id == "counter-comp"
                 || def.id == "lance-hold"
+                || def.id == "arty-siege"
             {
                 assert!(blue.is_none() && red.is_none(), "{}", def.id);
             } else {

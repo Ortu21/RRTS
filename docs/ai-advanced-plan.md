@@ -288,9 +288,25 @@ checksum/winrate.
     (stessi FAIL pre-esistenti a tick corti); `threat-sane` riporta i layer.
   - `ai-scenarios` all_pass True, 9/9 checksum bit-identici a 0.0.22
     (commander-snipe incluso: `0xf9c7…`): lo spread non ribalta alcuna
-    decisione della suite — rappresentazione pronta per 0.0.24 (scout pesati,
-    anelli torrette sul layer statico), suite da estendere con scenari
-    range-sensibili (assedio arty vs linea corta).
-- [ ] Debito futuro (specificato, non codice): threat multilayer range-aware
-  (Mark/Zielinski/Lewis), opponent con isteresi + scout information-gain
-  (Welsh/Walsh/Zielinski), threat cache perf, TrueSkill/hot-reload (mai).
+    decisione della suite — rappresentazione pronta per 0.0.24.
+- [x] 0.0.24 opponent isteresi + scout information-gain (branch
+  `feat/0.0.24-opponent-hysteresis`, spec `docs/ai/024-opponent-hysteresis.md`):
+  `OpponentBelief{stable,candidate,streak}` + `FLIP_AFTER=12` (≈3s) +
+  `belief_confidence()` + `adjust_courage_conf()`/`mix_bias_conf()` (conf=1:
+  bit-identici); `AiSnapshot.opponent/opp_confidence` stampati da
+  `refresh_snapshots` (percezione, mai stato); `AiState.opponent_belief`
+  (reset su `R`); `decide()` legge i campi (firma invariata);
+  `scout::info_gain()` (3×3, agli estremi = novelty binaria) al posto della
+  novelty in frontiera; nuovo scenario `arty-siege` (3 arty ferme 30m vs
+  4 light 13m, scriptato: inviluppo 4/4 morti, 3/3 arty in piedi); check
+  `opponent-sane`.
+  - `cargo test` 279 verdi (3 belief + 1 info-gain + 1 integrazione live-app),
+    `clippy -D warnings` verde, `fmt` verde, `classify_accuracy` ≥80% invariata.
+  - `ai-test` 1800t×2: checksum `0xcdc063b96cb87d34` bit-identici a `dev`.
+  - `ai-scenarios` all_pass True: 9/9 checksum bit-identici a 0.0.23 +
+    `arty-siege` PASS deterministico (`0x5a5b…`) — né isteresi né info-gain
+    ribaltano decisioni della suite (contatti tardivi/assenti nei tick coperti,
+    frontiera dominata dai deep-vergine come prima).
+- [ ] Debito futuro (specificato, non codice): micro generalizzato
+  (kiting Uriarte per-unità), planner BOSS-lite + eval hardening (mirror-bias,
+  Elo online), TrueSkill/hot-reload (mai).

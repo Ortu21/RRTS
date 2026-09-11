@@ -597,13 +597,16 @@ pub fn tech_pick(
     opponent: super::opponent::OpponentKind,
     tech_count: usize,
     max_tech: usize,
+    confidence: f32,
 ) -> Option<UnitKind> {
     if foe.is_empty() || tech_count >= max_tech {
         return None;
     }
     let mut best: Option<(UnitKind, f32, u32)> = None;
     for (kind, w) in tech_mix.iter().filter(|(_, w)| *w > 0) {
-        let edge = counter_edge(*kind, foe) * super::opponent::mix_bias(*kind, opponent);
+        // 0.0.24 — bias opponent pesato per confidence (conf=1: identico).
+        let edge =
+            counter_edge(*kind, foe) * super::opponent::mix_bias_conf(*kind, opponent, confidence);
         if edge <= TECH_EDGE_MIN {
             continue;
         }
@@ -624,16 +627,20 @@ pub fn tech_pick(
 /// Pesi mix già corretti per counter e opponent-bias: (kind, peso*edge*bias).
 /// Puro. 0.0.19: il bias da tabella `opponent::mix_bias` (±0.1) sposta il mix
 /// verso i counter della classe avversaria; Unknown = 1.0 = vecchio comportamento.
+/// 0.0.24: bias pesato per confidence (conf=1: identico).
 fn weighted_mix(
     mix: &[(UnitKind, u32)],
     foe: &[(UnitKind, f32)],
     opponent: super::opponent::OpponentKind,
+    confidence: f32,
 ) -> Vec<(UnitKind, f32)> {
     mix.iter()
         .map(|(kind, w)| {
             (
                 *kind,
-                *w as f32 * counter_edge(*kind, foe) * super::opponent::mix_bias(*kind, opponent),
+                *w as f32
+                    * counter_edge(*kind, foe)
+                    * super::opponent::mix_bias_conf(*kind, opponent, confidence),
             )
         })
         .collect()
@@ -1078,11 +1085,12 @@ pub fn decide_with_threat(
     // 0.0.17 — comp nemica stimata una volta per tick: guida i pesi mix
     // (counter) e il predittore Lanchester. Vuota = nemico ignoto.
     let foe = foe_mix(snapshot);
-    // 0.0.19 — opponent modeling leggero: classifica da conteggi freschi +
-    // timing primo contatto + edifici visti → shift mix/courage ±0.1 da
-    // tabella. Unknown = neutro = vecchio comportamento.
-    let opponent = super::opponent::classify(snapshot);
-    let courage = super::opponent::adjust_courage(personality.courage, opponent);
+    // 0.0.24 — opponent modeling con isteresi: classe STABILE + confidence
+    // dalla percezione (`refresh_snapshots`), mai classifica istantanea.
+    // A credenza convergente (conf=1) pesi bit-identici ai vecchi.
+    let opponent = snapshot.opponent;
+    let opp_conf = snapshot.opp_confidence;
+    let courage = super::opponent::adjust_courage_conf(personality.courage, opponent, opp_conf);
 
     // 2. Produzione: una enqueue per factory libera (N lab = N code in
     // parallelo). Le bloccate si saltano: accodare lì brucia solo eco.
@@ -1115,7 +1123,7 @@ pub fn decide_with_threat(
             // LabT2: mix pesante T2 pesato per counter + bias opponent. Il gate
             // di `enqueue` lo ribadisce, ma qui non si emette mai un T2 verso
             // una T1.
-            pick_deficit(&weighted_mix(&T2_MIX, &foe, opponent), |k| {
+            pick_deficit(&weighted_mix(&T2_MIX, &foe, opponent, opp_conf), |k| {
                 count_kind(snapshot, &queued_all, k)
             })
         } else {
@@ -1135,6 +1143,7 @@ pub fn decide_with_threat(
                 opponent,
                 tech_count,
                 personality.max_tech,
+                opp_conf,
             ) {
                 tech
             } else {
@@ -1151,7 +1160,7 @@ pub fn decide_with_threat(
                 if mix.is_empty() {
                     continue;
                 }
-                pick_deficit(&weighted_mix(&mix, &foe, opponent), |k| {
+                pick_deficit(&weighted_mix(&mix, &foe, opponent, opp_conf), |k| {
                     count_kind(snapshot, &queued_all, k)
                 })
             }
@@ -1926,7 +1935,8 @@ mod tests {
                 &lights,
                 OpponentKind::Unknown,
                 0,
-                2
+                2,
+                1.0
             ),
             Some(UnitKind::MgTank)
         );
@@ -1936,7 +1946,8 @@ mod tests {
                 &heavies,
                 OpponentKind::Unknown,
                 0,
-                2
+                2,
+                1.0
             ),
             Some(UnitKind::MortarTank)
         );
@@ -1947,7 +1958,8 @@ mod tests {
                 &[],
                 OpponentKind::Unknown,
                 0,
-                2
+                2,
+                1.0
             ),
             None
         );
@@ -1957,7 +1969,8 @@ mod tests {
                 &lights,
                 OpponentKind::Unknown,
                 2,
-                2
+                2,
+                1.0
             ),
             None
         );
@@ -1967,7 +1980,8 @@ mod tests {
                 &lights,
                 OpponentKind::Unknown,
                 0,
-                0
+                0,
+                1.0
             ),
             None
         );

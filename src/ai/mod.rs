@@ -178,6 +178,9 @@ pub struct AiState {
     /// stale tra match (entro il match la chiave tick basta: stesso tick =
     /// stesso snapshot = stessa mappa).
     pub threat_cache: threat::ThreatCache,
+    /// 0.0.24 — credenza avversaria per-team (isteresi in `refresh_snapshots`,
+    /// letta da `decide` via snapshot). Reset su `R` con lo stato.
+    pub opponent_belief: BTreeMap<u8, opponent::OpponentBelief>,
 }
 
 /// Punto 1 — avanza il contatore onde: conta solo il passaggio a un nuovo
@@ -793,5 +796,50 @@ mod tests {
             resumed.orders_issued + resumed.builds_done + resumed.enqueues_done
                 > before.orders_issued + before.builds_done + before.enqueues_done
         );
+    }
+
+    /// 0.0.24 — integrazione credenza in App live. Tre contatti freschi
+    /// sostenuti per il team 0 (massa rusher) fanno flippare la stabile a
+    /// Rusher entro circa 3s di letture (12 tick snapshot); lo snapshot
+    /// stampa classe e confidence maggiore di zero.
+    #[test]
+    fn belief_converges_on_sustained_contact_in_live_app() {
+        use crate::ai::{AiClock, EnemyMemory, opponent::OpponentKind};
+        let mut app = playground_app();
+        app.update();
+        let tick = app.world().resource::<AiClock>().tick;
+        app.world_mut()
+            .resource_mut::<EnemyMemory>()
+            .0
+            .entry(0)
+            .or_default()
+            .extend((0..3).map(|i| crate::ai::memory::Contact {
+                entity_bits: 900_000 + i,
+                pos: Vec3::new(50.0 + i as f32 * 5.0, 0.0, 50.0),
+                tick,
+                kind: Some(crate::units::UnitKind::HeavyTank),
+                hp: 100.0,
+                building: false,
+            }));
+        // ~5s sim = ~20 snapshot: oltre i 12 necessari al flip, dentro il
+        // fresh (120) e il TTL (240) dei contatti iniettati.
+        for _ in 0..300 {
+            app.update();
+        }
+        let world = app.world();
+        let belief = world
+            .resource::<AiState>()
+            .opponent_belief
+            .get(&0)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(belief.stable, OpponentKind::Rusher);
+        let snap = world
+            .resource::<AiSnapshots>()
+            .0
+            .get(&0)
+            .expect("snapshot team 0");
+        assert_eq!(snap.opponent, OpponentKind::Rusher);
+        assert!(snap.opp_confidence > 0.0, "conf {}", snap.opp_confidence);
     }
 }

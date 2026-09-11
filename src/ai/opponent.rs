@@ -15,11 +15,12 @@ use crate::{economy::balance::BuildingKind, units::UnitKind};
 use super::{memory::MEMORY_FRESH_TICKS, snapshot::AiSnapshot};
 
 /// Classi avversarie (soglie, niente ML).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum OpponentKind {
     Rusher,
     Turtle,
     Eco,
+    #[default]
     Unknown,
 }
 
@@ -163,6 +164,82 @@ pub fn adjust_courage(base: f32, opponent: OpponentKind) -> f32 {
 /// Bias mix da tabella per (kind, avversario). Puro, lookup da tabella.
 pub fn mix_bias(kind: UnitKind, opponent: OpponentKind) -> f32 {
     MIX_BIAS[opponent.index()][kind.index()]
+}
+
+/// 0.0.24 — letture concordi per cambiare classe stabile (≈3s a cadence
+/// snapshot 4Hz: niente flip-flicker su contatti singoli o rumorosi).
+pub const FLIP_AFTER: u32 = 12;
+
+/// 0.0.24 — credenza avversaria con isteresi (Walsh: la percezione ha
+/// inerzia, la classifica istantanea no). `stable` = classe usata da
+/// mix/courage; `candidate` + `streak` = convergenza in corso. Default =
+/// Unknown su tutto (buio). Pura nelle transizioni (stato passato dentro).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpponentBelief {
+    pub stable: OpponentKind,
+    pub candidate: OpponentKind,
+    pub streak: u32,
+}
+
+/// 0.0.24 — avanza la credenza con una lettura grezza (`classify`):
+/// lettura == stabile → convergenza azzerata; lettura diversa e == candidata
+/// → streak+1 (flip a `FLIP_AFTER`); lettura nuova → candidata + streak 1.
+/// Deterministico, niente allocazioni.
+pub fn update_belief(belief: &mut OpponentBelief, raw: OpponentKind) {
+    if raw == belief.stable {
+        belief.candidate = raw;
+        belief.streak = 0;
+        return;
+    }
+    if raw == belief.candidate {
+        belief.streak = belief.streak.saturating_add(1);
+    } else {
+        belief.candidate = raw;
+        belief.streak = 1;
+    }
+    if belief.streak >= FLIP_AFTER {
+        belief.stable = raw;
+        belief.streak = 0;
+    }
+}
+
+/// 0.0.24 — confidence 0..1 della classe stabile (Walsh confidence): classe
+/// nota × mappa esplorata × occhi freschi. Unknown = 0 (nessuna classe, shift
+/// comunque nulli). Nota con mappa vergine e senza occhi = 0.45 (agisce ma
+/// smorzata); con occhi ed esplorato → 1.0 (pesi pieni). Pura.
+pub fn belief_confidence(stable: OpponentKind, explored_pct: f32, fresh_eyes: bool) -> f32 {
+    if stable == OpponentKind::Unknown {
+        return 0.0;
+    }
+    let explored = if explored_pct.is_finite() {
+        explored_pct.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (0.45 + 0.35 * explored + if fresh_eyes { 0.2 } else { 0.0 }).clamp(0.0, 1.0)
+}
+
+/// 0.0.24 — courage con confidence: `conf=1` = identico a `adjust_courage`
+/// (continuità), `conf=0` = metà shift (mai zero: la classe stabile, anche
+/// incerta, vale più di Unknown). Puro.
+pub fn adjust_courage_conf(base: f32, opponent: OpponentKind, confidence: f32) -> f32 {
+    let conf = if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (base + courage_shift(opponent) * (0.5 + 0.5 * conf)).clamp(0.0, 1.2)
+}
+
+/// 0.0.24 — bias mix con confidence: `conf=1` = identico a `mix_bias`
+/// (continuità), `conf=0` = dimezzata la deviazione da 1.0. Puro.
+pub fn mix_bias_conf(kind: UnitKind, opponent: OpponentKind, confidence: f32) -> f32 {
+    let conf = if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    1.0 + (mix_bias(kind, opponent) - 1.0) * (0.5 + 0.5 * conf)
 }
 
 #[cfg(test)]
@@ -387,5 +464,69 @@ mod tests {
         let acc = hits as f32 / cases.len() as f32;
         assert!(acc >= 0.8, "accuracy {acc:.2} < 0.80 ({hits}/10)");
         let _ = UnitOrder::Idle;
+    }
+
+    #[test]
+    fn belief_flips_after_streak_not_before() {
+        // 0.0.24 — una lettura sola non flippa (niente flicker); FLIP_AFTER
+        // concordi sì; lettura == stabile azzera.
+        let mut b = OpponentBelief::default();
+        assert_eq!(b.stable, OpponentKind::Unknown);
+        update_belief(&mut b, OpponentKind::Rusher);
+        assert_eq!(b.stable, OpponentKind::Unknown);
+        assert_eq!(b.candidate, OpponentKind::Rusher);
+        // Prime 11 letture concordi: ancora Unknown; la 12ª flippa.
+        for _ in 1..FLIP_AFTER - 1 {
+            update_belief(&mut b, OpponentKind::Rusher);
+            assert_eq!(b.stable, OpponentKind::Unknown);
+        }
+        update_belief(&mut b, OpponentKind::Rusher);
+        assert_eq!(b.stable, OpponentKind::Rusher);
+        // Rumore singolo in mezzo: ricomincia da capo.
+        let mut b2 = OpponentBelief::default();
+        for _ in 0..FLIP_AFTER - 1 {
+            update_belief(&mut b2, OpponentKind::Turtle);
+        }
+        update_belief(&mut b2, OpponentKind::Eco);
+        assert_eq!(b2.stable, OpponentKind::Unknown);
+        assert_eq!(b2.candidate, OpponentKind::Eco);
+        // Conferma della stabile: streak azzerato, mai flip spurio.
+        update_belief(&mut b, OpponentKind::Rusher);
+        assert_eq!((b.stable, b.streak), (OpponentKind::Rusher, 0));
+    }
+
+    #[test]
+    fn belief_confidence_bounds() {
+        assert_eq!(belief_confidence(OpponentKind::Unknown, 1.0, true), 0.0);
+        let blind = belief_confidence(OpponentKind::Rusher, 0.0, false);
+        assert!((blind - 0.45).abs() < 1e-6, "{blind}");
+        let full = belief_confidence(OpponentKind::Rusher, 1.0, true);
+        assert!((full - 1.0).abs() < 1e-6, "{full}");
+        let mid = belief_confidence(OpponentKind::Turtle, 0.5, true);
+        assert!(mid > blind && mid < full, "{mid}");
+        // Sporco dentro, numero fuori.
+        assert_eq!(
+            belief_confidence(OpponentKind::Rusher, f32::NAN, false),
+            0.45
+        );
+        assert!((0.0..=1.0).contains(&belief_confidence(OpponentKind::Eco, 99.0, true)));
+    }
+
+    #[test]
+    fn weighted_matches_unweighted_at_full_confidence() {
+        // 0.0.24 — conf=1: stessi numeri di prima (continuità); conf=0: shift
+        // dimezzati ma mai nulli; eco-only resta "mai".
+        for opp in OpponentKind::ALL {
+            assert_eq!(adjust_courage_conf(0.6, opp, 1.0), adjust_courage(0.6, opp));
+            for kind in UnitKind::ALL {
+                assert_eq!(mix_bias_conf(kind, opp, 1.0), mix_bias(kind, opp));
+            }
+            // Eco-only non spara mai comunque.
+            assert!(adjust_courage_conf(1.1, opp, 0.0) >= 1.0);
+        }
+        // Rusher -0.1: conf 0 → -0.05.
+        assert!((adjust_courage_conf(0.55, OpponentKind::Rusher, 0.0) - 0.50).abs() < 1e-6);
+        // NaN = 0 (mai NaN in cascata).
+        assert!((adjust_courage_conf(0.55, OpponentKind::Rusher, f32::NAN) - 0.50).abs() < 1e-6);
     }
 }

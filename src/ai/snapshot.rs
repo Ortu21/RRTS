@@ -103,6 +103,13 @@ pub struct AiSnapshot {
     /// campionata da `VisibilityMap` in `build_snapshot`. Vuota = nessun dato
     /// fog (test senza plugin): la frontiera tratta tutto come inesplorato.
     pub explored_cells: Vec<bool>,
+    /// 0.0.24 — classe avversaria STABILE (isteresi in `opponent::update_belief`,
+    /// aggiornata da `refresh_snapshots`): la strategia legge questa, mai la
+    /// classifica istantanea. Default Unknown = buio.
+    pub opponent: super::opponent::OpponentKind,
+    /// 0.0.24 — confidence 0..1 della classe stabile (classe nota × esplorato
+    /// × occhi freschi): pesa gli shift mix/courage. Default 0.
+    pub opp_confidence: f32,
     #[allow(dead_code)]
     pub stock: [f64; 2],
     #[allow(dead_code)]
@@ -403,6 +410,10 @@ pub fn build_snapshot(
         stock,
         income,
         demand,
+        // 0.0.24 — percezione neutra: la credenza la stampa `refresh_snapshots`
+        // (isteresi); chi costruisce snapshot a mano imposta i campi se serve.
+        opponent: super::opponent::OpponentKind::Unknown,
+        opp_confidence: 0.0,
     }
 }
 
@@ -466,6 +477,7 @@ pub fn refresh_snapshots(
     economy: Option<Res<Economy>>,
     mut snapshots: ResMut<super::AiSnapshots>,
     mut memory: ResMut<super::EnemyMemory>,
+    mut ai_state: ResMut<super::AiState>,
     deposits: Option<Res<crate::structures::MetalDeposits>>,
     units: Query<(Entity, &Transform, &Team, &UnitKind, &UnitOrder, &Health), With<Unit>>,
     enemy_units: Query<(Entity, &Transform, &Team, &UnitKind, &Health), With<Unit>>,
@@ -551,9 +563,8 @@ pub fn refresh_snapshots(
                 )
             })
             .collect();
-        snapshots.0.insert(
-            brain.team,
-            build_snapshot(
+        snapshots.0.insert(brain.team, {
+            let mut snap = build_snapshot(
                 brain.team,
                 tick,
                 &flat_units,
@@ -563,8 +574,22 @@ pub fn refresh_snapshots(
                 map.as_deref(),
                 &mem_view,
                 &deposits.0,
-            ),
-        );
+            );
+            // 0.0.24 — credenza avversaria: lettura grezza → isteresi →
+            // stampa in percezione. La strategia legge SOLO questi campi
+            // (mai `classify` diretto, mai stato): a credenza convergente
+            // (conf=1) i pesi sono bit-identici ai vecchi.
+            let raw = super::opponent::classify(&snap);
+            let belief = ai_state.opponent_belief.entry(brain.team).or_default();
+            super::opponent::update_belief(belief, raw);
+            snap.opponent = belief.stable;
+            snap.opp_confidence = super::opponent::belief_confidence(
+                belief.stable,
+                snap.explored_pct,
+                super::strategy::has_fresh_eyes(&snap),
+            );
+            snap
+        });
     }
 }
 

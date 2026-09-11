@@ -212,11 +212,24 @@ pub fn evaluate_balance(world: &mut World, team: u8) -> Vec<CheckResult> {
         && threat_max >= 0.0
         && explored.is_finite()
         && (0.0..=1.0).contains(&explored);
+    // 0.0.23 — layer sani: finiti, non-negativi, somma = combinato.
+    let (layers_ok, layer_detail) = world
+        .get_resource::<super::AiSnapshots>()
+        .and_then(|s| s.0.get(&team))
+        .map(|snap| {
+            let map = super::threat::build_threat(snap);
+            let (live, rem, stat) = map.means();
+            (
+                map.layers_sane(),
+                format!("live={live:.1} rem={rem:.1} static={stat:.1}"),
+            )
+        })
+        .unwrap_or((true, "no snapshot".to_owned()));
     checks.push(CheckResult {
         name: "threat-sane",
-        pass: threat_sane,
+        pass: threat_sane && layers_ok,
         detail: format!(
-            "threat mean={threat_mean:.1} max={threat_max:.1} explored={:.1}%",
+            "threat mean={threat_mean:.1} max={threat_max:.1} explored={:.1}% {layer_detail}",
             explored * 100.0
         ),
     });

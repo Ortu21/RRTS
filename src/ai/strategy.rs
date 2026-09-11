@@ -774,7 +774,19 @@ pub fn wave_group(
 /// 0.0.20 — base minacciata: nemico visibile o hotspot threat entro il raggio
 /// da casa. Con la base sotto pressione l'ondata non parte (richiamo
 /// difensivo: il micro scherma a casa). Solo snapshot onesto. Puro.
+/// Costruisce la threat e delega (i sistemi con cache usano `..._with_map`).
 pub fn base_under_threat(snapshot: &AiSnapshot, scenario: Scenario) -> bool {
+    let threat = super::threat::build_threat(snapshot);
+    base_under_threat_with_map(snapshot, scenario, &threat)
+}
+
+/// 0.0.23 — come `base_under_threat`, con mappa già pronta dalla `ThreatCache`.
+/// Stessa matematica: a mappa uguale, stesso booleano. Puro.
+pub fn base_under_threat_with_map(
+    snapshot: &AiSnapshot,
+    scenario: Scenario,
+    threat: &super::threat::ThreatMap,
+) -> bool {
     let home = scenario.center(snapshot.team as usize);
     if snapshot
         .visible_enemies
@@ -783,7 +795,7 @@ pub fn base_under_threat(snapshot: &AiSnapshot, scenario: Scenario) -> bool {
     {
         return true;
     }
-    super::threat::build_threat(snapshot)
+    threat
         .hotspot()
         .is_some_and(|h| h.xz().distance(home.xz()) < BASE_THREAT_RADIUS)
 }
@@ -885,12 +897,37 @@ pub fn hold_position(anchor: Vec3, threat: Vec3, range: f32) -> Vec3 {
 /// (catch-up: se la massa non era pronta al confine, parte appena pronta
 /// invece di aspettare 75s — e se la cadenza salta un tick d'ondata, parte al
 /// successivo). Puro: lo stato resta fuori, qui solo confronto.
+/// Costruisce la threat (1 build) e delega a `decide_with_threat`: i sistemi
+/// con cache chiamano quella direttamente (zero rebuild).
 pub fn decide(
     snapshot: &AiSnapshot,
     personality: &Personality,
     scenario: Scenario,
     factories: &[FactoryView],
     last_wave_id: u64,
+) -> Vec<AiIntent> {
+    let threat = super::threat::build_threat(snapshot);
+    decide_with_threat(
+        snapshot,
+        personality,
+        scenario,
+        factories,
+        last_wave_id,
+        &threat,
+    )
+}
+
+/// 0.0.23 — come `decide`, ma con threat map già pronta (dalla `ThreatCache`
+/// di `ai_tick`: 1 build per team per strategy-tick invece di ~5). Stessa
+/// matematica di `decide`: a mappa uguale, intenti bit-identici (test
+/// `decide_with_threat_matches_decide`). Puro e deterministico.
+pub fn decide_with_threat(
+    snapshot: &AiSnapshot,
+    personality: &Personality,
+    scenario: Scenario,
+    factories: &[FactoryView],
+    last_wave_id: u64,
+    threat: &super::threat::ThreatMap,
 ) -> Vec<AiIntent> {
     let mut intents = Vec::new();
 
@@ -999,8 +1036,8 @@ pub fn decide(
         }
     }
     // 0.0.22 — minaccia base una volta per tick (riusata da difesa utility
-    // e tattica ondate): threat map 32×32 dallo snapshot onesto.
-    let threatened_early = base_under_threat(snapshot, scenario);
+    // e tattica ondate): threat map passata dal chiamante (cache 0.0.23).
+    let threatened_early = base_under_threat_with_map(snapshot, scenario, threat);
     // Difesa statica: torrette vicino alla base (l'executor cerca lo spot in
     // spirale dal centro). Conta anche i siti: niente doppie richieste.
     // 0.0.22 — gated da `defense_urgency × w_defense` (default passa sempre
@@ -1211,7 +1248,7 @@ pub fn decide(
     // (explored) e riacquisiscono (occhi per il courage, che attacca a soglia
     // invece che a massa cieca: first-blood).
     {
-        let threat = super::threat::build_threat(snapshot);
+        // 0.0.23 — threat dalla cache del chiamante (zero rebuild qui).
         let free_scouts = snapshot
             .my_units
             .iter()
@@ -1237,7 +1274,7 @@ pub fn decide(
         let n = free_scouts.min(super::scout::MAX_SCOUTS);
         if n > 0 {
             for destination in
-                super::scout::frontier_targets(snapshot, scenario, &threat, personality, n)
+                super::scout::frontier_targets(snapshot, scenario, threat, personality, n)
             {
                 intents.push(AiIntent::Scout { destination });
             }
@@ -3759,6 +3796,44 @@ mod tests {
         assert!(
             !off.iter().any(|i| matches!(i, AiIntent::Scout { .. })),
             "w_scout=0 deve sopprimere: {off:?}"
+        );
+    }
+
+    #[test]
+    fn decide_with_threat_matches_decide() {
+        // 0.0.23 — a mappa uguale (stesso snapshot), la via cached emette gli
+        // stessi intenti della via con build interna: la cache non cambia la
+        // decisione, solo il costo.
+        let mut snap = empty_snapshot(1);
+        idle_commander(&mut snap);
+        idle_engineer(&mut snap);
+        let threat = super::super::threat::build_threat(&snap);
+        for pers in [Personality::TURTLE, Personality::RUSHER] {
+            let a = decide(&snap, &pers, Scenario::Playground, &[], 0);
+            let b = decide_with_threat(&snap, &pers, Scenario::Playground, &[], 0, &threat);
+            assert_eq!(a, b);
+        }
+        // Anche con nemici visibili (hotspot/threat attivi nei rami).
+        snap.visible_enemies.push(super::super::snapshot::AiEnemy {
+            entity: Entity::from_bits(910),
+            pos: Vec3::new(60.0, 0.0, 0.0),
+            kind: UnitKind::HeavyTank,
+            health: crate::units::archetype(UnitKind::HeavyTank).max_health,
+        });
+        let threat = super::super::threat::build_threat(&snap);
+        let a = decide(&snap, &Personality::TURTLE, Scenario::Playground, &[], 0);
+        let b = decide_with_threat(
+            &snap,
+            &Personality::TURTLE,
+            Scenario::Playground,
+            &[],
+            0,
+            &threat,
+        );
+        assert_eq!(a, b);
+        assert!(
+            base_under_threat(&snap, Scenario::Playground)
+                == base_under_threat_with_map(&snap, Scenario::Playground, &threat)
         );
     }
 

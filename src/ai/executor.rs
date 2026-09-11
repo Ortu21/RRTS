@@ -13,12 +13,15 @@ use bevy::prelude::*;
 use super::{
     snapshot::AiSnapshot,
     strategy::{AiIntent, find_build_spot},
+    threat::ThreatMap,
 };
 
 /// Applica intenti con budget: max N ordini unità + 1 build.
 /// Le Enqueue factory sono applicate dal chiamante via query mutabile;
-/// qui contiamo solo quante ne ha richieste la strategia.
-/// Ritorna (ordini_unità, builds, enqueues_richieste, enqueue_targets).
+/// qui contiamo solo quante ne ha richiesta la strategia.
+/// `cached_threat`: mappa 0.0.23 dalla `ThreatCache` (`Some` in `ai_tick`,
+/// `None` nel micro/test = build lazy locale solo se un intento Build/Scout
+/// la richiede davvero). Ritorna (ordini_unità, builds, enqueues_richieste... ).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn execute_movement_and_build(
     commands: &mut Commands,
@@ -32,10 +35,21 @@ pub fn execute_movement_and_build(
     buildings: &[(Team, BuildingKind, Vec3, bool)],
     builders_live: &[(Team, Vec3, f32)],
     unit_footprints: &[(Vec3, f32)],
+    cached_threat: Option<&ThreatMap>,
 ) -> (usize, usize, Vec<(Entity, UnitKind)>) {
     let mut unit_orders = 0;
     let mut builds = 0;
     let mut enqueues: Vec<(Entity, UnitKind)> = Vec::new();
+    // Threat lazy: riusa la cache quando c'è, altrimenti costruisce una volta
+    // per chiamata (solo se Build/Scout presenti: gli altri rami non la toccano).
+    let fresh;
+    let threat: &ThreatMap = match cached_threat {
+        Some(m) => m,
+        None => {
+            fresh = super::threat::build_threat(snapshot);
+            &fresh
+        }
+    };
     // 0.0.19 — scout già taskati nel tick (un intento Scout = uno scout:
     // `decide()` emette mete distinte per max 2 scout, mai in pila).
     let mut tasked_scouts: Vec<Entity> = Vec::new();
@@ -93,7 +107,7 @@ pub fn execute_movement_and_build(
                         unit_footprints,
                     )
                 } else if *kind == BuildingKind::Wall {
-                    let hotspot = super::threat::build_threat(snapshot)
+                    let hotspot = threat
                         .hotspot()
                         .unwrap_or_else(|| scenario.attack_target(team as usize));
                     super::strategy::find_wall_spot(
@@ -107,7 +121,7 @@ pub fn execute_movement_and_build(
                     )
                 } else {
                     let anchor = (*kind == BuildingKind::Turret)
-                        .then(|| super::threat::build_threat(snapshot).hotspot())
+                        .then(|| threat.hotspot())
                         .flatten();
                     find_build_spot(
                         grid,
@@ -323,7 +337,7 @@ pub fn execute_movement_and_build(
                 // riparazione walkable così la frontiera non genera mai
                 // nav-failure. Chi è in rotta fredda la finisce (niente churn
                 // da re-target a 1Hz), al prossimo Idle nuova frontiera.
-                let threat = super::threat::build_threat(snapshot);
+                // 0.0.23 — threat dalla cache del chiamante (zero rebuild qui).
                 let mut scouts: Vec<(Entity, Vec3, UnitOrder)> = units
                     .iter()
                     .filter(|(e, _, k, o)| {
@@ -343,7 +357,7 @@ pub fn execute_movement_and_build(
                     let waypoint = super::scout::scout_waypoint(
                         pos,
                         *destination,
-                        &threat,
+                        threat,
                         super::scout::SCOUT_THREAT_THRESHOLD,
                     );
                     let repaired = grid.clear_point_for(waypoint, 0.5);
@@ -513,6 +527,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert_eq!(orders, 2, "budget micro = 2 ordini");
         assert_eq!(builds, 0);
@@ -560,6 +575,7 @@ mod tests {
                 &[],
                 &live,
                 &[],
+                None,
             );
             assert_eq!(builds, builders, "un cantiere per builder libero");
             app.world_mut().flush();
@@ -634,6 +650,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert_eq!(orders, 0, "niente riordini verso lo stesso slot");
     }

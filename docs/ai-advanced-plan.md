@@ -273,6 +273,24 @@ checksum/winrate.
     build programmati non abbordabili skippati, più stock per la difesa).
   - League quick/full full-cap = nightly (policy sessione: solo probe
     ticks-capped in interattiva).
+- [x] 0.0.22 utility full — vedi sopra (branch mergiato in `dev`).
+- [x] 0.0.23 threat multistrato + cache (branch `feat/0.0.23-threat-multilayer`,
+  spec `docs/ai/023-threat-multilayer.md`): layer `live/remembered/static_def`
+  (`cells` = somma, API combinata invariata), spread in gittata da tabella con
+  falloff lineare (`deposit()` row-major), `threat_range()/building_range()`,
+  muri restano 0 (nessun DPS). `ThreatCache` in `AiState` (reset su `R`, chiave
+  tick): 1 build per team per strategy-tick invece di ~5 (`decide_with_threat`
+  + `base_under_threat_with_map` + executor con `Option<&ThreatMap>`, micro a
+  `None`). Sistemi restati a ≤16 param (niente slot nuovi: cache nello stato).
+  - `cargo test` 274 verdi (6 nuovi: spread/bound/layer/range/cache/equivalenza
+    decide), `clippy -D warnings` verde, `fmt` verde.
+  - `ai-test` 1800t×2: checksum `0xcdc063b96cb87d34` bit-identici a `dev`
+    (stessi FAIL pre-esistenti a tick corti); `threat-sane` riporta i layer.
+  - `ai-scenarios` all_pass True, 9/9 checksum bit-identici a 0.0.22
+    (commander-snipe incluso: `0xf9c7…`): lo spread non ribalta alcuna
+    decisione della suite — rappresentazione pronta per 0.0.24 (scout pesati,
+    anelli torrette sul layer statico), suite da estendere con scenari
+    range-sensibili (assedio arty vs linea corta).
 - [ ] Debito futuro (specificato, non codice): threat multilayer range-aware
   (Mark/Zielinski/Lewis), opponent con isteresi + scout information-gain
   (Welsh/Walsh/Zielinski), threat cache perf, TrueSkill/hot-reload (mai).

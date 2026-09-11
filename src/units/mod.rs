@@ -18,6 +18,7 @@ use crate::{
 use bevy::prelude::*;
 
 pub mod archetype;
+pub(crate) mod commander_visual;
 pub use archetype::{UnitKind, archetype, kind_for_index};
 
 pub const UNIT_HALF_SIZE: Vec3 = Vec3::new(0.55, 0.8, 0.55);
@@ -37,6 +38,7 @@ impl Plugin for UnitPlugin {
         app.init_resource::<UnitIds>()
             .add_systems(Startup, spawn_units);
         if self.visuals {
+            app.add_plugins(commander_visual::CommanderVisualPlugin);
             app.add_systems(Startup, setup_visual_assets)
                 .add_systems(PostUpdate, add_visuals);
         }
@@ -83,6 +85,9 @@ pub struct SecondaryTurret;
 /// Visual-only, never read back by simulation.
 #[derive(Component)]
 pub struct BuilderBeacon;
+/// Prevent procedural visuals from being respawned after a GLB replaces the root mesh.
+#[derive(Component)]
+struct UnitVisualsPresent;
 /// Marker for the initial builder/base unit. Never queued in factories.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Commander;
@@ -369,7 +374,7 @@ struct UnitVisualAssets {
 fn add_visuals(
     mut commands: Commands,
     assets: Res<UnitVisualAssets>,
-    units: Query<(Entity, &Team, &UnitKind), (With<Unit>, Without<Mesh3d>)>,
+    units: Query<(Entity, &Team, &UnitKind), (With<Unit>, Without<UnitVisualsPresent>)>,
 ) {
     let UnitVisualAssets {
         body_meshes,
@@ -404,6 +409,7 @@ fn add_visuals(
         commands
             .entity(entity)
             .insert((
+                UnitVisualsPresent,
                 Mesh3d(body_meshes[kind.index()].clone()),
                 MeshMaterial3d(materials_by_team[team.0 as usize % 2].clone()),
             ))
@@ -412,9 +418,17 @@ fn add_visuals(
                     SelectionRing,
                     Mesh3d(ring.clone()),
                     MeshMaterial3d(ring_material.clone()),
-                    Transform::from_xyz(0.0, -UNIT_HALF_SIZE.y + 0.04, 0.0)
-                        .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-                        .with_scale(Vec3::splat(ring_scale)),
+                    Transform::from_xyz(
+                        0.0,
+                        -if is_commander {
+                            stats.body.y
+                        } else {
+                            UNIT_HALF_SIZE.y
+                        } + 0.04,
+                        0.0,
+                    )
+                    .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+                    .with_scale(Vec3::splat(ring_scale)),
                     Visibility::Hidden,
                 ));
                 parent.spawn((

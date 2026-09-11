@@ -1181,6 +1181,7 @@ fn spawn_beam(
 #[allow(clippy::type_complexity)]
 fn fire_weapons(
     mut commands: Commands,
+    mut commander_shots: Option<ResMut<Messages<crate::units::commander_visual::CommanderShot>>>,
     grid: Res<SpatialGrid>,
     clock: Res<CombatClock>,
     assets: Option<Res<ProjectileAssets>>,
@@ -1252,7 +1253,18 @@ fn fire_weapons(
         }
         state.remaining = weapon.cooldown;
         let muzzle_dir = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos());
-        let muzzle = transform.translation + muzzle_dir * crate::units::MUZZLE_REACH;
+        let commander = kind.is_some_and(|kind| kind.is_commander());
+        let muzzle = if commander {
+            if let Some(messages) = commander_shots.as_deref_mut() {
+                messages.write(crate::units::commander_visual::CommanderShot {
+                    owner: entity,
+                    secondary: false,
+                });
+            }
+            crate::units::commander_visual::muzzle(transform, turret.0, false)
+        } else {
+            transform.translation + muzzle_dir * crate::units::MUZZLE_REACH
+        };
         let team_mat = assets.team_material[team.0 as usize % 2].clone();
         match tech {
             WeaponTech::Laser => {
@@ -1392,6 +1404,7 @@ fn fire_weapons(
 #[allow(clippy::type_complexity)]
 fn fire_secondary(
     mut commands: Commands,
+    mut commander_shots: Option<ResMut<Messages<crate::units::commander_visual::CommanderShot>>>,
     grid: Res<SpatialGrid>,
     clock: Res<CombatClock>,
     assets: Option<Res<ProjectileAssets>>,
@@ -1405,6 +1418,7 @@ fn fire_secondary(
             &mut SecondaryWeaponState,
             &AttackTarget,
             &SecondaryTurretYaw,
+            Option<&UnitKind>,
         ),
         With<Unit>,
     >,
@@ -1412,7 +1426,7 @@ fn fire_secondary(
     let Some(assets) = assets else {
         return;
     };
-    for (entity, transform, team, weapon, mut state, target, turret) in &mut shooters {
+    for (entity, transform, team, weapon, mut state, target, turret, kind) in &mut shooters {
         if state.remaining > 0.0 {
             continue;
         }
@@ -1432,6 +1446,13 @@ fn fire_secondary(
             }
         }
         state.remaining = weapon.cooldown;
+        let commander = kind.is_some_and(|kind| kind.is_commander());
+        if commander && let Some(messages) = commander_shots.as_deref_mut() {
+            messages.write(crate::units::commander_visual::CommanderShot {
+                owner: entity,
+                secondary: true,
+            });
+        }
         let team_mat = assets.team_material[team.0 as usize % 2].clone();
         match weapon.tech {
             WeaponTech::Laser => {
@@ -1467,7 +1488,11 @@ fn fire_secondary(
             // Top-attack lobs from the sky above the locked point (dodgeable).
             _ => {
                 let muzzle_dir = Vec3::new(-turret.0.sin(), 0.0, -turret.0.cos());
-                let muzzle = transform.translation + muzzle_dir * 2.2 + Vec3::Y * 1.6;
+                let muzzle = if commander {
+                    crate::units::commander_visual::muzzle(transform, turret.0, true)
+                } else {
+                    transform.translation + muzzle_dir * 2.2 + Vec3::Y * 1.6
+                };
                 let dist = transform.translation.distance(target_position);
                 let offset =
                     spread_offset(entity.to_bits(), clock.tick, 1, weapon.spread_rad, dist);

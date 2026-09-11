@@ -78,6 +78,12 @@ Regola: split solo con re-export invariato + `cargo test` verde. Niente rename p
 - Nuovo ordine: variante `UnitOrder` + consumo in `movement` + grafica in `lines` + gate fog/comando.
 - Nuovo workload: variante `Workload` + orchestrazione in `benchmark`, riusa plugin gioco.
 - Nuovo tool debug: variante `DebugTool` in `ui::debug`, default OFF, mai letto dalla sim.
+- Nuovo asset GLB (solo Commander oggi): sorgente in `art/<nome>/` (`.blend` +
+  script `export_*.py`), export vendored in `assets/models/<nome>/`, contract
+  in `scripts/check_<nome>_asset.py` (nodi/clip/materiali Socket, niente
+  camere/skin/uri esterni). La sim non legge mai le transform importate:
+  socket balistici restano costanti pure in Rust (vedi `commander_visual::muzzle`).
+  Senza GLB il gioco usa il fallback procedurale (mai panic, mai asset mancanti in test).
 
 ## Vault esterno
 

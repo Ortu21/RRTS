@@ -30,5 +30,7 @@ RRTS_RUN_PROFILE=benchmark cargo run --locked --profile benchmark -- \
 # rendering/presentation; profile numbers are instrumented diagnostics.
 # Never mix the three when comparing baselines in benchmarks/history.
 cargo test fog > "$output/fog.log" 2>&1
-printf 'PASS: fmt, check, tests, clippy, quick benchmark, ai-test, economy and ai-scenarios correctness\n' | tee "$output/status.txt"
+# GLB contract (stdlib-only, sub-second): nodes, clips, sockets, materials.
+python3 scripts/check_commander_asset.py > "$output/commander-asset.log" 2>&1
+printf 'PASS: fmt, check, tests, clippy, quick benchmark, ai-test, economy, ai-scenarios and commander-asset correctness\n' | tee "$output/status.txt"
 printf 'Report: %s/benchmark/report.md\n' "$output"

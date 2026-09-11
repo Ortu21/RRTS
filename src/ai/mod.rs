@@ -172,6 +172,12 @@ pub struct AiState {
     /// Punto 1 — win_prob al lancio di ogni ondata *contata* (una per periodo).
     /// Serie corta (<= periodi del match): calibrazione courage dai dati veri.
     pub fire_win_probs: BTreeMap<u8, Vec<f32>>,
+    /// 0.0.23 — cache threat per-team (chiave = snapshot tick): vive qui e
+    /// non come risorsa separata per restare entro i 16 param Bevy di
+    /// `ai_tick`. Resettata con lo stato su `R` (`restart_on_r`), quindi mai
+    /// stale tra match (entro il match la chiave tick basta: stesso tick =
+    /// stesso snapshot = stessa mappa).
+    pub threat_cache: threat::ThreatCache,
 }
 
 /// Punto 1 — avanza il contatore onde: conta solo il passaggio a un nuovo
@@ -432,12 +438,21 @@ fn ai_tick(
         let apm = brain
             .max_orders_per_tick
             .min(brain.handicap.max_orders_per_tick);
-        let intents = strategy::decide(
+        // 0.0.23 — 1 build threat per team per strategy-tick: la cache in
+        // `AiState` evita i rebuild (prima ~5 build tra `decide` ed
+        // `executor`). La copia locale (16KB) chiude subito il prestito della
+        // cache così `last_wave`/stats restano mutuabili dopo (NLL).
+        let threat = state
+            .threat_cache
+            .get_or_build(brain.team, snapshot.tick, snapshot)
+            .clone();
+        let intents = strategy::decide_with_threat(
             snapshot,
             &pers,
             *scenario,
             &factory_queues,
             state.last_wave.get(&brain.team).copied().unwrap_or(0),
+            &threat,
         );
         if debug.as_deref().is_some_and(|d| d.enabled) {
             all_intent_labels.extend(intents.iter().map(|i| format!("M{}:{i:?}", brain.team)));
@@ -467,6 +482,7 @@ fn ai_tick(
         // Truppe del team.
         let flat_units = collect_flat_units(&units, brain.team);
 
+        // 0.0.23 — riuso: la stessa mappa di `decide_with_threat` sopra.
         let (orders, builds, enqueue_targets) = executor::execute_movement_and_build(
             &mut commands,
             snapshot,
@@ -479,6 +495,7 @@ fn ai_tick(
             &flat_buildings,
             &live_builders,
             &footprints,
+            Some(&threat),
         );
         // Enqueue via query mutabile (ordinata per determinismo).
         let mut enqueues_done = 0;
@@ -583,6 +600,8 @@ fn micro_tick(
         }
         let flat_units = collect_flat_units(&units, brain.team);
 
+        // 0.0.23 — il micro non ordina mai Build/Scout: niente mappa (zero
+        // build qui; l'executor costruisce lazy solo se servisse davvero).
         let (orders, _, _) = executor::execute_movement_and_build(
             &mut commands,
             snapshot,
@@ -595,6 +614,7 @@ fn micro_tick(
             &flat_buildings,
             &no_builders,
             &no_footprints,
+            None,
         );
         state.stats_mut(brain.team).orders_issued += orders as u64;
         state.stats_mut(brain.team).micro_orders += orders as u64;

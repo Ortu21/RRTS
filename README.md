@@ -1,4 +1,4 @@
-# Rust RTS — v0.0.14
+# Rust RTS — v0.0.25
 
 A procedural 3D RTS prototype in Rust 2024 and Bevy 0.19. No external assets. Gameplay depends only on Bevy; benchmark reporting and machine metadata additionally use serde/serde_json and sysinfo (benchmark-only code paths).
 

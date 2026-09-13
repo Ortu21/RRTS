@@ -63,11 +63,11 @@ Order schedule: `(snapshot, ai_tick, micro_tick).chain().after(MovementSystems).
 5. Misura: headless = CPU sim, grafico = +rendering, trace = diagnostica. Mai mixare per confronti.
 6. Test gate ogni fase: `cargo test + ai-test + ai-suite quick + ai-scenarios` + delta checksum/winrate dichiarato prima.
 
-## File grandi — piano split (non in questo PR)
+## File grandi — split (fatto in 0.0.25, re-export invariato + test verdi)
 
-- `ai/strategy.rs ~3k`: → `strategy/{decide,waves,micro,spots,personality}.rs` con `mod.rs` che re-esporta. Primo candidato: `wall_slots/find_*_spot` → `spots.rs`.
-- `combat/mod.rs ~2.3k`: → `combat/{acquire,fire,projectile,death,guard}.rs`.
-- `navigation/mod.rs ~1.6k`: → `navigation/{grid,theta,congestion,budget}.rs`.
+- `ai/strategy/` → `{decide,waves,micro,spots,personality}.rs` + `mod.rs` (test restano in `mod.rs`, ~2.2k: prossimo step distribuirli).
+- `combat/` → `{acquire,fire,projectile,death,guard}.rs` + `mod.rs` (plugin+set+test in `mod.rs`).
+- `navigation/` → `{grid,theta,congestion,budget}.rs` + `mod.rs` (test in `mod.rs`).
 - `ui/industry.rs ~1k`, `ui/shell.rs ~0.9k`: già separati per ruolo; non unire, semmai estrarre `placement_preview.rs` da industry.
 
 Regola: split solo con re-export invariato + `cargo test` verde. Niente rename pubblici senza alias deprecato (come `view`→`session`).
